@@ -40,7 +40,7 @@ const downloadDir = './data_minute';
 
 // --- Dynamic Date and Rate Configuration ---
 const YEARS_TO_DOWNLOAD = 5;
-const RATE_LIMIT = 3;
+const RATE_LIMIT = 20;
 
 // Calculate the start and end dates for the data you want to download
 const endDate = new Date();
