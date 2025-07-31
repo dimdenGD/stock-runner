@@ -40,7 +40,7 @@ const downloadDir = './data_minute';
 
 // --- Dynamic Date and Rate Configuration ---
 const YEARS_TO_DOWNLOAD = 5;
-const RATE_LIMIT = 20;
+const RATE_LIMIT = 10;
 
 // Calculate the start and end dates for the data you want to download
 const endDate = new Date();
@@ -78,7 +78,7 @@ async function downloadAndDecompressFile(fileKey) {
 
   if (fs.existsSync(localFilePath)) {
     // Silently skip if file exists to reduce log noise in parallel execution.
-    // console.log(`Decompressed file already exists, skipping: ${localFilePath}`);
+    console.log(`Decompressed file already exists, skipping: ${localFilePath}`);
     return;
   }
 
