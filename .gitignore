@@ -1,4 +1,4 @@
-data_minute/
-data_daily/
+data/
 .env
 node_modules/
+comments.txt

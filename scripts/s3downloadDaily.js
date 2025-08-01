@@ -11,13 +11,13 @@
  * 5. Run the script from your terminal: `node polygon_s3_downloader.js`
  */
 
-require('dotenv').config();
-const AWS = require('aws-sdk');
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
-const util = require('util');
-const { format, eachDayOfInterval, subYears } = require('date-fns');
+import 'dotenv/config';
+import AWS from 'aws-sdk';
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import util from 'util';
+import { format, eachDayOfInterval, subYears } from 'date-fns';
 
 // Promisify the zlib.gunzip function for use with async/await
 const gunzip = util.promisify(zlib.gunzip);
