@@ -10,9 +10,11 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@questdb/nodejs-client": "^3.0.0",
     "aws-sdk": "^2.1692.0",
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.1",
-    "fast-csv": "^5.0.2"
+    "fast-csv": "^5.0.2",
+    "postgres": "^3.4.7"
   }
 }

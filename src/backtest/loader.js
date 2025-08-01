@@ -79,7 +79,7 @@ export async function loadAllDaily(startDate, endDate) {
             if(!stocks[row.ticker]) {
                 stocks[row.ticker] = new Stock(row.ticker);
             }
-            const candle = new Candle(row.open, row.high, row.low, row.close, row.volume, row.window_start / 1000000, row.transactions);
+            const candle = new Candle(+row.open, +row.high, +row.low, +row.close, +row.volume, +row.window_start / 1000000, +row.transactions);
             stocks[row.ticker].pushCandle(candle);
         });
 
