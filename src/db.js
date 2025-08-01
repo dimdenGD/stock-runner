@@ -34,7 +34,5 @@ await sql`
     DEDUP UPSERT KEYS(ticker, timestamp)
 `;
 
-export const sender = Sender.fromConfig("http::addr=localhost:9000;username=admin;password=quest;auto_flush_rows=100;auto_flush_interval=1000;")
+export const sender = Sender.fromConfig("http::addr=localhost:9000;username=admin;password=quest;auto_flush_rows=1000;auto_flush_interval=3000;")
 export { sql };
-
-setInterval(() => sender.flush(), 1000);

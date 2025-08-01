@@ -1,5 +1,4 @@
 import { sender, sql } from "../src/db.js";
-import CSV from 'fast-csv';
 import fs from 'fs';
 import { eachDayOfInterval, format } from 'date-fns';
 
@@ -7,6 +6,32 @@ const startDate = new Date('2020-07-01');
 const endDate = new Date();
 const days = eachDayOfInterval({ start: startDate, end: endDate });
 
+function lineReader(inputFile, callback) {
+    let inputStream = fs.createReadStream(inputFile, { encoding: 'utf-8' })
+    let remaining = ''
+
+    inputStream.on('data', (chunk) => {
+        remaining += chunk;
+
+        let index = remaining.indexOf('\n')
+        let last = 0;
+
+        while (index > -1) {
+            let line = remaining.substring(last, index)
+            last = (index + 1)
+
+            callback(line)
+
+            index = remaining.indexOf('\n', last)
+        }
+
+        remaining = remaining.substring(last)
+    })
+
+    inputStream.on('end', () => {
+        callback(remaining || '', true)
+    })
+}
 
 for (const day of days) {
     const start = new Date();
@@ -15,23 +40,31 @@ for (const day of days) {
     if(!fs.existsSync(filename)) {
         continue;
     }
-    const stream = fs.createReadStream(filename).pipe(CSV.parse({ headers: true, quote: null }));
     const promise = Promise.withResolvers();
-    stream.on('data', async (row) => {
-        await sender
-            .table('candles_minute')
-            .symbol('ticker', row.ticker)
-            .floatColumn('open', +row.open)
-            .floatColumn('high', +row.high)
-            .floatColumn('low', +row.low)
-            .floatColumn('close', +row.close)
-            .intColumn('volume', +row.volume)
-            .intColumn('transactions', +row.transactions)
-            .at(+row.window_start / 1000000, 'ms');
-        await sender.flush();
-    });
-    stream.on('end', () => {
-        promise.resolve();
+    lineReader(filename, async (line, done) => {
+        if(done) {
+            promise.resolve();
+            return;
+        }
+        const arr = line.split(',');
+        if(arr[0] === 'ticker' || arr.length !== 8) {
+            return;
+        }
+        try {
+            await sender
+                .table('candles_minute')
+                .symbol('ticker', arr[0])
+                .floatColumn('open', +arr[2])
+                .floatColumn('high', +arr[4])
+                .floatColumn('low', +arr[5])
+                .floatColumn('close', +arr[3])
+                .intColumn('volume', +arr[1])
+                .intColumn('transactions', +arr[7])
+                .at(+arr[6] / 1000000, 'ms');
+        } catch (e) {
+            console.log(arr);
+            throw e;
+        }
     });
     await promise.promise;
     const end = new Date();
