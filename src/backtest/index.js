@@ -1,9 +1,7 @@
-import { loadAllDaily } from './loader.js';
+import { loadDaily, loadMinute } from './loader.js';
 
-const stocks = await loadAllDaily(new Date('2020-07-01'), new Date());
+const stock = await loadDaily('GOOG', new Date('2020-07-01'), new Date());
 
-console.log(stocks);
-
-setInterval(() => {
-    console.log(stocks['AAPL'].size);
-}, 1000);
+for(const candle of stock) {
+    console.log(candle);
+}

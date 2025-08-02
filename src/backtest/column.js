@@ -1,5 +1,5 @@
 class Column {
-    constructor(Type, initialCapacity = 1_000_000) {
+    constructor(Type, initialCapacity = 1_000) {
         this.Type = Type;
         this.buffer = new Type(initialCapacity);
         this.length = 0;

@@ -23,6 +23,12 @@ class Stock {
         return this.volumes.length;
     }
 
+    *[Symbol.iterator]() {
+        for (let i = 0; i < this.size; i++) {
+            yield this.getCandle(i);
+        }
+    }
+
     /**
      * Get the index of the candle at the given timestamp.
      * @param {number} timestamp - The timestamp of the candle.
@@ -40,13 +46,13 @@ class Stock {
      */
     getCandle(i) {
         return new Candle(
-            this.volumes[i],
-            this.opens[i],
-            this.closes[i],
-            this.highs[i],
-            this.lows[i],
-            this.timestamps[i],
-            this.transactions[i]
+            this.opens.buffer[i],
+            this.highs.buffer[i],
+            this.lows.buffer[i],
+            this.closes.buffer[i],
+            this.volumes.buffer[i],
+            this.transactions.buffer[i],
+            this.timestamps.buffer[i]
         );
     }
 
@@ -63,6 +69,16 @@ class Stock {
         this.timestamps.push(candle.timestamp);
         this.transactions.push(candle.transactions);
         this.timestampIndex.set(candle.timestamp, this.size - 1);
+    }
+
+    finish() {
+        this.volumes.finish();
+        this.opens.finish();
+        this.closes.finish();
+        this.highs.finish();
+        this.lows.finish();
+        this.timestamps.finish();
+        this.transactions.finish();
     }
 }
 
