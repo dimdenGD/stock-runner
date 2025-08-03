@@ -19,7 +19,7 @@ for (const day of days) {
     const promise = Promise.withResolvers();
     stream.on('data', async (row) => {
         await sender
-            .table('candles_daily')
+            .table('candles_1d')
             .symbol('ticker', row.ticker)
             .floatColumn('open', +row.open)
             .floatColumn('high', +row.high)

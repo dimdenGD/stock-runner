@@ -7,7 +7,7 @@ const sql = postgres("postgres://admin:quest@localhost:8812/qdb", {
 });
 
 await sql`
-CREATE TABLE IF NOT EXISTS candles_daily (
+CREATE TABLE IF NOT EXISTS candles_1d (
         ticker SYMBOL CAPACITY 30000,
         open DOUBLE,
         high DOUBLE,
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS candles_daily (
 `;
 
 await sql`
-    CREATE TABLE IF NOT EXISTS candles_minute (
+    CREATE TABLE IF NOT EXISTS candles_1m (
         ticker SYMBOL CAPACITY 30000,
         open DOUBLE,
         high DOUBLE,

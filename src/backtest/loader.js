@@ -1,44 +1,112 @@
 import Stock from './stock.js';
-import { eachDayOfInterval, format, addDays, eachMinuteOfInterval, addMinutes } from 'date-fns';
 import { sql } from '../db.js';
+import { allowedIntervals, intervalMsMap } from './consts.js';
 import Candle from './candle.js';
 
+
 /**
- * Loads daily data for a stock from the database.
+ * Loads data for a stock from the database.
  * @param {string} stockName - The name of the stock to load.
+ * @param {string} interval - The interval of the data to load.
  * @param {Date} startDate - The start date of the data to load.
  * @param {Date} endDate - The end date of the data to load.
  * @returns {Promise<Stock>} The loaded stock.
+ * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
-export async function loadDaily(stockName, startDate, endDate) {
-    const stock = new Stock(stockName, 1000*60*60*24);
+export async function loadStockInRange(stockName, interval, startDate, endDate) {
+    if(!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
+    }
+    if(!(startDate instanceof Date) || !(endDate instanceof Date)) {
+        throw new TypeError('startDate and endDate must be instances of Date');
+    }
+
+    const intervalMs = intervalMsMap[interval];
+    const stock = new Stock(stockName, intervalMs);
     const start = new Date();
-    const candles = await sql`SELECT * FROM candles_daily WHERE ticker = ${stockName} AND timestamp >= ${startDate} AND timestamp < ${endDate}`;
+    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${startDate} AND timestamp < ${endDate} ORDER BY timestamp ASC`;
     for(const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
     stock.finish();
     const end = new Date();
-    console.log(`Loaded ${stock.size} ${stockName} daily candles in ${end - start}ms`);
+    console.log(`Loaded ${stock.size} ${stockName} ${interval} candles in ${end - start}ms`);
     return stock;
 }
 
-/**
- * Loads minute data for a stock from the database.
- * @param {string} stockName - The name of the stock to load.
- * @param {Date} startDate - The start date of the data to load.
- * @param {Date} endDate - The end date of the data to load.
- * @returns {Promise<Stock>} The loaded stock.
- */
-export async function loadMinute(stockName, startDate, endDate) {
-    const stock = new Stock(stockName, 1000*60);
+export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount) {
+    if(!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
+    }
+    if(!(date instanceof Date)) {
+        console.log(date);
+        throw new TypeError('date must be an instance of Date');
+    }
+    if(typeof candlesCount !== 'number') {
+        throw new TypeError('candlesCount must be a number');
+    }
+    if(candlesCount < 1) {
+        throw new TypeError('candlesCount must be greater than 0');
+    }
+
+    const intervalMs = intervalMsMap[interval];
+    const stock = new Stock(stockName, intervalMs);
     const start = new Date();
-    const candles = await sql`SELECT * FROM candles_minute WHERE ticker = ${stockName} AND timestamp >= ${startDate} AND timestamp < ${endDate}`;
+    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${date} ORDER BY timestamp ASC LIMIT ${candlesCount}`;
     for(const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
     stock.finish();
     const end = new Date();
-    console.log(`Loaded ${stock.size} ${stockName} minute candles in ${end - start}ms`);
+    console.log(`Loaded ${stock.size} ${stockName} ${interval} candles in ${end - start}ms`);
     return stock;
+}
+
+export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount) {
+    if(!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
+    }
+    if(!(date instanceof Date)) {
+        throw new TypeError('date must be an instance of Date');
+    }
+
+    const intervalMs = intervalMsMap[interval];
+    const stock = new Stock(stockName, intervalMs);
+    const start = new Date();
+    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp < ${date} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
+    for(const candle of candles) {
+        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+    }
+    stock.finish();
+    const end = new Date();
+    console.log(`Loaded ${stock.size} ${stockName} ${interval} candles in ${end - start}ms`);
+    return stock;
+}
+
+
+export async function loadAllStocksInRange(interval, startDate, endDate) {
+    if(!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
+    }
+    if(!(startDate instanceof Date) || !(endDate instanceof Date)) {
+        throw new TypeError('startDate and endDate must be instances of Date');
+    }
+
+    const start = new Date();
+    const intervalMs = intervalMsMap[interval];
+    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE timestamp >= ${startDate} AND timestamp < ${endDate} ORDER BY timestamp ASC`;
+    const stocks = {};
+    for(let i = 0; i < candles.length; i++) {
+        const candle = candles[i];
+        if(!stocks[candle.ticker]) {
+            stocks[candle.ticker] = new Stock(candle.ticker, intervalMs);
+        }
+        stocks[candle.ticker].pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+    }
+    for(const stock in stocks) {
+        stocks[stock].finish();
+    }
+    const end = new Date();
+    console.log(`Loaded ${Object.keys(stocks).length} stocks in ${end - start}ms`);
+    return stocks;
 }

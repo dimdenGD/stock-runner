@@ -71,6 +71,9 @@ class Stock {
         this.timestampIndex.set(candle.timestamp, this.size - 1);
     }
 
+    /**
+     * Finish the stock.
+     */
     finish() {
         this.volumes.finish();
         this.opens.finish();

@@ -52,7 +52,7 @@ for (const day of days) {
         }
         try {
             await sender
-                .table('candles_minute')
+                .table('candles_1m')
                 .symbol('ticker', arr[0])
                 .floatColumn('open', +arr[2])
                 .floatColumn('high', +arr[4])
