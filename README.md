@@ -24,7 +24,7 @@ node scripts/s3download.js <1d|1m>
 node scripts/questIngest.js <1d|1m>
 ```
 Importing 1m can take up to 5 hours.  
-
+  
 3. You can re-run these scripts to update the data.
 
 ### Running a backtest
