@@ -39,36 +39,30 @@ export default class Strategy {
 
     /**
      * Runs backtest for a given ticker and date range
-     * @param {Object} params
-     * @param {string} params.stockName
-     * @param {Date}   params.startDate
-     * @param {Date}   params.endDate
+     * @param {Backtest} backtest
      */
-    async run({ stockName, startDate, endDate }) {
-        if (typeof stockName !== 'string') {
-            throw new TypeError('`stockName` must be a string');
-        }
-        if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
+    async runBacktest(backtest) {
+        if (!(backtest.startDate instanceof Date) || !(backtest.endDate instanceof Date)) {
             throw new TypeError('`startDate` and `endDate` must be Date instances');
         }
-        if (startDate >= endDate) {
+        if (backtest.startDate >= backtest.endDate) {
             throw new TypeError('`startDate` must be before `endDate`');
         }
 
         // initialize buffers for each interval
         for (const iv of this.intervals) {
             this.buffers[iv.name] = new CandleBuffer(
-                stockName,
+                backtest.stockName,
                 iv.name,
-                startDate,
-                endDate,
+                backtest.startDate,
+                backtest.endDate,
                 iv.candles
             );
         }
 
         // preload initial chunks
         await Promise.all(
-            Object.values(this.buffers).map(buf => buf.ensure(startDate))
+            Object.values(this.buffers).map(buf => buf.ensure(backtest.startDate))
         );
 
         const mainBuf = this.buffers[this.mainInterval.name].buffer;
@@ -78,7 +72,7 @@ export default class Strategy {
         for (let i = lookback - 1; i < mainBuf.length; i++) {
             const mainCandle = mainBuf[i];
             const ts = mainCandle.timestamp;
-            if (ts >= endDate) break;
+            if (ts >= backtest.endDate) break;
 
             // top up all buffers as we advance
             await Promise.all(
@@ -87,10 +81,11 @@ export default class Strategy {
 
             // invoke strategy
             await this.onTick({
-                timestamp: ts,
-                main: mainCandle,
+                candle: mainCandle,
                 getCandles: (intervalName, count) => this.buffers[intervalName].getLast(count, ts),
-                candle: mainCandle
+                backtest: backtest,
+                buy: (quantity, price) => backtest.buy(quantity, price, mainCandle.timestamp),
+                sell: (quantity, price) => backtest.sell(quantity, price, mainCandle.timestamp),
             });
         }
     }
