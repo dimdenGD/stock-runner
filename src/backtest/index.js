@@ -70,6 +70,9 @@ export default class Backtest {
 
     /**
      * Market buy: adjust cash, shares, log trade
+     * @param {number} quantity - The quantity of shares to buy.
+     * @param {number} price - The price of the stock.
+     * @param {number} timestamp - The timestamp of the trade.
      */
     buy(quantity, price, timestamp = Date.now()) {
         const cost = quantity * price;
@@ -85,6 +88,9 @@ export default class Backtest {
 
     /**
      * Market sell: adjust shares, cash, log trade
+     * @param {number} quantity - The quantity of shares to sell.
+     * @param {number} price - The price of the stock.
+     * @param {number} timestamp - The timestamp of the trade.
      */
     sell(quantity, price, timestamp = Date.now()) {
         if (quantity > this.stockBalance) {
@@ -100,6 +106,8 @@ export default class Backtest {
 
     /**
      * Value of stock holdings at a given price
+     * @param {number} price - The price of the stock.
+     * @returns {number} The value of the stock holdings.
      */
     positionValue(price) {
         return this.stockBalance * price;
@@ -107,6 +115,8 @@ export default class Backtest {
 
     /**
      * Total account value: cash + position value
+     * @param {number} price - The price of the stock.
+     * @returns {number} The total value of the account.
      */
     totalValue(price) {
         return this.dollarBalance + this.positionValue(price);
@@ -114,6 +124,7 @@ export default class Backtest {
 
     /**
      * Get the recorded equity curve as [{timestamp, equity}, ...]
+     * @returns {Object[]} The equity curve.
      */
     getEquityCurve() {
         return this.equityCurve;
@@ -122,6 +133,7 @@ export default class Backtest {
     /**
      * Compute performance statistics: total return, annualized return,
      * max drawdown, Sharpe ratio, and trade count.
+     * @returns {Object} The statistics.
      */
     getStats() {
         const curve = this.equityCurve;
@@ -172,6 +184,9 @@ export default class Backtest {
         };
     }
 
+    /**
+     * Log the results of the backtest.
+     */
     logResults() {
         console.log('Trades:');
         for (const trade of this.trades) {

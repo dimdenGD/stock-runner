@@ -30,6 +30,15 @@ export async function loadStockInRange(stockName, interval, startDate, endDate) 
     return stock;
 }
 
+/**
+ * Loads data for a stock from the database.
+ * @param {string} stockName - The name of the stock to load.
+ * @param {string} interval - The interval of the data to load.
+ * @param {Date} date - The date to load the data after.
+ * @param {number} candlesCount - The number of candles to load.
+ * @returns {Promise<Stock>} The loaded stock.
+ * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
+ */
 export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount) {
     if(!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
@@ -54,6 +63,15 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
     return stock;
 }
 
+/**
+ * Loads data for a stock from the database.
+ * @param {string} stockName - The name of the stock to load.
+ * @param {string} interval - The interval of the data to load.
+ * @param {Date} date - The date to load the data before.
+ * @param {number} candlesCount - The number of candles to load.
+ * @returns {Promise<Stock>} The loaded stock.
+ * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
+ */
 export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount) {
     if(!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
@@ -73,6 +91,14 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
 }
 
 
+/**
+ * Loads data for all stocks from the database.
+ * @param {string} interval - The interval of the data to load.
+ * @param {Date} startDate - The start date of the data to load.
+ * @param {Date} endDate - The end date of the data to load.
+ * @returns {Promise<Object<string, Stock>>} The loaded stocks.
+ * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
+ */
 export async function loadAllStocksInRange(interval, startDate, endDate) {
     if(!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
@@ -97,6 +123,10 @@ export async function loadAllStocksInRange(interval, startDate, endDate) {
     return stocks;
 }
 
+/**
+ * Gets the names of all stocks in the database.
+ * @returns {Promise<string[]>} The names of all stocks.
+ */
 export async function getStockNames() {
     const stocks = await sql`SELECT DISTINCT ticker FROM candles_1d`;
     return stocks.map(stock => stock.ticker);

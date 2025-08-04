@@ -57,6 +57,12 @@ class Stock {
         return left;
     }
 
+    /**
+     * Get the candles in the given range.
+     * @param {Date} start - The start date of the range.
+     * @param {Date} end - The end date of the range.
+     * @returns {Candle[]} The candles in the range.
+     */
     getCandlesInRange(start, end) {
         const startIndex = this.getIndex(start);
         const endIndex = this.getIndex(end);

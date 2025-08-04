@@ -64,6 +64,7 @@ export default class CandleBuffer {
     /**
      * Ensures we have enough future data loaded so that any lookback up to
      * `this.lookback` bars before `currentTs` is in `this.buffer`.
+     * @param {number} currentTs - The current timestamp.
      */
     async ensure(currentTs) {
       if (this.buffer.length === 0) {

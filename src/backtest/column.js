@@ -1,3 +1,8 @@
+/**
+ * A column of values.
+ * @param {Function} Type - The type of the values.
+ * @param {number} initialCapacity - The initial capacity of the column.
+ */
 class Column {
     constructor(Type, initialCapacity = 1_000) {
         this.Type = Type;
@@ -5,6 +10,10 @@ class Column {
         this.length = 0;
     }
 
+    /**
+     * Push a value to the column.
+     * @param {any} value - The value to push.
+     */
     push(value) {
         if (this.length >= this.buffer.length) {
             // grow to 2× capacity
@@ -15,6 +24,10 @@ class Column {
         this.buffer[this.length++] = value;
     }
 
+    /**
+     * Finish the column.
+     * @returns {any[]} The finished column.
+     */
     finish() {
         // shrink‐wrap to exact length
         return this.buffer.subarray(0, this.length);
