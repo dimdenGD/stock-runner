@@ -35,8 +35,36 @@ class Stock {
      * @returns {number} The index of the candle.
      */
     getIndex(timestamp) {
-        const index = Math.floor(timestamp / this.granularity) * this.granularity;
-        return this.timestampIndex.get(index);
+        // binary search
+        let left = 0;
+        let right = this.size - 1;
+        while(left <= right) {
+            const mid = Math.floor((left + right) / 2);
+            if(this.timestamps.buffer[mid] === timestamp) {
+                return mid;
+            }
+            if(this.timestamps.buffer[mid] < timestamp) {
+                left = mid + 1;
+            } else {
+                right = mid - 1;
+            }
+        }
+        if(left > 0 && right < this.size - 1) {
+            const leftDiff = Math.abs(this.timestamps.buffer[left - 1] - timestamp);
+            const rightDiff = Math.abs(this.timestamps.buffer[right + 1] - timestamp);
+            return leftDiff < rightDiff ? left - 1 : right + 1;
+        }
+        return left;
+    }
+
+    getCandlesInRange(start, end) {
+        const startIndex = this.getIndex(start);
+        const endIndex = this.getIndex(end);
+        const candles = [];
+        for(let i = startIndex; i <= endIndex; i++) {
+            candles.push(this.getCandle(i));
+        }
+        return candles;
     }
 
     /**
@@ -45,6 +73,9 @@ class Stock {
      * @returns {Candle} The candle.
      */
     getCandle(i) {
+        if(i < 0 || i >= this.size) {
+            return null;
+        }
         return new Candle(
             this.opens.buffer[i],
             this.highs.buffer[i],
