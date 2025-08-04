@@ -13,3 +13,7 @@ export function percentageDifference(original, updated) {
     }
     return ((updated - original) / original) * 100;
 }
+
+export function formatDate(date) {
+    return date.toISOString().split(':').slice(0, 2).join(':').split('T').join(' ');
+}
