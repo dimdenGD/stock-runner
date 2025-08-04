@@ -20,7 +20,7 @@ const myStrat = new Strategy({
         const price = candle.close;
 
         if (backtest.stockBalance === 0 && shortMA > longMA) {
-            buy(50, price);
+            buy(3, price);
         }
         else if (backtest.stockBalance > 0 && shortMA < longMA) {
             sell(backtest.stockBalance, price);
@@ -30,7 +30,7 @@ const myStrat = new Strategy({
 
 const bt = new Backtest({
     strategy: myStrat,
-    stockName: 'AAPL',
+    stockName: 'GOOG',
     startDate: new Date('2020-07-14'),
     endDate: new Date('2025-07-30'),
     startDollarBalance: 10_000,

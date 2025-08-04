@@ -110,3 +110,8 @@ export async function loadAllStocksInRange(interval, startDate, endDate) {
     console.log(`Loaded ${Object.keys(stocks).length} stocks in ${end - start}ms`);
     return stocks;
 }
+
+export async function getStockNames() {
+    const stocks = await sql`SELECT DISTINCT ticker FROM candles_1d`;
+    return stocks.map(stock => stock.ticker);
+}
