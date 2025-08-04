@@ -32,9 +32,9 @@ const bt = new Backtest({
     strategy: myStrat,
     stockName: 'AAPL',
     startDate: new Date('2020-07-14'),
-    endDate: new Date(),
+    endDate: new Date('2025-07-30'),
     startDollarBalance: 10_000,
-    broker: new IBKR('fixed'),
+    broker: new IBKR('tiered'),
 });
 
 await bt.run();

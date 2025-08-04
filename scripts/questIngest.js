@@ -2,8 +2,22 @@ import { sender, sql } from "../src/db.js";
 import fs from 'fs';
 import { eachDayOfInterval, format } from 'date-fns';
 
-const startDate = new Date('2020-07-01');
+const type = process.argv[2];
+
+if (!['1d', '1m'].includes(type)) {
+    console.error('Usage: node questIngest.js <1d|1m>');
+    process.exit(1);
+}
+
+let startDate = new Date('2020-07-01');
 const endDate = new Date();
+
+const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
+if(lastDate.length > 0) {
+    startDate = new Date(lastDate[0].timestamp);
+    console.log(`Last date in database: ${format(startDate, 'yyyy-MM-dd')}`);
+}
+
 const days = eachDayOfInterval({ start: startDate, end: endDate });
 
 function lineReader(inputFile, callback) {
@@ -36,7 +50,7 @@ function lineReader(inputFile, callback) {
 for (const day of days) {
     const start = new Date();
     const date = format(day, 'yyyy-MM-dd');
-    const filename = `data/minute/${date}.csv`;
+    const filename = `data/${type}/${date}.csv`;
     if(!fs.existsSync(filename)) {
         continue;
     }
@@ -52,7 +66,7 @@ for (const day of days) {
         }
         try {
             await sender
-                .table('candles_1m')
+                .table(`candles_${type}`)
                 .symbol('ticker', arr[0])
                 .floatColumn('open', +arr[2])
                 .floatColumn('high', +arr[4])
@@ -70,3 +84,7 @@ for (const day of days) {
     const end = new Date();
     console.log(`Loaded ${date} in ${end - start}ms`);
 }
+sender.flush();
+await new Promise(resolve => setTimeout(resolve, 5000)); // give time to flush
+
+console.log('Done');
