@@ -6,9 +6,8 @@
  * 1. Make sure you have a Polygon.io account with access to the flat files.
  * 2. Get your Access Key ID and Secret Access Key from your Polygon.io dashboard.
  * 3. Set the `POLYGON_ACCESS_KEY_ID` and `POLYGON_SECRET_ACCESS_KEY` environment variables,
- * or replace the placeholder values in the script.
- * 4. Optionally adjust the `RATE_LIMIT_PER_SECOND` and `YEARS_TO_DOWNLOAD` constants.
- * 5. Run the script from your terminal: `node polygon_s3_downloader.js`
+ * 4. Optionally adjust the `RATE_LIMIT` and `YEARS_TO_DOWNLOAD` constants.
+ * 5. Run the script from your terminal: `node scripts/s3download.js <daily|minute>`
  */
 
 import 'dotenv/config';
@@ -18,6 +17,18 @@ import path from 'path';
 import zlib from 'zlib';
 import util from 'util';
 import { format, eachDayOfInterval, subYears } from 'date-fns';
+import { sql } from '../src/db.js';
+
+const type = process.argv[2];
+const typeMap = {
+  '1d': 'day',
+  '1m': 'minute',
+}
+
+if (!['1d', '1m'].includes(type)) {
+  console.error('Usage: node s3download.js <1d|1m>');
+  process.exit(1);
+}
 
 // Promisify the zlib.gunzip function for use with async/await
 const gunzip = util.promisify(zlib.gunzip);
@@ -36,15 +47,15 @@ const endpoint = 'https://files.polygon.io';
 const bucketName = 'flatfiles';
 
 // The directory where you want to save the downloaded and decompressed files
-const downloadDir = './data_minute';
+const downloadDir = `./data/${type}`;
 
 // --- Dynamic Date and Rate Configuration ---
-const YEARS_TO_DOWNLOAD = 5;
-const RATE_LIMIT = 10;
+const YEARS_TO_DOWNLOAD = isFinite(+process.env.YEARS_TO_DOWNLOAD) ? +process.env.YEARS_TO_DOWNLOAD : 5;
+const RATE_LIMIT = isFinite(+process.env.RATE_LIMIT) ? +process.env.RATE_LIMIT : 10;
 
 // Calculate the start and end dates for the data you want to download
 const endDate = new Date();
-const startDate = subYears(endDate, YEARS_TO_DOWNLOAD);
+let startDate = subYears(endDate, YEARS_TO_DOWNLOAD);
 endDate.setDate(endDate.getDate() - 1); // current day is not available
 
 
@@ -120,12 +131,19 @@ async function main() {
 
   createDownloadDirectory();
 
+  const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
+  if(lastDate.length > 0) {
+    startDate = new Date(lastDate[0].timestamp);
+    console.log(`Last date in database: ${format(startDate, 'yyyy-MM-dd')}`);
+  }
+  
   const datesToDownload = eachDayOfInterval({ start: startDate, end: endDate });
+
   const allFileKeys = datesToDownload.map(date => {
     const year = format(date, 'yyyy');
     const month = format(date, 'MM');
     const day = format(date, 'yyyy-MM-dd');
-    return `us_stocks_sip/minute_aggs_v1/${year}/${month}/${day}.csv.gz`;
+    return `us_stocks_sip/${typeMap[type]}_aggs_v1/${year}/${month}/${day}.csv.gz`;
   });
 
   console.log(`Preparing to download data for ${allFileKeys.length} days from ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')}.`);

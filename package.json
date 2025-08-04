@@ -1,5 +1,5 @@
 {
-  "name": "night",
+  "name": "stock-runner",
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
@@ -16,8 +16,5 @@
     "dotenv": "^17.2.1",
     "fast-csv": "^5.0.2",
     "postgres": "^3.4.7"
-  },
-  "devDependencies": {
-    "why-is-node-running": "^3.2.2"
   }
 }
