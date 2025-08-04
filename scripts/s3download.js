@@ -16,7 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import util from 'util';
-import { format, eachDayOfInterval, subYears } from 'date-fns';
+import { format, eachDayOfInterval, subYears, addDays } from 'date-fns';
 import { sql } from '../src/db.js';
 
 const type = process.argv[2];
@@ -133,7 +133,7 @@ async function main() {
 
   const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
   if(lastDate.length > 0) {
-    startDate = new Date(lastDate[0].timestamp);
+    startDate = addDays(new Date(lastDate[0].timestamp), 1);
     console.log(`Last date in database: ${format(startDate, 'yyyy-MM-dd')}`);
   }
   
@@ -162,6 +162,7 @@ async function main() {
   }
 
   console.log('--- Download process complete ---');
+  await sql.end();
 }
 
 main();

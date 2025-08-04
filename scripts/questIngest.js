@@ -1,6 +1,6 @@
 import { sender, sql } from "../src/db.js";
 import fs from 'fs';
-import { eachDayOfInterval, format } from 'date-fns';
+import { eachDayOfInterval, format, addDays } from 'date-fns';
 
 const type = process.argv[2];
 
@@ -14,7 +14,7 @@ const endDate = new Date();
 
 const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
 if(lastDate.length > 0) {
-    startDate = new Date(lastDate[0].timestamp);
+    startDate = addDays(new Date(lastDate[0].timestamp), 1);
     console.log(`Last date in database: ${format(startDate, 'yyyy-MM-dd')}`);
 }
 
@@ -88,3 +88,5 @@ sender.flush();
 await new Promise(resolve => setTimeout(resolve, 5000)); // give time to flush
 
 console.log('Done');
+await sender.close();
+await sql.end();
