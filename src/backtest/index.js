@@ -200,14 +200,16 @@ export default class Backtest {
                     })
                 }
 
-                await this.strategy.onTick({
-                    raw: stocks,
-                    currentDate,
-                    ctx: this,
-                    stocks: arr
-                });
-                this.equityCurve.push([currentDate, this.totalValue()]);
-                i++;
+                if(arr.length > 0) {
+                    await this.strategy.onTick({
+                        raw: stocks,
+                        currentDate,
+                        ctx: this,
+                        stocks: arr
+                    });
+                    this.equityCurve.push([currentDate, this.totalValue()]);
+                    i++;
+                }
             }
         }
 
@@ -362,6 +364,14 @@ export default class Backtest {
     }
 
     logMetrics(m) {
+        if(Object.keys(this.stockBalances).length > 0) {
+            console.log('\n');
+            console.log(chalk.bold('=== STOCKS STILL IN PORTFOLIO ==='));
+            for(const stockName in this.stockBalances) {
+                console.log(`${this.stockBalances[stockName].toLocaleString('en-US').padEnd(8)} ${chalk.bold(stockName.padEnd(7))} ($${(this.stockPrices[stockName] * this.stockBalances[stockName]).toLocaleString('en-US')})`);
+            }
+        }
+
         console.log('\n' + chalk.bold('=== BACKTEST SUMMARY ==='));
         console.log(`Period            : ${this.startDate.toISOString().slice(0,10)} → ${this.endDate.toISOString().slice(0,10)}`);
         console.log(`Trades            : ${this.trades.length}  (win-rate ${(this.trades.filter(t => t.profit > 0).length / this.trades.length * 100).toFixed(2)}%) / ${this.swaps.length} swaps`);
