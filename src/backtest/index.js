@@ -361,8 +361,8 @@ export default class Backtest {
         console.log('\n' + chalk.bold('=== BACKTEST SUMMARY ==='));
         console.log(`Period            : ${this.startDate.toISOString().slice(0,10)} → ${this.endDate.toISOString().slice(0,10)}`);
         console.log(`Trades            : ${this.trades.length}  (win-rate ${(this.trades.filter(t => t.profit > 0).length / this.trades.length * 100).toFixed(2)}%) / ${this.swaps.length} swaps`);
-        console.log(`Fees              : $${this.totalFees.toLocaleString('en-US')}`);
-        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (m.totalReturn * this.startCashBalance).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(m.totalReturn * this.startCashBalance).toLocaleString('en-US'))}`);
+        console.log(`Fees              : $${Math.round(this.totalFees).toLocaleString('en-US')}`);
+        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US'))} ($${this.startCashBalance.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
