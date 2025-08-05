@@ -277,24 +277,22 @@ export default class Backtest {
         if(this.logs.trades) {
             const swaps = this.swaps.toReversed().filter(t => t.stockName === stockName);
             const lastSell = swaps.findIndex(t => t.type === 'sell');
-            if(lastSell !== -1) {
-                const buys = swaps.slice(0, lastSell).filter(t => t.type === 'buy');
-                const cost = buys.reduce((acc, t) => acc + t.quantity * t.price, 0);
-                const fee = buys.reduce((acc, t) => acc + t.fee, 0);
-                const profit = proceeds - cost - fee;
-                const profitPercent = profit / cost;
+            const buys = swaps.slice(0, lastSell === -1 ? swaps.length : lastSell).filter(t => t.type === 'buy');
+            const cost = buys.reduce((acc, t) => acc + t.quantity * t.price, 0);
+            const fee = buys.reduce((acc, t) => acc + t.fee, 0);
+            const profit = proceeds - cost - fee;
+            const profitPercent = profit / cost;
 
-                console.log(
-                    chalk.gray(`${formatDate(new Date(timestamp))} `) +
-                    chalk.bold(`${stockName.padEnd(7)} `) +
-                    chalk[profit > 0 ? 'green' : 'red'](
-                        `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(8)} ` +
-                        `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
-                    ) +
-                    chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
-                );
-                this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
-            }
+            console.log(
+                chalk.gray(`${formatDate(new Date(timestamp))} `) +
+                chalk.bold(`${stockName.padEnd(7)} `) +
+                chalk[profit > 0 ? 'green' : 'red'](
+                    `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(8)} ` +
+                    `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
+                ) +
+                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
+            );
+            this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
         }
 
         this.swaps.push({ type: 'sell', quantity, price, timestamp, fee, stockName });
