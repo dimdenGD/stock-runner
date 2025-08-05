@@ -287,7 +287,7 @@ export default class Backtest {
                 chalk.gray(`${formatDate(new Date(timestamp))} `) +
                 chalk.bold(`${stockName.padEnd(7)} `) +
                 chalk[profit > 0 ? 'green' : 'red'](
-                    `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(8)} ` +
+                    `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
                     `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
                 ) +
                 chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
@@ -362,7 +362,7 @@ export default class Backtest {
         console.log(`Period            : ${this.startDate.toISOString().slice(0,10)} → ${this.endDate.toISOString().slice(0,10)}`);
         console.log(`Trades            : ${this.trades.length}  (win-rate ${(this.trades.filter(t => t.profit > 0).length / this.trades.length * 100).toFixed(2)}%) / ${this.swaps.length} swaps`);
         console.log(`Fees              : $${this.totalFees.toFixed(2)}`);
-        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (m.totalReturn * this.startCashBalance).toFixed(1)) : chalk.redBright('-$' + Math.abs(m.totalReturn * this.startCashBalance).toFixed(1))}`);
+        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (m.totalReturn * this.startCashBalance).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(m.totalReturn * this.startCashBalance).toLocaleString('en-US'))}`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
