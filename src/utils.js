@@ -16,7 +16,9 @@ export function percentageDifference(original, updated) {
 
 export function formatDate(date) {
     const weekDay = date.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
-    return `${weekDay} ${date.toISOString().split(':').slice(0, 2).join(':').split('T').join(' ')}`;
+    const month = date.toLocaleDateString('en-US', { month: 'short', timeZone: "UTC" });
+    const day = date.toLocaleDateString('en-US', { day: 'numeric', timeZone: "UTC" });
+    return `${month} ${day.padStart(2, '0')} ${weekDay} ${date.toISOString().split(':').slice(0, 2).join(':').split('T').join(' ')}`;
 }
 
 export function splitArray(arr, size) {

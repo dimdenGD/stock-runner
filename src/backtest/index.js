@@ -4,7 +4,7 @@ import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
 import chalk from 'chalk';
-import { eachDayOfInterval, eachMinuteOfInterval } from 'date-fns';
+import { eachDayOfInterval, eachMinuteOfInterval, subDays } from 'date-fns';
 
 const sharpePeriods = {
     '1d': 252,
@@ -55,11 +55,13 @@ export default class Backtest {
         this.startCashBalance = startCashBalance;
         this.cashBalance = startCashBalance;
         this.stockBalances = {};
+        this.holdSince = {};
         this.stockPrices = {};
 
         this.swaps = [];
         this.trades = [];
         this.equityCurve = [];
+        this.delistCounter = {};
         
         this.broker = broker;
         this.totalFees = 0;
@@ -201,6 +203,19 @@ export default class Backtest {
                 }
 
                 if(arr.length > 0) {
+                    // delisted stocks
+                    if(Object.keys(this.stockBalances).length > 0) {
+                        for(const stockName in this.stockBalances) {
+                            if(!arr.find(s => s.stockName === stockName)) {
+                                this.delistCounter[stockName] = (this.delistCounter[stockName] || 0) + 1;
+                                if(this.delistCounter[stockName] > 10) {
+                                    delete this.stockBalances[stockName];
+                                    console.log(chalk.red(`${stockName} DELISTED ON ${formatDate(subDays(currentDate, interval === '1d' ? 10 : 0))}`));
+                                }
+                            }
+                        }
+                    }
+
                     await this.strategy.onTick({
                         raw: stocks,
                         currentDate,
@@ -232,6 +247,7 @@ export default class Backtest {
         this.totalFees += fee;
         this.swaps.push({ type: 'buy', quantity, price, timestamp, fee, stockName });
         this.stockPrices[stockName] = price;
+        this.holdSince[stockName] = timestamp;
 
         if(this.logs.swaps) {
             const equity = this.totalValue();
@@ -262,6 +278,7 @@ export default class Backtest {
         this.stockBalances[stockName] -= quantity;
         if(this.stockBalances[stockName] === 0) {
             delete this.stockBalances[stockName];
+            delete this.holdSince[stockName];
         }
         this.totalFees += fee;
         this.stockPrices[stockName] = price;
@@ -368,7 +385,7 @@ export default class Backtest {
             console.log('\n');
             console.log(chalk.bold('=== STOCKS STILL IN PORTFOLIO ==='));
             for(const stockName in this.stockBalances) {
-                console.log(`${this.stockBalances[stockName].toLocaleString('en-US').padEnd(8)} ${chalk.bold(stockName.padEnd(7))} ($${(this.stockPrices[stockName] * this.stockBalances[stockName]).toLocaleString('en-US')})`);
+                console.log(`${this.stockBalances[stockName].toLocaleString('en-US').padEnd(8)} ${chalk.bold(stockName.padEnd(7))} ($${(this.stockPrices[stockName] * this.stockBalances[stockName]).toLocaleString('en-US')})`.padEnd(40) + (this.holdSince[stockName] ? ` (held since ${formatDate(this.holdSince[stockName])})` : ''));
             }
         }
 
