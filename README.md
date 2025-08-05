@@ -46,47 +46,41 @@ const LONG_LEN = SHORT_LEN * 2;
 const sma = candles => candles.reduce((sum, c) => sum + c.close, 0) / candles.length;
 
 const smaCrossover = new Strategy({
-    intervals: [
-        { name: '1d', candles: LONG_LEN, main: true },
-    ],
-    onTick: async ({ candle, getCandles, buy, sell, backtest }) => {
+    intervals: {
+        '1d': { count: LONG_LEN, main: true },
+    },
+    onTick: async ({ candle, getCandles, buy, sell, stockBalance }) => {
         const lastLong = getCandles('1d', LONG_LEN);
-        const lastShort = lastLong.slice(0, SHORT_LEN);
+        const lastShort = getCandles('1d', SHORT_LEN);
 
         const longMA = sma(lastLong);
         const shortMA = sma(lastShort);
         const price = candle.close;
 
-        if (backtest.stockBalance === 0 && shortMA > longMA) {
-            buy(50, price);
+        if (stockBalance === 0 && shortMA > longMA) {
+            buy(3, price);
         }
-        else if (backtest.stockBalance > 0 && shortMA < longMA) {
-            sell(backtest.stockBalance, price);
+        else if (stockBalance > 0 && shortMA < longMA) {
+            sell(stockBalance, price);
         }
     }
 });
 
 const bt = new Backtest({
     strategy: smaCrossover,
-    stockName: 'AAPL',
     startDate: new Date('2020-07-14'),
     endDate: new Date('2025-07-30'),
-    startDollarBalance: 10_000,
+    startCashBalance: 10_000,
     broker: new IBKR('tiered'),
+    logs: {
+        swaps: false,
+        trades: true
+    }
 });
 
-await bt.run();
-
-bt.logResults();
+const result = await bt.runOnStock('AAPL');
+bt.logMetrics(result);
 ```
-Result:
-```
-2020-07-14 00:00 - 2025-07-30 00:00 Stats:
-Total return %: 33.23%
-Annualized return %: 5.85%
-Max drawdown %: 22.46%
-Sharpe ratio: 0.49
-Number of trades: 29
-Total P&L: $3322.92
-Total fees: $10.58
-```
+Result:  
+  
+![image](https://lune.dimden.dev/9157964b4648.png) 

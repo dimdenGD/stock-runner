@@ -18,7 +18,7 @@ export default class CandleBuffer {
      * @param {Date}   endDate    – backtest end
      * @param {number} lookback   – how many past bars your strategy will ever request
      */
-    constructor(stockName, interval, startDate, endDate, lookback) {
+    constructor(stockName, interval, startDate, endDate, lookback, prefetch) {
       this.stockName = stockName;
       this.interval  = interval;
       this.startDate = startDate;
@@ -26,7 +26,7 @@ export default class CandleBuffer {
       this.lookback  = lookback;
   
       this.ms        = intervalMsMap[interval];
-      this.prefetch  = lookback * prefetchFactor;
+      this.prefetch  = prefetch || Math.max(lookback * prefetchFactor, 100);
       this.buffer    = [];        // holds loaded candles in ascending timestamp
       // start fetching from "lookback" bars before the official startDate
       this.nextTs    = new Date(startDate.getTime() - lookback * this.ms);

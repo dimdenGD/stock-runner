@@ -82,7 +82,7 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
-    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp < ${date} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
+    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp <= ${date} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
     for(const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
