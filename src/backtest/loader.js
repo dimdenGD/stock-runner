@@ -108,6 +108,7 @@ export async function loadAllStocksInRange(interval, startDate, endDate) {
     }
 
     const intervalMs = intervalMsMap[interval];
+    const start = Date.now();
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE timestamp >= ${startDate} AND timestamp <= ${endDate} ORDER BY timestamp ASC`;
     const stocks = {};
     for(let i = 0; i < candles.length; i++) {

@@ -4,7 +4,7 @@ import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
 import chalk from 'chalk';
-import { eachDayOfInterval, eachMinuteOfInterval, subDays } from 'date-fns';
+import { eachDayOfInterval, eachMinuteOfInterval, subDays, addDays } from 'date-fns';
 
 const sharpePeriods = {
     '1d': 252,
@@ -141,6 +141,7 @@ export default class Backtest {
         const intervalFn = interval === '1d' ? eachDayOfInterval : eachMinuteOfInterval;
         const dates = intervalFn({ start: this.startDate, end: this.endDate });
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
+        const start = Date.now();
 
         const getCandles = (ts, stock, intervalName, count) => {
             const interval = this.strategy.intervals[intervalName];
@@ -170,17 +171,16 @@ export default class Backtest {
             return arr.reverse().slice(0, count);
         }
 
-        let i = 0;
         let min = this.strategy.mainInterval.count;
         for(const chunk of chunks) {
-            const stocks = await loadAllStocksInRange(interval, chunk[0], chunk[chunk.length - 1]);
+            console.log('++++++++++++++++++++');
+            const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
             for(const currentDate of chunk) {
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
                 if(day === 'Sat' || day === 'Sun') {
                     continue;
                 }
-                if(i < min) {
-                    i++;
+                if(currentDate < chunk[0]) {
                     continue;
                 }
                 const arr = [];
@@ -223,7 +223,6 @@ export default class Backtest {
                         stocks: arr
                     });
                     this.equityCurve.push([currentDate, this.totalValue()]);
-                    i++;
                 }
             }
         }
