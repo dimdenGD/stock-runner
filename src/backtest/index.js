@@ -173,6 +173,10 @@ export default class Backtest {
         for(const chunk of chunks) {
             const stocks = await loadAllStocksInRange(interval, chunk[0], chunk[chunk.length - 1]);
             for(const currentDate of chunk) {
+                const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
+                if(day === 'Sat' || day === 'Sun') {
+                    continue;
+                }
                 if(i < min) {
                     i++;
                     continue;
