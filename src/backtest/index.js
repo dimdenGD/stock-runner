@@ -1,9 +1,10 @@
-import { formatDate } from '../utils.js';
+import { formatDate, splitArray } from '../utils.js';
 import Broker from '../brokers/base.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
-import { loadStockBeforeTimestamp } from './loader.js';
+import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
 import chalk from 'chalk';
+import { eachDayOfInterval, eachMinuteOfInterval } from 'date-fns';
 
 const sharpePeriods = {
     '1d': 252,
@@ -11,8 +12,13 @@ const sharpePeriods = {
 }
 
 const oneStockPreloadAmounts = {
-    '1d': 400,
-    '1m': 4000,
+    '1d': 600,
+    '1m': 10000,
+}
+
+const allStocksPreloadAmounts = {
+    '1d': 250,
+    '1m': 2000,
 }
 
 /**
@@ -88,8 +94,8 @@ export default class Backtest {
             if(!interval.preload) {
                 return new Promise(async (resolve, reject) => {
                     try {
-                        const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count);
-                        resolve([...stock]);
+                        const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2);
+                        resolve([...stock].reverse().slice(0, count));
                     } catch(e) {
                         reject(e);
                     }
@@ -117,7 +123,7 @@ export default class Backtest {
                 candle: mainCandle,
                 ctx: this,
                 stockBalance: this.stockBalances[stockName] || 0,
-                getCandles: (intervalName, count) => getCandles(ts, intervalName, count),
+                getCandles: (intervalName, count, ts = mainCandle.timestamp) => getCandles(ts, intervalName, count),
                 buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp),
                 sell: (quantity, price) => this.sell(stockName, quantity, price, mainCandle.timestamp),
             });
@@ -128,20 +134,98 @@ export default class Backtest {
         return this.getMetrics();
     }
 
+    async runOnAllStocks() {
+        const interval = this.strategy.mainInterval.name;
+        const intervalFn = interval === '1d' ? eachDayOfInterval : eachMinuteOfInterval;
+        const dates = intervalFn({ start: this.startDate, end: this.endDate });
+        const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
+
+        const getCandles = (ts, stock, intervalName, count) => {
+            const interval = this.strategy.intervals[intervalName];
+            if(!interval) {
+                throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
+            }
+            if(!interval.preload) {
+                return new Promise(async (resolve, reject) => {
+                    try {
+                        const stock = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
+                        resolve([...stock].reverse().slice(0, count));
+                    } catch(e) {
+                        reject(e);
+                    }
+                });
+            }
+            const index = stock.getIndex(ts);
+            const arr = [];
+            for(let i = index - count + 1; i <= index; i++) {
+                const candle = stock.getCandle(i);
+                if(!candle) continue;
+                arr.push(candle);
+            }
+            if(arr.length < count) {
+                return null;
+            }
+            return arr.reverse().slice(0, count);
+        }
+
+        let i = 0;
+        let min = this.strategy.mainInterval.count;
+        for(const chunk of chunks) {
+            const stocks = await loadAllStocksInRange(interval, chunk[0], chunk[chunk.length - 1]);
+            for(const currentDate of chunk) {
+                if(i < min) {
+                    i++;
+                    continue;
+                }
+                const arr = [];
+
+                for(const stockName in stocks) {
+                    const stock = stocks[stockName];
+                    const candle = stock.getCandle(stock.getIndex(currentDate));
+                    if(!candle) continue;
+
+                    this.stockPrices[stockName] = candle.close;
+
+                    arr.push({
+                        stockName,
+                        candle,
+                        stockBalance: this.stockBalances[stockName] || 0,
+                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count),
+                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate),
+                        sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
+                    })
+                }
+
+                await this.strategy.onTick({
+                    raw: stocks,
+                    currentDate,
+                    ctx: this,
+                    stocks: arr
+                });
+                this.equityCurve.push([currentDate, this.totalValue()]);
+                i++;
+            }
+        }
+
+        return this.getMetrics();
+    }
+
     totalValue() {
+
         return this.cashBalance + Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + quantity * this.stockPrices[stockName], 0);
     }
 
     buy(stockName, quantity, price, timestamp) {
         const cost = quantity * price;
         const fee = this.broker.calculateFees(quantity, price, 'buy');
-        if (cost + fee > this.dollarBalance) {
-            throw new Error(`Insufficient cash: need ${cost + fee}, have ${this.dollarBalance}`);
+        if (cost + fee > this.cashBalance) {
+            throw new Error(`Insufficient cash: need ${cost + fee}, have ${this.cashBalance}`);
         }
         this.cashBalance -= (cost + fee);
         this.stockBalances[stockName] = (this.stockBalances[stockName] || 0) + quantity;
         this.totalFees += fee;
         this.swaps.push({ type: 'buy', quantity, price, timestamp, fee, stockName });
+        this.stockPrices[stockName] = price;
 
         if(this.logs.swaps) {
             const equity = this.totalValue();
@@ -149,12 +233,12 @@ export default class Backtest {
                 chalk.gray(`${formatDate(new Date(timestamp))} `) +
                 chalk.bold(`${stockName.padEnd(7)} `) +
                 chalk.greenBright(`BUY  `) +
-                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(6)) +
+                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
                 chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +
                 chalk.gray(` | `) +
-                chalk.white(`$${(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
-                chalk.white(` + $${fee.toLocaleString('en-US')} fee`.padEnd(16)) +
-                chalk.gray(`BUDGET $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
+                chalk.white(`$${Math.round(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
+                chalk.white(` + $${Math.round(fee).toLocaleString('en-US')} fee`.padEnd(16)) +
+                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
             );
         }
     }
@@ -174,6 +258,7 @@ export default class Backtest {
             delete this.stockBalances[stockName];
         }
         this.totalFees += fee;
+        this.stockPrices[stockName] = price;
 
         if(this.logs.swaps) {
             const equity = this.totalValue();
@@ -181,12 +266,12 @@ export default class Backtest {
                 chalk.gray(`${formatDate(new Date(timestamp))} `) +
                 chalk.bold(`${stockName.padEnd(7)} `) +
                 chalk.redBright(`SELL `) +
-                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(6)) +
+                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
                 chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +
                 chalk.gray(` | `) +
-                chalk.white(`$${(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
-                chalk.white(` + $${fee.toLocaleString('en-US')} fee`.padEnd(16)) +
-                chalk.gray(`BUDGET $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
+                chalk.white(`$${Math.round(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
+                chalk.white(` + $${Math.round(fee).toLocaleString('en-US')} fee`.padEnd(16)) +
+                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
             );
         }
         if(this.logs.trades) {
@@ -206,7 +291,7 @@ export default class Backtest {
                         `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(8)} ` +
                         `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
                     ) +
-                    chalk.gray(`BUDGET $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
+                    chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
                 );
                 this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
             }

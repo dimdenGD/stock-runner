@@ -17,3 +17,11 @@ export function percentageDifference(original, updated) {
 export function formatDate(date) {
     return date.toISOString().split(':').slice(0, 2).join(':').split('T').join(' ');
 }
+
+export function splitArray(arr, size) {
+    const result = [];
+    for (let i = 0; i < arr.length; i += size) {
+        result.push(arr.slice(i, i + size));
+    }
+    return result;
+}
