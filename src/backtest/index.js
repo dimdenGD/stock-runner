@@ -423,7 +423,7 @@ export default class Backtest {
             rankColor = 'yellowBright';
         } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.35) {
             rank = 'C';
-            rankColor = 'orangeBright';
+            rankColor = 'yellowBright';
         } else if(m.sharpe >= 1 && m.maxDrawdown > -0.4) {
             rank = 'D';
             rankColor = 'redBright';
