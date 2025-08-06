@@ -407,13 +407,13 @@ export default class Backtest {
 
         let rank = 'F';
         let rankColor = 'redBright';
-        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.1 && m.avgDaily >= 0.008) {
+        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.11 && m.avgDaily >= 0.008) {
             rank = 'S';
             rankColor = 'cyanBright';
-        } else if(m.sharpe >= 3 && m.maxDrawdown > -0.15) {
+        } else if(m.sharpe >= 3 && m.maxDrawdown > -0.18) {
             rank = 'A';
             rankColor = 'greenBright';
-        } else if(m.sharpe >= 2 && m.maxDrawdown > -0.2) {
+        } else if(m.sharpe >= 2 && m.maxDrawdown > -0.23) {
             rank = 'B';
             rankColor = 'yellowBright';
         } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.25) {
