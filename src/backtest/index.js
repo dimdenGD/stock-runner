@@ -141,6 +141,7 @@ export default class Backtest {
         const intervalFn = interval === '1d' ? eachDayOfInterval : eachMinuteOfInterval;
         const dates = intervalFn({ start: this.startDate, end: this.endDate });
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
+        const start = Date.now();
 
         const getCandles = (ts, stock, intervalName, count) => {
             const interval = this.strategy.intervals[intervalName];
@@ -226,6 +227,7 @@ export default class Backtest {
             }
         }
 
+        console.log('Backtest finished in', Date.now() - start, 'ms');
         return this.getMetrics();
     }
 

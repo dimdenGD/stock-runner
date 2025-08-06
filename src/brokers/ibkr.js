@@ -10,12 +10,13 @@ export default class IBKR extends Broker {
     /**
      * @param {'fixed'|'tiered'} feeType
      */
-    constructor(feeType = 'tiered') {
+    constructor(feeType = 'tiered', slippage = 0) {
         super();
         if (!['fixed', 'tiered'].includes(feeType)) {
             throw new TypeError('feeType must be "fixed" or "tiered"');
         }
         this.feeType = feeType;
+        this.slippage = slippage;
     }
 
     /**
@@ -59,7 +60,7 @@ export default class IBKR extends Broker {
         }
 
         // total all fees
-        const total = commission + finraTAF + finraCAT + clearing + passThruNYSE + passThruFINRA;
+        const total = commission + finraTAF + finraCAT + clearing + passThruNYSE + passThruFINRA + (notional * this.slippage);
         return total;
     }
 }

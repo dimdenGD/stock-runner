@@ -4,7 +4,7 @@
  * @param {number} initialCapacity - The initial capacity of the column.
  */
 class Column {
-    constructor(Type, initialCapacity = 1_000) {
+    constructor(Type, initialCapacity = 500) {
         this.Type = Type;
         this.buffer = new Type(initialCapacity);
         this.length = 0;
