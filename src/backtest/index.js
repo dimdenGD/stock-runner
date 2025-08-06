@@ -172,8 +172,9 @@ export default class Backtest {
         }
 
         let min = this.strategy.mainInterval.count;
-        for(const chunk of chunks) {
-            console.log('++++++++++++++++++++');
+        for(let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            console.log(`++++++++++++++++++++ ${(((i+1) / chunks.length) * 100).toFixed(2)}%`);
             const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
             for(const currentDate of chunk) {
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
