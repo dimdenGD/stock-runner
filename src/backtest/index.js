@@ -412,22 +412,22 @@ export default class Backtest {
 
         let rank = 'F';
         let rankColor = 'redBright';
-        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.11 && m.avgDaily >= 0.008) {
+        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.15 && m.avgDaily >= 0.008) {
             rank = 'S';
             rankColor = 'cyanBright';
-        } else if(m.sharpe >= 3 && m.maxDrawdown > -0.18) {
+        } else if(m.sharpe >= 3 && m.maxDrawdown > -0.3) {
             rank = 'A';
             rankColor = 'greenBright';
-        } else if(m.sharpe >= 2 && m.maxDrawdown > -0.23) {
+        } else if(m.sharpe >= 2 && m.maxDrawdown > -0.32) {
             rank = 'B';
             rankColor = 'yellowBright';
-        } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.25) {
+        } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.35) {
             rank = 'C';
             rankColor = 'orangeBright';
-        } else if(m.sharpe >= 1 && m.maxDrawdown > -0.3) {
+        } else if(m.sharpe >= 1 && m.maxDrawdown > -0.4) {
             rank = 'D';
             rankColor = 'redBright';
-        } else if(m.maxDrawdown > -0.35) {
+        } else if(m.maxDrawdown > -0.4) {
             rank = 'E';
             rankColor = 'redBright';
         } else {
