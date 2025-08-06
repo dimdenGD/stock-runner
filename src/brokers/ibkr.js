@@ -9,6 +9,7 @@ import Broker from './base.js';
 export default class IBKR extends Broker {
     /**
      * @param {'fixed'|'tiered'} feeType
+     * @param {number} slippage - slippage in percentage
      */
     constructor(feeType = 'tiered', slippage = 0) {
         super();
