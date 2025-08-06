@@ -172,16 +172,10 @@ export default class Backtest {
         }
 
         let min = this.strategy.mainInterval.count;
-        let firstChunk = chunks[0];
-        let nextStocksP = loadAllStocksInRange(interval, subDays(firstChunk[0], min*2), addDays(firstChunk[firstChunk.length - 1], 4));
         for(let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             console.log(`++++++++++++++++++++ ${((i / chunks.length) * 100).toFixed(2)}%`);
-            const stocks = await nextStocksP;
-            if(i < chunks.length - 1) {
-                const nextChunk = chunks[i + 1];
-                nextStocksP = loadAllStocksInRange(interval, subDays(nextChunk[0], min*2), addDays(nextChunk[nextChunk.length - 1], 4));
-            }
+            const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
             for(const currentDate of chunk) {
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
                 if(day === 'Sat' || day === 'Sun') {
@@ -426,10 +420,10 @@ export default class Backtest {
         } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.25) {
             rank = 'C';
             rankColor = 'orangeBright';
-        } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.3) {
+        } else if(m.sharpe >= 1 && m.maxDrawdown > -0.3) {
             rank = 'D';
             rankColor = 'redBright';
-        } else if(m.sharpe >= 1 && m.maxDrawdown > -0.35) {
+        } else if(m.maxDrawdown > -0.35) {
             rank = 'E';
             rankColor = 'redBright';
         } else {
