@@ -312,7 +312,7 @@ export default class Backtest {
                     `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
                     `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
                 ) +
-                chalk.white(`${holdTime}`.padEnd(4)) +
+                chalk.white(`${holdTime}`.padEnd(5)) +
                 chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
             );
             this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
