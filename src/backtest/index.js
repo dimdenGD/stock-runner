@@ -397,11 +397,38 @@ export default class Backtest {
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
-        console.log(`Max draw-down     : ${(m.maxDrawdown * 100).toFixed(1) + '%'}`);
         console.log(`Geo-mean period   : ${m.geoPeriodRet > 0 ? chalk.greenBright('+' + (m.geoPeriodRet * 100).toFixed(2) + '%') : chalk.redBright('' + (m.geoPeriodRet * 100).toFixed(2) + '%')}  (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)`);
         console.log(`Geo-mean annual   : ${m.geoAnnualRet > 0 ? chalk.greenBright('+' + (m.geoAnnualRet * 100).toFixed(2) + '%') : chalk.redBright('' + (m.geoAnnualRet * 100).toFixed(2) + '%')}`);
-
+        
+        const maxDrawdownColor = m.maxDrawdown >= -0.025 ? 'cyanBright' : m.maxDrawdown >= -0.1 ? 'greenBright' : m.maxDrawdown >= -0.15 ? 'yellowBright' : m.maxDrawdown >= -0.25 ? 'orangeBright' : 'redBright';
+        console.log(`Max draw-down     : ${chalk[maxDrawdownColor]((m.maxDrawdown * 100).toFixed(1) + '%')}`);
         const sharpeColor = m.sharpe > 3 ? 'cyanBright' : m.sharpe > 2 ? 'greenBright' : m.sharpe > 1 ? 'yellowBright' : 'redBright';
         console.log(`Sharpe            : ${chalk[sharpeColor](m.sharpe.toFixed(2))}`);
+
+        let rank = 'F';
+        let rankColor = 'redBright';
+        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.1) {
+            rank = 'S';
+            rankColor = 'cyanBright';
+        } else if(m.sharpe >= 3 && m.maxDrawdown > -0.15) {
+            rank = 'A';
+            rankColor = 'greenBright';
+        } else if(m.sharpe >= 2 && m.maxDrawdown > -0.2) {
+            rank = 'B';
+            rankColor = 'yellowBright';
+        } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.25) {
+            rank = 'C';
+            rankColor = 'orangeBright';
+        } else if(m.sharpe >= 1.5 && m.maxDrawdown > -0.3) {
+            rank = 'D';
+            rankColor = 'redBright';
+        } else if(m.sharpe >= 1 && m.maxDrawdown > -0.35) {
+            rank = 'E';
+            rankColor = 'redBright';
+        } else {
+            rank = 'F';
+            rankColor = 'redBright';
+        }
+        console.log(chalk.bold(`\nRank              : ${chalk[rankColor](rank)}`));
     }
 }
