@@ -5,6 +5,7 @@ import Strategy from './strategy.js';
 import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
 import chalk from 'chalk';
 import { eachDayOfInterval, eachMinuteOfInterval, subDays, addDays } from 'date-fns';
+import ms from 'ms';
 
 const sharpePeriods = {
     '1d': 252,
@@ -228,7 +229,7 @@ export default class Backtest {
             }
         }
 
-        console.log('Backtest finished in', Date.now() - start, 'ms');
+        console.log('Backtest finished in', ms(Date.now() - start));
         return this.getMetrics();
     }
 
@@ -277,10 +278,6 @@ export default class Backtest {
         const fee = this.broker.calculateFees(quantity, price, 'sell');
         this.cashBalance += (proceeds - fee);
         this.stockBalances[stockName] -= quantity;
-        if(this.stockBalances[stockName] === 0) {
-            delete this.stockBalances[stockName];
-            delete this.holdSince[stockName];
-        }
         this.totalFees += fee;
         this.stockPrices[stockName] = price;
 
@@ -306,6 +303,7 @@ export default class Backtest {
             const fee = buys.reduce((acc, t) => acc + t.fee, 0);
             const profit = proceeds - cost - fee;
             const profitPercent = profit / cost;
+            const holdTime = ms(timestamp - this.holdSince[stockName]);
 
             console.log(
                 chalk.gray(`${formatDate(new Date(timestamp))} `) +
@@ -314,9 +312,15 @@ export default class Backtest {
                     `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
                     `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
                 ) +
+                chalk.white(`${holdTime}`.padEnd(4)) +
                 chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
             );
             this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
+        }
+
+        if(this.stockBalances[stockName] === 0) {
+            delete this.stockBalances[stockName];
+            delete this.holdSince[stockName];
         }
 
         this.swaps.push({ type: 'sell', quantity, price, timestamp, fee, stockName });
