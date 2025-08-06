@@ -9,7 +9,10 @@ const PORT = process.env.QUESTDB_PORT || 8812;
 const DATABASE = process.env.QUESTDB_DATABASE || 'qdb';
 
 const sql = postgres(`postgres://${USERNAME}:${PASSWORD}@${HOST}:${PORT}/${DATABASE}`, {
-    max: 4
+    max: 4,
+    connection: {
+        timezone: "UTC",
+    },
 });
 
 await sql`

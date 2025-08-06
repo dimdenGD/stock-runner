@@ -11,7 +11,6 @@ class Stock {
         this.lows = new Column(Float32Array);
         this.timestamps = new Column(Float64Array);
         this.transactions = new Column(Uint32Array);
-        this.timestampIndex = new Map();
         this.granularity = granularity;
     }
 
@@ -105,7 +104,6 @@ class Stock {
         this.lows.push(candle.low);
         this.timestamps.push(candle.timestamp);
         this.transactions.push(candle.transactions);
-        this.timestampIndex.set(candle.timestamp, this.size - 1);
     }
 
     /**

@@ -2,6 +2,84 @@ import Stock from './stock.js';
 import { sql } from '../db.js';
 import { allowedIntervals, intervalMsMap } from './consts.js';
 import Candle from './candle.js';
+import http from 'http';
+import parse from 'csv-simple-parser';
+
+/**
+ * Async-generator that streams rows from QuestDB’s /exp CSV API.
+ *
+ * @param {string} query   A SQL query to run
+ * @param {object} opts    Optional connection params
+ * @param {string} opts.host    QuestDB host (default 'localhost')
+ * @param {number} opts.port    QuestDB port (default 9000)
+ * @param {object} opts.headers Any extra HTTP headers
+ *
+ * @yields {object} Each row as an object: { col1: val1, col2: val2, … }
+ */
+async function* fastFetch(
+    query,
+    { host = 'localhost', port = 9000, headers = {} } = {}
+) {
+    // 1) kick off the HTTP request
+    const req = http.request({
+        host,
+        port,
+        path: `/exp?query=${encodeURIComponent(query)}`,  // :contentReference[oaicite:0]{index=0}
+        method: 'GET',
+        headers: {
+            Accept: 'text/csv',
+            ...headers,
+        },
+    });
+
+    const res = await new Promise((resolve, reject) => {
+        req.on('error', reject);
+        req.on('response', resolve);
+        req.end();
+    });
+
+    if (res.statusCode !== 200) {
+        throw new Error(`QuestDB error: ${res.statusCode}`);
+    }
+
+    let leftover = '';
+    let i = 0;
+
+    // 3) stream chunks, accumulate partial lines
+    for await (const chunk of res) {
+        const text = leftover + chunk.toString('utf8');
+        const lines = text.split(/\r?\n/);
+        leftover = lines.pop();  // last element is possibly an incomplete line
+
+        if (lines.length) {
+            // re-join complete lines into one CSV blob (you can also feed each line individually)
+            const csvBatch = lines.join('\n');
+            const parsed = parse(csvBatch);
+            for(const row of parsed) {
+                // skip header
+                if(i === 0) {
+                    i = 1;
+                    continue;
+                }
+                if(row.length === 0) {
+                    continue;
+                }
+                yield row;
+            }
+        }
+    }
+
+    // 4) flush any remaining line
+    if (leftover) {
+        const parsed = parse(leftover);
+        for(const row of parsed) {
+            if(row[0] === '') {
+                continue;
+            }
+            yield row;
+        }
+    }
+}
 
 /**
  * Loads data for a stock from the database.
@@ -13,17 +91,17 @@ import Candle from './candle.js';
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
 export async function loadStockInRange(stockName, interval, startDate, endDate) {
-    if(!allowedIntervals.includes(interval)) {
+    if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
-    if(!(startDate instanceof Date) || !(endDate instanceof Date)) {
+    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
         throw new TypeError('startDate and endDate must be instances of Date');
     }
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${startDate} AND timestamp < ${endDate} ORDER BY timestamp ASC`;
-    for(const candle of candles) {
+    for (const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
     stock.finish();
@@ -40,23 +118,23 @@ export async function loadStockInRange(stockName, interval, startDate, endDate) 
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
 export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount) {
-    if(!allowedIntervals.includes(interval)) {
+    if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
-    if(!(date instanceof Date)) {
+    if (!(date instanceof Date)) {
         throw new TypeError('date must be an instance of Date');
     }
-    if(typeof candlesCount !== 'number') {
+    if (typeof candlesCount !== 'number') {
         throw new TypeError('candlesCount must be a number');
     }
-    if(candlesCount < 1) {
+    if (candlesCount < 1) {
         throw new TypeError('candlesCount must be greater than 0');
     }
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${date} ORDER BY timestamp ASC LIMIT ${candlesCount}`;
-    for(const candle of candles) {
+    for (const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
     stock.finish();
@@ -73,17 +151,17 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
 export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount) {
-    if(!allowedIntervals.includes(interval)) {
+    if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
-    if(!(date instanceof Date)) {
+    if (!(date instanceof Date)) {
         throw new TypeError('date must be an instance of Date');
     }
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp <= ${date} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
-    for(const candle of candles) {
+    for (const candle of candles) {
         stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
     }
     stock.finish();
@@ -100,24 +178,26 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
 export async function loadAllStocksInRange(interval, startDate, endDate) {
-    if(!allowedIntervals.includes(interval)) {
+    if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
-    if(!(startDate instanceof Date) || !(endDate instanceof Date)) {
+    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
         throw new TypeError('startDate and endDate must be instances of Date');
     }
 
     const intervalMs = intervalMsMap[interval];
-    const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE timestamp >= ${startDate} AND timestamp <= ${endDate} ORDER BY timestamp ASC`;
     const stocks = {};
-    for(let i = 0; i < candles.length; i++) {
-        const candle = candles[i];
-        if(!stocks[candle.ticker]) {
-            stocks[candle.ticker] = new Stock(candle.ticker, intervalMs);
+
+    const candles = fastFetch(`SELECT * FROM candles_${interval} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    for await (const candle of candles) {
+        const stockName = candle[0];
+        if (!stocks[stockName]) {
+            stocks[stockName] = new Stock(stockName, intervalMs);
         }
-        stocks[candle.ticker].pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+        stocks[stockName].pushCandle(new Candle(+candle[1], +candle[2], +candle[3], +candle[4], +candle[5], +candle[6], new Date(candle[7]).getTime()));
     }
-    for(const stock in stocks) {
+
+    for (const stock in stocks) {
         stocks[stock].finish();
     }
     return stocks;

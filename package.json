@@ -12,6 +12,7 @@
   "dependencies": {
     "@questdb/nodejs-client": "^3.0.0",
     "aws-sdk": "^2.1692.0",
+    "csv-simple-parser": "^2.0.2",
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.1",
     "fast-csv": "^5.0.2",
