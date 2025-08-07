@@ -10,16 +10,8 @@ class Stock {
         this.highs = new Column(Float32Array);
         this.lows = new Column(Float32Array);
         this.timestamps = new Column(Float64Array);
-        this.transactions = new Column(Uint32Array);
         this.granularity = granularity;
-    }
-
-    /**
-     * Get the size of the stock.
-     * @returns {number} The size of the stock.
-     */
-    get size() {
-        return this.volumes.length;
+        this.size = 0;
     }
 
     *[Symbol.iterator]() {
@@ -87,7 +79,6 @@ class Stock {
             this.lows.buffer[i],
             this.closes.buffer[i],
             this.volumes.buffer[i],
-            this.transactions.buffer[i],
             this.timestamps.buffer[i]
         );
     }
@@ -103,7 +94,7 @@ class Stock {
         this.highs.push(candle.high);
         this.lows.push(candle.low);
         this.timestamps.push(candle.timestamp);
-        this.transactions.push(candle.transactions);
+        this.size++;
     }
 
     /**
@@ -116,7 +107,6 @@ class Stock {
         this.highs.finish();
         this.lows.finish();
         this.timestamps.finish();
-        this.transactions.finish();
     }
 }
 

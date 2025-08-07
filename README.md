@@ -1,41 +1,56 @@
 # Stock Runner
 Because of lack of good backtesting tools in JavaScript, I've decided to build my own.
-It uses Polygon.io to get backtesting data, and QuestDB to efficiently store and query the data.
+It uses QuestDB to efficiently store and query the data.
 It's also quite fast and nice to use. You can run a 5 year backtest on ALL stocks in 1 minute (on daily ticks).
 
-### Installation
+## Installation
 1. Clone the repository
 2. Install dependencies with `npm install`
 3. QuestDB:
 - Install from https://questdb.com/download/
 - Run it with `./questdb.exe` or `./questdb`
 - By default QuestDB uses `admin:quest@localhost:8812/qdb` as credentials. If you just plan on running it locally, you can leave it as is. Otherwise you can set the optional `QUESTDB_USERNAME`, `QUESTDB_PASSWORD`, `QUESTDB_HOST`, `QUESTDB_PORT`, and `QUESTDB_DATABASE` environment variables.
-4. Polygon.io:
-- Create an account at https://polygon.io/
-- Get flat files API key at https://polygon.io/dashboard/keys
-- Set the `POLYGON_ACCESS_KEY_ID` and `POLYGON_SECRET_ACCESS_KEY` environment variables.
 
-### Getting the data
-1. Run the script to download the data from Polygon to CSV files:
+## Getting the data
+
+### Stooq
+Free, adjusted for splits
+1. Go to https://stooq.com/db/h/
+2. Download daily/hourly/5min data and put `nasdaq stocks` etc folders in `data/stooq/`
+3. Run the script to import the data from CSV files to QuestDB:
 ```
-node scripts/s3download.js <1d|1m>
+node scripts/stooq_ingest.js <1d|1h|5m>
 ```
-2. Run the script to import the data from CSV files to QuestDB:
+  
+4. You can re-run these scripts to update the data.
+
+### Polygon.io
+Paid, not recommended because doesn't adjust for splits
+1. Create an account at https://polygon.io/
+2. Get flat files API key at https://polygon.io/dashboard/keys
+3. Set the `POLYGON_ACCESS_KEY_ID` and `POLYGON_SECRET_ACCESS_KEY` environment variables.
+4. Run the script to download the data from Polygon to CSV files:
 ```
-node scripts/questIngest.js <1d|1m>
+node scripts/polygon_download.js <1d|1m>
+```
+5. Run the script to import the data from CSV files to QuestDB:
+```
+node scripts/polygon_ingest.js <1d|1m>
 ```
 Importing 1m can take up to 5 hours.  
   
-3. You can re-run these scripts to update the data.
+6. You can re-run these scripts to update the data.
 
-### Running a backtest
+## Running a backtest
 1. Create a strategy in `strategies/`
 2. Run the backtest:
 ```
 node strategies/sma.js
 ```
 
-## Example strategy on single stock - SMA crossover
+## Strategies
+
+### Example strategy on single stock - SMA crossover
 ```js
 import Strategy from '../src/backtest/strategy.js';
 import Backtest from '../src/backtest/index.js';
@@ -86,7 +101,7 @@ Result:
   
 ![image](https://lune.dimden.dev/9157964b4648.png) 
 
-## Example strategy on all stocks - SMA crossover
+### Example strategy on all stocks - SMA crossover
 ```js
 import Strategy from '../src/backtest/strategy.js';
 import Backtest from '../src/backtest/index.js';

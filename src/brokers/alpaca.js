@@ -10,11 +10,18 @@ import Broker from './base.js';
  * - CAT fee (all executions): $0.0000265 per share
  *
  * @param {number} slippage - slippage as a fraction (e.g. 0.001 = 0.1%)
+ * @param {boolean} [paper=true] - use paper trading
+ * @param {string} [apiKey] - Alpaca API key
+ * @param {string} [apiSecret] - Alpaca API secret
  */
 export default class Alpaca extends Broker {
-  constructor(slippage = 0) {
+  constructor(slippage = 0, paper = true, apiKey, apiSecret) {
     super();
     this.slippage = slippage;
+    this.paper = !!paper;
+    this.url = this.paper ? 'https://paper-api.alpaca.markets' : 'https://api.alpaca.markets';
+    this.apiKey = apiKey;
+    this.apiSecret = apiSecret;
   }
 
   /**

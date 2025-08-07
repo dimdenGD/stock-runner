@@ -102,7 +102,7 @@ export async function loadStockInRange(stockName, interval, startDate, endDate) 
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${startDate} AND timestamp < ${endDate} ORDER BY timestamp ASC`;
     for (const candle of candles) {
-        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, candle.timestamp));
     }
     stock.finish();
     return stock;
@@ -135,7 +135,7 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp >= ${date} ORDER BY timestamp ASC LIMIT ${candlesCount}`;
     for (const candle of candles) {
-        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, candle.timestamp));
     }
     stock.finish();
     return stock;
@@ -162,7 +162,7 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
     const stock = new Stock(stockName, intervalMs);
     const candles = await sql`SELECT * FROM ${sql(`candles_${interval}`)} WHERE ticker = ${stockName} AND timestamp <= ${date} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
     for (const candle of candles) {
-        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, +candle.transactions, candle.timestamp));
+        stock.pushCandle(new Candle(candle.open, candle.high, candle.low, candle.close, +candle.volume, candle.timestamp));
     }
     stock.finish();
     return stock;
@@ -194,7 +194,7 @@ export async function loadAllStocksInRange(interval, startDate, endDate) {
         if (!stocks[stockName]) {
             stocks[stockName] = new Stock(stockName, intervalMs);
         }
-        stocks[stockName].pushCandle(new Candle(+candle[1], +candle[2], +candle[3], +candle[4], +candle[5], +candle[6], new Date(candle[7]).getTime()));
+        stocks[stockName].pushCandle(new Candle(+candle[1], +candle[2], +candle[3], +candle[4], +candle[5], new Date(candle[candle.length === 8 ? 7 : 6]).getTime()));
     }
 
     for (const stock in stocks) {

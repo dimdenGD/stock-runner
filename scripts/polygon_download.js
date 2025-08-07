@@ -26,7 +26,7 @@ const typeMap = {
 }
 
 if (!['1d', '1m'].includes(type)) {
-  console.error('Usage: node s3download.js <1d|1m>');
+  console.error('Usage: node polygon_download.js <1d|1m>');
   process.exit(1);
 }
 

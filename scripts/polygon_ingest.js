@@ -5,11 +5,11 @@ import { eachDayOfInterval, format, addDays } from 'date-fns';
 const type = process.argv[2];
 
 if (!['1d', '1m'].includes(type)) {
-    console.error('Usage: node questIngest.js <1d|1m>');
+    console.error('Usage: node polygon_ingest.js <1d|1m>');
     process.exit(1);
 }
 
-let startDate = new Date('2020-07-01');
+let startDate = new Date('2003-07-01');
 const endDate = new Date();
 
 const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
@@ -73,7 +73,6 @@ for (const day of days) {
                 .floatColumn('low', +arr[5])
                 .floatColumn('close', +arr[3])
                 .intColumn('volume', +arr[1])
-                .intColumn('transactions', +arr[7])
                 .at(+arr[6] / 1000000, 'ms');
         } catch (e) {
             console.log(arr);

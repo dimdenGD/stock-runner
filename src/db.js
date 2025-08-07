@@ -23,9 +23,8 @@ CREATE TABLE IF NOT EXISTS candles_1d (
         low DOUBLE,
         close DOUBLE,
         volume LONG,
-        transactions LONG,
         timestamp TIMESTAMP
-    ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY WEEK
+    ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY MONTH
     DEDUP UPSERT KEYS(timestamp, ticker)
 `;
 
@@ -37,7 +36,19 @@ await sql`
         low DOUBLE,
         close DOUBLE,
         volume LONG,
-        transactions LONG,
+        timestamp TIMESTAMP
+    ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY DAY
+    DEDUP UPSERT KEYS(timestamp, ticker)
+`;
+
+await sql`
+    CREATE TABLE IF NOT EXISTS candles_5m (
+        ticker SYMBOL CAPACITY 30000,
+        open DOUBLE,
+        high DOUBLE,
+        low DOUBLE,
+        close DOUBLE,
+        volume LONG,
         timestamp TIMESTAMP
     ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY DAY
     DEDUP UPSERT KEYS(timestamp, ticker)

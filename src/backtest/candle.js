@@ -7,17 +7,15 @@
  * @param {number} low - The low price.
  * @param {number} close - The close price.
  * @param {number} volume - The volume.
- * @param {number} transactions - The number of transactions.
  * @param {number} timestamp - The timestamp.
  */
 class Candle {
-    constructor(open, high, low, close, volume, transactions, timestamp) {
+    constructor(open, high, low, close, volume, timestamp) {
         this.open = open;
         this.high = high;
         this.low = low;
         this.close = close;
         this.volume = volume;
-        this.transactions = transactions;
         this.timestamp = timestamp;
     }
 }
