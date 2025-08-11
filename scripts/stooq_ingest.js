@@ -2,7 +2,7 @@ import { sender, sql } from "../src/db.js";
 import fs from 'fs';
 import { eachDayOfInterval, format, addDays } from 'date-fns';
 import path from 'path';
-import { Temporal } from 'temporal-polyfill';
+import { Temporal } from '@js-temporal/polyfill';
 
 const type = process.argv[2];
 
@@ -74,15 +74,27 @@ async function processMarket(folderPath) {
             const [ticker, per, date, time, open, high, low, close, volume] = line.trim().split(',');
             if(per === '<PER>') return; // skip header
 
-            const timestamp = Temporal.ZonedDateTime.from({
-                timeZone: 'Europe/Warsaw', // stooq is a polish site
-                year: date.slice(0, 4),
-                month: date.slice(4, 6),
-                day: date.slice(6, 8),
-                hour: time.slice(0, 2),
-                minute: time.slice(2, 4),
-                second: time.slice(4, 6),
-            });
+            let timestamp;
+            if(type !== '1d') {
+                timestamp = Temporal.ZonedDateTime.from({
+                    timeZone: 'Europe/Warsaw', // stooq is a polish site
+                    year: date.slice(0, 4),
+                    month: date.slice(4, 6),
+                    day: date.slice(6, 8),
+                    hour: time.slice(0, 2),
+                    minute: time.slice(2, 4),
+                    second: time.slice(4, 6),
+                });
+            } else {
+                // force 16:00 EST
+                timestamp = Temporal.ZonedDateTime.from({
+                    timeZone: 'America/New_York',
+                    year: date.slice(0, 4),
+                    month: date.slice(4, 6),
+                    day: date.slice(6, 8),
+                    hour: 16,
+                });
+            }
 
             const ms = timestamp.epochMilliseconds;
             if(ms < startDate || ms > endDate) return;
