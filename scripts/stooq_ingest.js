@@ -58,6 +58,7 @@ function lineReader(inputFile, callback) {
 }
 
 async function processMarket(folderPath) {
+    if(folderPath.includes(".DS_Store")) return;
     const files = fs.readdirSync(folderPath);
     for(const i in files) {
         const file = files[i];
