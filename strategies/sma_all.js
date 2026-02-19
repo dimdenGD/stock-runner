@@ -2,7 +2,7 @@ import Strategy from '../src/backtest/strategy.js';
 import Backtest from '../src/backtest/index.js';
 import IBKR from '../src/brokers/ibkr.js';
 
-const SHORT_LEN = 60;
+const SHORT_LEN = 14;
 const LONG_LEN = SHORT_LEN * 2;
 const MAX_POS_PER_STOCK = 50_000; // Maximum position size per stock
 
@@ -10,7 +10,7 @@ const sma = candles => candles.reduce((sum, c) => sum + c.close, 0) / candles.le
 
 const smaCrossover = new Strategy({
     intervals: {
-        '5m': { count: LONG_LEN, main: true },
+        '1d': { count: LONG_LEN, main: true },
     },
     onTick: async ({ stocks, currentDate, ctx }) => {
         // Process each filtered stock
@@ -18,8 +18,8 @@ const smaCrossover = new Strategy({
             const { stockName, candle, getCandles, buy, sell, stockBalance } = s;
             
             try {
-                const lastLong = getCandles('5m', LONG_LEN);
-                const lastShort = getCandles('5m', SHORT_LEN);
+                const lastLong = getCandles('1d', LONG_LEN);
+                const lastShort = getCandles('1d', SHORT_LEN);
 
                 if (!lastLong || !lastShort || lastLong.length < LONG_LEN || lastShort.length < SHORT_LEN) {
                     continue; // Skip if we don't have enough data
