@@ -4,22 +4,39 @@ import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
 import chalk from 'chalk';
-import { eachDayOfInterval, eachMinuteOfInterval, subDays, addDays } from 'date-fns';
+import { eachDayOfInterval, eachMinuteOfInterval, eachHourOfInterval, subDays, addDays, addMinutes } from 'date-fns';
 import ms from 'ms';
 
 const sharpePeriods = {
     '1d': 252,
-    '1m': 252 * 390, // 390 minutes in a trading day
+    '1h': 252 * 6.5,   // 6.5 trading hours per day
+    '5m': 252 * 78,    // 78 five-min bars per 6.5h day
+    '1m': 252 * 390,   // 390 minutes in a trading day
 }
 
 const oneStockPreloadAmounts = {
     '1d': 600,
+    '1h': 2000,
+    '5m': 5000,
     '1m': 10000,
 }
 
 const allStocksPreloadAmounts = {
     '1d': 250,
+    '1h': 500,
+    '5m': 1000,
     '1m': 2000,
+}
+
+/** Returns dates at step-minute intervals in [start, end]. */
+function eachStepMinuteOfInterval({ start, end }, stepMinutes) {
+    const dates = [];
+    let d = new Date(start);
+    while (d <= end) {
+        dates.push(d);
+        d = addMinutes(d, stepMinutes);
+    }
+    return dates;
 }
 
 /**
@@ -139,7 +156,13 @@ export default class Backtest {
 
     async runOnAllStocks() {
         const interval = this.strategy.mainInterval.name;
-        const intervalFn = interval === '1d' ? eachDayOfInterval : eachMinuteOfInterval;
+        const intervalFns = {
+            '1d': eachDayOfInterval,
+            '1h': eachHourOfInterval,
+            '5m': (opts) => eachStepMinuteOfInterval(opts, 5),
+            '1m': eachMinuteOfInterval,
+        };
+        const intervalFn = intervalFns[interval] ?? eachMinuteOfInterval;
         const dates = intervalFn({ start: this.startDate, end: this.endDate });
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
         const start = Date.now();
