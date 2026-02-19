@@ -54,5 +54,18 @@ await sql`
     DEDUP UPSERT KEYS(timestamp, ticker)
 `;
 
+await sql`
+    CREATE TABLE IF NOT EXISTS candles_1h (
+        ticker SYMBOL CAPACITY 30000,
+        open DOUBLE,
+        high DOUBLE,
+        low DOUBLE,
+        close DOUBLE,
+        volume LONG,
+        timestamp TIMESTAMP
+    ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY DAY
+    DEDUP UPSERT KEYS(timestamp, ticker)
+`;
+
 export const sender = Sender.fromConfig(`http::addr=${HOST}:9000;username=${USERNAME};password=${PASSWORD};auto_flush_rows=1000;auto_flush_interval=3000;`)
 export { sql };
