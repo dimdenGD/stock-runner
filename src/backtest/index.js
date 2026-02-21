@@ -175,8 +175,9 @@ export default class Backtest {
             if(!interval.preload) {
                 return new Promise(async (resolve, reject) => {
                     try {
-                        const stock = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
-                        resolve([...stock].reverse().slice(0, count));
+                        const loaded = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
+                        // loadStockBeforeTimestamp returns DESC (newest first); return first count = newest first
+                        resolve([...loaded].slice(0, count));
                     } catch(e) {
                         reject(e);
                     }
