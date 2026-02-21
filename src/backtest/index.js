@@ -39,6 +39,25 @@ function eachStepMinuteOfInterval({ start, end }, stepMinutes) {
     return dates;
 }
 
+
+
+const setHoursDifferentTZ = (inputDateTime, timeZone, setHoursArray) => {
+    inputDateTime.setHours(setHoursArray[0],setHoursArray[1]);
+
+    const dateTZShifted = inputDateTime.toLocaleString("en-US", {timeZone : timeZone , dateStyle: 'long', timeStyle: 'long'});
+    let timeTZShifted = dateTZShifted.split(" ").slice(4,5).join(' ').toString().split(':');
+    let originalTime = inputDateTime.toString().split(" ").slice(4,5).join(' ').toString().split(':');
+    let newLocalTime = [
+        Number(originalTime[0]) - Number(timeTZShifted[0]) + Number(originalTime[0]),
+        Number(originalTime[1]) - Number(timeTZShifted[1]) + Number(originalTime[1]), 
+        Number(originalTime[2]) - Number(timeTZShifted[2]) + Number(originalTime[2])
+    ];
+    let outputDate = new Date(inputDateTime);
+    outputDate.setHours(Number(newLocalTime[0]), Number(newLocalTime[1]),Number(newLocalTime[2]));
+
+    return outputDate;   
+}
+
 /**
  * Backtest orchestrator: runs a Strategy instance, records equity over time,
  * and computes performance statistics.
@@ -166,6 +185,14 @@ export default class Backtest {
         const dates = intervalFn({ start: this.startDate, end: this.endDate });
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
         const start = Date.now();
+
+        if(interval === '1d') {
+            for(const date of dates) {
+                // set to 4 PM EST (closing time)
+                const nyDate = setHoursDifferentTZ(date, 'America/New_York', [16, 0, 0]);
+                date.setTime(nyDate.getTime());
+            }
+        }
 
         const getCandles = (ts, stock, intervalName, count) => {
             const interval = this.strategy.intervals[intervalName];
