@@ -185,10 +185,13 @@ export default class Backtest {
             }
             const index = stock.getIndex(ts);
             const arr = [];
-            for(let i = index - count + 1; i <= index; i++) {
+            for(let i = index - (count+1); i <= index; i++) {
                 const candle = stock.getCandle(i);
                 if(!candle) continue;
                 arr.push(candle);
+                if(arr.length === count) {
+                    break;
+                }
             }
             if(arr.length < count) {
                 return null;

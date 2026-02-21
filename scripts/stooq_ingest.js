@@ -77,13 +77,19 @@ async function processMarket(folderPath) {
 
             let timestamp;
             if(type !== '1d') {
+                let addMinutes = type === '5m' ? 5 : 0;
+                let addHour = 0;
+                if(addMinutes === 5 && (+time.slice(2, 4) + addMinutes) === 60) {
+                    addMinutes = -55;
+                    addHour = 1;
+                }
                 timestamp = Temporal.ZonedDateTime.from({
                     timeZone: 'Europe/Warsaw', // stooq is a polish site
                     year: date.slice(0, 4),
                     month: date.slice(4, 6),
                     day: date.slice(6, 8),
-                    hour: time.slice(0, 2),
-                    minute: time.slice(2, 4),
+                    hour: (+time.slice(0, 2) + addHour).toString().padStart(2, '0'),
+                    minute: (+time.slice(2, 4) + addMinutes).toString().padStart(2, '0'),
                     second: time.slice(4, 6),
                 });
             } else {
@@ -103,7 +109,7 @@ async function processMarket(folderPath) {
             try {
                 await sender
                     .table(`candles_${type}`)
-                    .symbol('ticker', ticker.split(".").slice(0, -1))
+                    .symbol('ticker', ticker.split(".").slice(0, -1).join('.'))
                     .floatColumn('open', +open)
                     .floatColumn('high', +high)
                     .floatColumn('low', +low)
