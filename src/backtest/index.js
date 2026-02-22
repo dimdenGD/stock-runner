@@ -3,6 +3,7 @@ import Broker from '../brokers/base.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
+import { intervalMsMap } from './consts.js';
 import chalk from 'chalk';
 import { eachDayOfInterval, eachMinuteOfInterval, eachHourOfInterval, subDays, addDays, addMinutes } from 'date-fns';
 import ms from 'ms';
@@ -134,13 +135,20 @@ export default class Backtest {
                 return new Promise(async (resolve, reject) => {
                     try {
                         const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2);
+                        if(!stock || stock.length < count) {
+                            return null;
+                        }
                         resolve([...stock].reverse().slice(0, count));
                     } catch(e) {
                         reject(e);
                     }
                 });
             }
-            return buffers[intervalName].getLast(count, ts);
+            const candles = buffers[intervalName].getLast(count, ts);
+            if(!candles || candles.length < count) {
+                return null;
+            }
+            return candles.reverse().slice(0, count);
         };
 
         // iterate once we have full lookback
@@ -194,7 +202,7 @@ export default class Backtest {
             }
         }
 
-        const getCandles = (ts, stock, intervalName, count) => {
+        const getCandles = (ts, stock, intervalName, count, preloadedStocks) => {
             const interval = this.strategy.intervals[intervalName];
             if(!interval) {
                 throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
@@ -204,16 +212,20 @@ export default class Backtest {
                     try {
                         const loaded = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
                         // loadStockBeforeTimestamp returns DESC (newest first); return first count = newest first
+                        if(!loaded || loaded.length < count) {
+                            return null;
+                        }
                         resolve([...loaded].slice(0, count));
                     } catch(e) {
                         reject(e);
                     }
                 });
             }
-            const index = stock.getIndex(ts);
+            const targetStock = (preloadedStocks[intervalName] && preloadedStocks[intervalName][stock.name]) || stock;
+            const index = targetStock.getIndex(ts);
             const arr = [];
             for(let i = index - (count+1); i <= index; i++) {
-                const candle = stock.getCandle(i);
+                const candle = targetStock.getCandle(i);
                 if(!candle) continue;
                 arr.push(candle);
                 if(arr.length === count) {
@@ -226,11 +238,31 @@ export default class Backtest {
             return arr.reverse().slice(0, count);
         }
 
+        const preloadedIntervals = {};
+        for (const ivName in this.strategy.intervals) {
+            const iv = this.strategy.intervals[ivName];
+            if (iv.preload && ivName !== interval) {
+                preloadedIntervals[ivName] = iv;
+            }
+        }
+
         let min = this.strategy.mainInterval.count;
         for(let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             console.log(`++++++++++++++++++++ ${((i / chunks.length) * 100).toFixed(2)}%`);
             const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
+
+            const preloadedStocks = {};
+            for (const ivName in preloadedIntervals) {
+                const iv = preloadedIntervals[ivName];
+                const lookbackMs = iv.count * intervalMsMap[ivName] * 2;
+                console.log(`Loading ${ivName} for ${chunk[0].toLocaleDateString('en-US', { timeZone: "UTC" })} to ${chunk[chunk.length - 1].toLocaleDateString('en-US', { timeZone: "UTC" })}`);
+                preloadedStocks[ivName] = await loadAllStocksInRange(
+                    ivName,
+                    new Date(chunk[0].getTime() - lookbackMs),
+                    addDays(chunk[chunk.length - 1], 4)
+                );
+            }
             for(const currentDate of chunk) {
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
                 if(day === 'Sat' || day === 'Sun') {
@@ -252,7 +284,7 @@ export default class Backtest {
                         stockName,
                         candle,
                         stockBalance: this.stockBalances[stockName] || 0,
-                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count),
+                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count, preloadedStocks),
                         buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate),
                         sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
                     })
