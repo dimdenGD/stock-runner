@@ -49,6 +49,25 @@ function eachStepMinuteOfInterval({ start, end }, stepMinutes) {
 
 
 
+function pearsonCorrelation(xs, ys) {
+    const n = xs.length;
+    if (n < 2) return null;
+    const sumX = xs.reduce((a, b) => a + b, 0);
+    const sumY = ys.reduce((a, b) => a + b, 0);
+    const meanX = sumX / n;
+    const meanY = sumY / n;
+    let num = 0, denX = 0, denY = 0;
+    for (let i = 0; i < n; i++) {
+        const dx = xs[i] - meanX;
+        const dy = ys[i] - meanY;
+        num += dx * dy;
+        denX += dx * dx;
+        denY += dy * dy;
+    }
+    const den = Math.sqrt(denX * denY);
+    return den === 0 ? null : num / den;
+}
+
 const setHoursDifferentTZ = (inputDateTime, timeZone, setHoursArray) => {
     inputDateTime.setHours(setHoursArray[0],setHoursArray[1]);
 
@@ -107,7 +126,8 @@ export default class Backtest {
         this.trades = [];
         this.equityCurve = [];
         this.delistCounter = {};
-        
+        this.stockFeatures = {};  // features set at buy, cleared when position closed
+
         this.broker = broker;
         this.totalFees = 0;
         this.buffers = {};
@@ -171,16 +191,18 @@ export default class Backtest {
 
             this.stockPrices[stockName] = mainCandle.close;
 
-            // invoke strategy
-            await this.strategy.onTick({
+            const tickObj = {
                 stockName,
                 candle: mainCandle,
                 ctx: this,
                 stockBalance: this.stockBalances[stockName] || 0,
+                _features: null,
+                setFeatures(features) { this._features = features; },
                 getCandles: (intervalName, count, ts = mainCandle.timestamp) => getCandles(ts, intervalName, count),
-                buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp),
+                buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp, tickObj._features),
                 sell: (quantity, price) => this.sell(stockName, quantity, price, mainCandle.timestamp),
-            });
+            };
+            await this.strategy.onTick(tickObj);
 
             this.equityCurve.push([mainCandle.timestamp, this.totalValue()]);
         }
@@ -309,14 +331,17 @@ export default class Backtest {
 
                     this.stockPrices[stockName] = candle.close;
 
-                    arr.push({
+                    const item = {
                         stockName,
                         candle,
                         stockBalance: this.stockBalances[stockName] || 0,
+                        _features: null,
+                        setFeatures(features) { this._features = features; },
                         getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count),
-                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate),
+                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate, item._features),
                         sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
-                    })
+                    };
+                    arr.push(item);
                 }
 
                 if(arr.length > 0) {
@@ -353,7 +378,7 @@ export default class Backtest {
         return this.cashBalance + Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + quantity * this.stockPrices[stockName], 0);
     }
 
-    buy(stockName, quantity, price, timestamp) {
+    buy(stockName, quantity, price, timestamp, features) {
         const cost = quantity * price;
         const fee = this.broker.calculateFees(quantity, price, 'buy');
         if (cost + fee > this.cashBalance) {
@@ -365,6 +390,9 @@ export default class Backtest {
         this.swaps.push({ type: 'buy', quantity, price, timestamp, fee, stockName });
         this.stockPrices[stockName] = price;
         this.holdSince[stockName] = timestamp;
+        if (features != null && Array.isArray(features)) {
+            this.stockFeatures[stockName] = features;
+        }
 
         if(this.logs.swaps) {
             const equity = this.totalValue();
@@ -410,32 +438,36 @@ export default class Backtest {
                 chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
             );
         }
-        if(this.logs.trades) {
-            const swaps = this.swaps.toReversed().filter(t => t.stockName === stockName);
-            const lastSell = swaps.findIndex(t => t.type === 'sell');
-            const buys = swaps.slice(0, lastSell === -1 ? swaps.length : lastSell).filter(t => t.type === 'buy');
-            const cost = buys.reduce((acc, t) => acc + t.quantity * t.price, 0);
-            const fee = buys.reduce((acc, t) => acc + t.fee, 0);
-            const profit = proceeds - cost - fee;
-            const profitPercent = profit / cost;
-            const holdTime = ms(timestamp - this.holdSince[stockName]);
+        const swaps = this.swaps.toReversed().filter(t => t.stockName === stockName);
+        const lastSell = swaps.findIndex(t => t.type === 'sell');
+        const buys = swaps.slice(0, lastSell === -1 ? swaps.length : lastSell).filter(t => t.type === 'buy');
+        const cost = buys.reduce((acc, t) => acc + t.quantity * t.price, 0);
+        const buyFees = buys.reduce((acc, t) => acc + t.fee, 0);
+        const profit = proceeds - cost - buyFees - fee;
+        const profitPercent = cost ? profit / cost : 0;
+        const features = this.stockFeatures[stockName];
+        this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent, features: features ?? undefined });
 
-            console.log(
-                chalk.gray(`${formatDate(new Date(timestamp))} `) +
+        if(this.logs.trades) {
+            const holdTime = ms(timestamp - this.holdSince[stockName]);
+            let line = chalk.gray(`${formatDate(new Date(timestamp))} `) +
                 chalk.bold(`${stockName.padEnd(7)} `) +
                 chalk[profit > 0 ? 'green' : 'red'](
                     `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
                     `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
                 ) +
                 chalk.white(`${holdTime}`.padEnd(5)) +
-                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`)
-            );
-            this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent });
+                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`);
+            if (features != null && features.length > 0) {
+                line += chalk.cyan(` [${features.map(f => typeof f === 'number' ? f.toFixed(4) : f).join(', ')}]`);
+            }
+            console.log(line);
         }
 
         if(this.stockBalances[stockName] === 0) {
             delete this.stockBalances[stockName];
             delete this.holdSince[stockName];
+            delete this.stockFeatures[stockName];
         }
 
         this.swaps.push({ type: 'sell', quantity, price, timestamp, fee, stockName });
@@ -486,6 +518,27 @@ export default class Backtest {
 
         const avgDaily = periodRets.reduce((s, r) => s + r, 0) / periodRets.length;
 
+        /* --------- feature correlations ---------------------------- */
+        const tradesWithFeatures = this.trades.filter(t =>
+            t.features != null && Array.isArray(t.features) && t.features.length > 0 &&
+            typeof t.profit === 'number' && typeof t.profitPercent === 'number'
+        );
+        let featureCorrelations = null;
+        if (tradesWithFeatures.length >= 2) {
+            const maxLen = Math.max(...tradesWithFeatures.map(t => t.features.length));
+            featureCorrelations = [];
+            for (let i = 0; i < maxLen; i++) {
+                const valid = tradesWithFeatures.filter(t => t.features.length > i);
+                if (valid.length < 2) {
+                    featureCorrelations.push(null);
+                    continue;
+                }
+                const xs = valid.map(t => t.features[i]);
+                const ys = valid.map(t => t.profitPercent);
+                featureCorrelations.push(pearsonCorrelation(xs, ys));
+            }
+        }
+
         return {
             period        : [this.startDate, this.endDate],
             trades        : this.trades.length,
@@ -497,6 +550,7 @@ export default class Backtest {
             maxDrawdown   : maxDD,
             geoPeriodRet,
             geoAnnualRet,
+            featureCorrelations,
         };
     }
 
@@ -524,6 +578,13 @@ export default class Backtest {
         console.log(`Max draw-down     : ${chalk[maxDrawdownColor]((m.maxDrawdown * 100).toFixed(1) + '%')}`);
         const sharpeColor = m.sharpe > 3 ? 'cyanBright' : m.sharpe > 2 ? 'greenBright' : m.sharpe > 1 ? 'yellowBright' : 'redBright';
         console.log(`Sharpe            : ${chalk[sharpeColor](m.sharpe.toFixed(2))}`);
+        if (m.featureCorrelations && m.featureCorrelations.length > 0) {
+            const parts = m.featureCorrelations.map((r, i) => {
+                const v = r == null ? 'n/a' : r.toFixed(3);
+                return chalk.cyan(`f${i}: ${v}`);
+            });
+            console.log(`Feature vs return% : ${parts.join('  ')}`);
+        }
 
         let rank = 'F';
         let rankColor = 'redBright';
