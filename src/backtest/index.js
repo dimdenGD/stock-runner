@@ -135,20 +135,20 @@ export default class Backtest {
                 return new Promise(async (resolve, reject) => {
                     try {
                         const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2);
-                        if(!stock || stock.length < count) {
-                            return null;
+                        if(stock.size < count) {
+                            return resolve(null);
                         }
-                        resolve([...stock].reverse().slice(0, count));
+                        resolve([...stock].slice(0, count));
                     } catch(e) {
                         reject(e);
                     }
                 });
             }
             const candles = buffers[intervalName].getLast(count, ts);
-            if(!candles || candles.length < count) {
-                return null;
+            if(candles.length < count) {
+                return resolve(null);
             }
-            return candles.reverse().slice(0, count);
+            return resolve(candles.reverse().slice(0, count));
         };
 
         // iterate once we have full lookback
@@ -212,8 +212,8 @@ export default class Backtest {
                     try {
                         const loaded = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
                         // loadStockBeforeTimestamp returns DESC (newest first); return first count = newest first
-                        if(!loaded || loaded.length < count) {
-                            return null;
+                        if(loaded.size < count) {
+                            return resolve(null);
                         }
                         resolve([...loaded].slice(0, count));
                     } catch(e) {
