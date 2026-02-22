@@ -29,6 +29,13 @@ const allStocksPreloadAmounts = {
     '1m': 2000,
 }
 
+const preloadWindowMs = {
+    '1d': 1000 * 60 * 60 * 24 * 365,   // 1 year
+    '1h': 1000 * 60 * 60 * 24 * 31 * 4,    // 4 months
+    '5m': 1000 * 60 * 60 * 24 * 7 * 4,    // 4 weeks
+    '1m': 1000 * 60 * 60 * 24 * 14,    // 2 weeks
+}
+
 /** Returns dates at step-minute intervals in [start, end]. */
 function eachStepMinuteOfInterval({ start, end }, stepMinutes) {
     const dates = [];
@@ -202,41 +209,13 @@ export default class Backtest {
             }
         }
 
-        const getCandles = (ts, stock, intervalName, count, preloadedStocks) => {
-            const interval = this.strategy.intervals[intervalName];
-            if(!interval) {
-                throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
-            }
-            if(!interval.preload) {
-                return new Promise(async (resolve, reject) => {
-                    try {
-                        const loaded = await loadStockBeforeTimestamp(stock.name, interval.name, new Date(ts), count*2);
-                        // loadStockBeforeTimestamp returns DESC (newest first); return first count = newest first
-                        if(loaded.size < count) {
-                            return resolve(null);
-                        }
-                        resolve([...loaded].slice(0, count));
-                    } catch(e) {
-                        reject(e);
-                    }
+        const dbFallback = (stockName, intervalName, ts, count) => {
+            return loadStockBeforeTimestamp(stockName, intervalName, new Date(ts), count * 2)
+                .then(loaded => {
+                    if(loaded.size < count) return null;
+                    return [...loaded].slice(0, count);
                 });
-            }
-            const targetStock = (preloadedStocks[intervalName] && preloadedStocks[intervalName][stock.name]) || stock;
-            const index = targetStock.getIndex(ts);
-            const arr = [];
-            for(let i = index - (count+1); i <= index; i++) {
-                const candle = targetStock.getCandle(i);
-                if(!candle) continue;
-                arr.push(candle);
-                if(arr.length === count) {
-                    break;
-                }
-            }
-            if(arr.length < count) {
-                return null;
-            }
-            return arr.reverse().slice(0, count);
-        }
+        };
 
         const preloadedIntervals = {};
         for (const ivName in this.strategy.intervals) {
@@ -246,24 +225,74 @@ export default class Backtest {
             }
         }
 
+        const preloadedStocks = {};
+        const preloadWindowEnd = {};
+
+        const ensurePreloaded = async (currentDate) => {
+            const ts = currentDate.getTime();
+            for (const ivName in preloadedIntervals) {
+                if (!preloadWindowEnd[ivName] || ts >= preloadWindowEnd[ivName]) {
+                    const iv = preloadedIntervals[ivName];
+                    const lookbackMs = iv.count * intervalMsMap[ivName] * 3;
+                    const windowMs = preloadWindowMs[ivName];
+                    const startDate = new Date(ts - lookbackMs);
+                    const endDate = new Date(ts + windowMs);
+                    preloadedStocks[ivName] = await loadAllStocksInRange(ivName, startDate, endDate);
+                    preloadWindowEnd[ivName] = endDate.getTime();
+                }
+            }
+        };
+
+        const getCandles = (ts, stock, intervalName, count) => {
+            const iv = this.strategy.intervals[intervalName];
+            if(!iv) {
+                throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
+            }
+            if(!iv.preload) {
+                return dbFallback(stock.name, iv.name, ts, count);
+            }
+
+            const targetStock = (intervalName === this.strategy.mainInterval.name)
+                ? stock
+                : preloadedStocks[intervalName]?.[stock.name];
+
+            if(!targetStock) {
+                return dbFallback(stock.name, intervalName, ts, count);
+            }
+
+            let index = targetStock.getIndex(ts);
+            if (index >= targetStock.size) {
+                return dbFallback(stock.name, intervalName, ts, count);
+            }
+            const barAtIndex = targetStock.getCandle(index);
+            if (barAtIndex && barAtIndex.timestamp > ts) {
+                index--;
+            }
+            if (index < 0) {
+                return dbFallback(stock.name, intervalName, ts, count);
+            }
+            const start = index - count + 1;
+            if (start < 0) {
+                return dbFallback(stock.name, intervalName, ts, count);
+            }
+            const arr = [];
+            for (let i = start; i <= index; i++) {
+                const candle = targetStock.getCandle(i);
+                if (candle) arr.push(candle);
+            }
+            if (arr.length < count) {
+                return dbFallback(stock.name, intervalName, ts, count);
+            }
+            return arr.reverse().slice(0, count);
+        }
+
         let min = this.strategy.mainInterval.count;
         for(let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             console.log(`++++++++++++++++++++ ${((i / chunks.length) * 100).toFixed(2)}%`);
             const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
-
-            const preloadedStocks = {};
-            for (const ivName in preloadedIntervals) {
-                const iv = preloadedIntervals[ivName];
-                const lookbackMs = iv.count * intervalMsMap[ivName] * 2;
-                console.log(`Loading ${ivName} for ${chunk[0].toLocaleDateString('en-US', { timeZone: "UTC" })} to ${chunk[chunk.length - 1].toLocaleDateString('en-US', { timeZone: "UTC" })}`);
-                preloadedStocks[ivName] = await loadAllStocksInRange(
-                    ivName,
-                    new Date(chunk[0].getTime() - lookbackMs),
-                    addDays(chunk[chunk.length - 1], 4)
-                );
-            }
             for(const currentDate of chunk) {
+                await ensurePreloaded(currentDate);
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
                 if(day === 'Sat' || day === 'Sun') {
                     continue;
@@ -284,7 +313,7 @@ export default class Backtest {
                         stockName,
                         candle,
                         stockBalance: this.stockBalances[stockName] || 0,
-                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count, preloadedStocks),
+                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count),
                         buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate),
                         sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
                     })
