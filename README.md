@@ -133,13 +133,16 @@ bt.logMetrics(result);
 
 ### Brokers
 
-- **`Broker`** (base) - No fees; override `calculateFees(quantity, price, side)` for custom logic.
-- **`IBKR`** - Interactive Brokers:
+- **`Broker`** (base) — No fees; override `calculateFees(quantity, price, side)` for custom logic.
+- **`IBKR`** — Interactive Brokers:
   - `new IBKR('tiered')` or `new IBKR('fixed')`
   - Tiered: $0.0035/share, min $0.35, max 1% notional + clearing/regulatory.
   - Fixed: $0.005/share, min $1, max 1% notional.
   - Optional second argument: slippage (decimal, e.g. `0.001` = 0.1%).
-
+- **`Alpaca`** — Commission-free U.S. equity; regulatory fees only:
+  - `new Alpaca(slippage?)`
+  - Commission: $0. Sells: FINRA TAF $0.000166/share. All: CAT $0.0000265/share.
+  - `slippage` — fraction (e.g. `0.001` = 0.1%), default `0`.
 ---
 
 ## Strategies
