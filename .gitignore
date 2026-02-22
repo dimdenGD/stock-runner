@@ -3,4 +3,6 @@ data/
 node_modules/
 comments.txt
 strategies/private/
+scripts/private/
+output/
 .DS_Store

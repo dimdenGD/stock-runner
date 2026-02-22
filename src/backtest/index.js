@@ -198,7 +198,12 @@ export default class Backtest {
                 stockBalance: this.stockBalances[stockName] || 0,
                 _features: null,
                 setFeatures(features) { this._features = features; },
-                getCandles: (intervalName, count, ts = mainCandle.timestamp) => getCandles(ts, intervalName, count),
+                getCandles: (intervalName, count, ts = mainCandle.timestamp) => {
+                    if(ts > mainCandle.timestamp) {
+                        throw new Error(`Requested candles in the future: ${ts} > ${mainCandle.timestamp}`);
+                    }
+                    return getCandles(ts, intervalName, count);
+                },
                 buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp, tickObj._features),
                 sell: (quantity, price) => this.sell(stockName, quantity, price, mainCandle.timestamp),
             };
@@ -337,7 +342,12 @@ export default class Backtest {
                         stockBalance: this.stockBalances[stockName] || 0,
                         _features: null,
                         setFeatures(features) { this._features = features; },
-                        getCandles: (intervalName, count, ts = currentDate) => getCandles(ts, stock, intervalName, count),
+                        getCandles: (intervalName, count, ts = currentDate) => {
+                            if(ts.getTime() > currentDate.getTime()) {
+                                throw new Error(`Requested candles in the future: ${ts.toISOString()} > ${currentDate.toISOString()}`);
+                            }
+                            return getCandles(ts, stock, intervalName, count);
+                        },
                         buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate, item._features),
                         sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
                     };
