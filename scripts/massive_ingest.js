@@ -1,24 +1,19 @@
 import { sender, sql } from "../src/db.js";
 import fs from 'fs';
-import { eachDayOfInterval, format, addDays } from 'date-fns';
 
 const type = process.argv[2];
 
-if (!['1d', '1m'].includes(type)) {
-    console.error('Usage: node polygon_ingest.js <1d|1m>');
+if (!['1d', '1h', '5m', '1m'].includes(type)) {
+    console.error('Usage: node massive_ingest.js <1d|1h|5m|1m>');
     process.exit(1);
 }
 
-let startDate = new Date('2003-07-01');
-const endDate = new Date();
-
-const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${type}`)} ORDER BY timestamp DESC LIMIT 1`;
-if(lastDate.length > 0) {
-    startDate = addDays(new Date(lastDate[0].timestamp), 1);
-    console.log(`Last date in database: ${format(startDate, 'yyyy-MM-dd')}`);
+const toAdd = {
+    '1d': 60000*60*16, // 4pm
+    '1h': 60000*60, // 1 hour
+    '5m': 60000*5, // 5 minutes
+    '1m': 60000, // 1 minute
 }
-
-const days = eachDayOfInterval({ start: startDate, end: endDate });
 
 function lineReader(inputFile, callback) {
     let inputStream = fs.createReadStream(inputFile, { encoding: 'utf-8' })
@@ -47,15 +42,11 @@ function lineReader(inputFile, callback) {
     })
 }
 
-for (const day of days) {
-    const start = new Date();
-    const date = format(day, 'yyyy-MM-dd');
-    const filename = `data/${type}/${date}.csv`;
-    if(!fs.existsSync(filename)) {
-        continue;
-    }
+const tickers = fs.readdirSync(`data/massive/${type}`).map(f => f.split('.').slice(0, -1).join('.'));
+for(const ticker of tickers) {
     const promise = Promise.withResolvers();
-    lineReader(filename, async (line, done) => {
+    console.log(`Processing ${ticker}...`);
+    lineReader(`data/massive/${type}/${ticker}.csv`, async (line, done) => {
         if(done) {
             promise.resolve();
             return;
@@ -72,16 +63,14 @@ for (const day of days) {
                 .floatColumn('high', +arr[4])
                 .floatColumn('low', +arr[5])
                 .floatColumn('close', +arr[3])
-                .intColumn('volume', +arr[1])
-                .at(+arr[6] / 1000000, 'ms');
+                .intColumn('volume', parseInt(arr[1]))
+                .at(+arr[6] + toAdd[type], 'ms');
         } catch (e) {
             console.log(arr);
             throw e;
         }
     });
     await promise.promise;
-    const end = new Date();
-    console.log(`Loaded ${date} in ${end - start}ms`);
 }
 sender.flush();
 await new Promise(resolve => setTimeout(resolve, 5000)); // give time to flush

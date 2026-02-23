@@ -19,29 +19,34 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
 
 ## Getting the data
 
-### Stooq (free, split-adjusted)
+### Stooq (free, only last 6 months for 5m, 2 years for 1h, 20 years for 1d)
 
 1. Go to [stooq.com/db/h](https://stooq.com/db/h/)
-2. Download daily/hourly/5m data and place `nasdaq stocks`, etc., in `data/stooq/`
+2. Download daily/hourly/5m data and place `nasdaq stocks`, etc., in `data/stooq/1d`, `data/stooq/1h`, `data/stooq/5m`
 3. Ingest into QuestDB:
    ```bash
    node scripts/stooq_ingest.js <1d|1h|5m>
    ```
 4. Re-run to update data.
 
-### Polygon.io (paid, not split-adjusted)
+### Massive (paid)
 
-1. Sign up at [polygon.io](https://polygon.io/) and get flat files API keys from the dashboard.
-2. Set `POLYGON_ACCESS_KEY_ID` and `POLYGON_SECRET_ACCESS_KEY`.
-3. Download to CSV:
+1. Get API key from [massive.com](https://massive.com/)
+2. Set `MASSIVE_KEY` in `.env`
+3. Run:
    ```bash
-   node scripts/polygon_download.js <1d|1m>
+   node scripts/massive_download.js <period> <startDate> <skip downloaded tickers>
    ```
-4. Ingest into QuestDB:
+   - Example: `node scripts/massive_download.js 1d 2003-09-10 true`
+   - `period` can be `1d`, `1h`, `5m`, `1m`
+   - `startDate` is the date to start downloading from
+   - `skip downloaded tickers` is a boolean flag to skip already downloaded tickers
+5. Ingest into QuestDB:
    ```bash
-   node scripts/polygon_ingest.js <1d|1m>
+   node scripts/massive_ingest.js <period>
    ```
-   (1m ingest can take several hours.)
+   - Example: `node scripts/massive_ingest.js 1d`
+   - `period` can be `1d`, `1h`, `5m`, `1m`
 
 ---
 
