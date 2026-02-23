@@ -70,6 +70,9 @@ async function callMassive(path, params) {
     while(nextUrl) {
         const response = await fetch(nextUrl + '&apiKey=' + MASSIVE_KEY);
         const data = await response.json();
+        if(data.resultsCount === 0) {
+            break;
+        }
         results.push(...data.results);
         nextUrl = data.next_url;
     }
@@ -92,7 +95,7 @@ if(skip) {
     console.log(`Remaining ${tickerList.length} tickers`);
 }
 
-const BATCH_SIZE = 10;
+const BATCH_SIZE = 50;
 const endDate = new Date().toISOString().split('T')[0];
 const startStr = startDate.toISOString().split('T')[0];
 
