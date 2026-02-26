@@ -6,7 +6,7 @@ import Broker from './base.js';
  *
  * - Commission:               $0.00 per share
  * - SEC fee (sells only):     $0.00 per $1 000 000
- * - FINRA TAF (sells only):   $0.000166 per share
+ * - FINRA TAF (sells only):   $0.000195 per share (max $9.79, qty cap 50,205)
  * - CAT fee (all executions): $0.0000265 per share
  *
  * @param {number} slippage - slippage as a fraction (e.g. 0.001 = 0.1%)
@@ -41,8 +41,9 @@ export default class Alpaca extends Broker {
     const secFee = 0;
 
     // 3) FINRA Trading Activity Fee (sells only)
+    //    $0.000195/share, qty capped at 50,205, max $9.79/trade, rounded up to nearest penny
     const finraTAF = side === 'sell'
-      ? quantity * 0.000166
+      ? Math.ceil(Math.min(Math.min(quantity, 50205) * 0.000195, 9.79) * 100) / 100
       : 0;
 
     // 4) Consolidated Audit Trail fee (all executions)
