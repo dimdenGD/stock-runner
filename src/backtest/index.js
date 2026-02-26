@@ -211,7 +211,7 @@ export default class Backtest {
             };
             await this.strategy.onTick(tickObj);
 
-            this.equityCurve.push([mainCandle.timestamp, this.totalValue()]);
+            this.equityCurve.push([mainCandle.timestamp, this.totalValue(), this.cashBalance]);
         }
 
         return this.getMetrics();
@@ -377,7 +377,7 @@ export default class Backtest {
                         ctx: this,
                         stocks: arr
                     });
-                    this.equityCurve.push([currentDate, this.totalValue()]);
+                    this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
                 }
             }
         }
@@ -629,19 +629,19 @@ export default class Backtest {
     buildReport(m) {
         const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
-        let rank = 'F', rankColor = '#ff4444';
+        let rank = 'F', rankColor = '#ff4444', rankGlow = '#ff444480';
         if (m.sharpe >= 3.5 && m.maxDrawdown >= -0.15 && m.avgDaily >= 0.008) {
-            rank = 'S'; rankColor = '#00ffff';
+            rank = 'S'; rankColor = '#00ffff'; rankGlow = '#00ffff60';
         } else if (m.sharpe >= 3 && m.maxDrawdown > -0.3) {
-            rank = 'A'; rankColor = '#44ff44';
+            rank = 'A'; rankColor = '#44ff44'; rankGlow = '#44ff4460';
         } else if (m.sharpe >= 2 && m.maxDrawdown > -0.32) {
-            rank = 'B'; rankColor = '#ffff44';
+            rank = 'B'; rankColor = '#ffff44'; rankGlow = '#ffff4460';
         } else if (m.sharpe >= 1.5 && m.maxDrawdown > -0.35) {
-            rank = 'C'; rankColor = '#ffff44';
+            rank = 'C'; rankColor = '#ffff44'; rankGlow = '#ffff4460';
         } else if (m.sharpe >= 1 && m.maxDrawdown > -0.4) {
-            rank = 'D'; rankColor = '#ff4444';
+            rank = 'D'; rankColor = '#ff4444'; rankGlow = '#ff444460';
         } else if (m.maxDrawdown > -0.4) {
-            rank = 'E'; rankColor = '#ff4444';
+            rank = 'E'; rankColor = '#ff4444'; rankGlow = '#ff444460';
         }
 
         const maxDDColor = m.maxDrawdown >= -0.025 ? '#00ffff'
@@ -658,10 +658,11 @@ export default class Backtest {
             : '0.00';
         const finalEquity = Math.round(this.totalValue());
 
-        /* ---- equity curve ---- */
+        /* ---- equity + cash curve ---- */
         const sortedEquity = this.equityCurve.toSorted((a, b) => a[0] - b[0]);
         const equityLabels = sortedEquity.map(([ts]) => new Date(ts).toISOString().slice(0, 10));
         const equityValues = sortedEquity.map(([, eq]) => +eq.toFixed(2));
+        const cashValues = sortedEquity.map(e => +(e[2] ?? 0).toFixed(2));
 
         /* ---- avg profit per day ---- */
         const dayMap = {};
@@ -686,18 +687,20 @@ export default class Backtest {
                 bucketMap[bucket].push(t.profitPercent * 100);
             }
             const buckets = Object.keys(bucketMap).map(Number).sort((a, b) => a - b);
+            const corr = m.featureCorrelations && m.featureCorrelations[i];
             featureCharts.push({
                 name: def.name,
                 labels: buckets.map(b => b.toLocaleString('en-US')),
                 data: buckets.map(b => +mean(bucketMap[b]).toFixed(4)),
                 counts: buckets.map(b => bucketMap[b].length),
+                correlation: corr,
             });
         }
 
         /* ---- holdings still open ---- */
         const holdingNames = Object.keys(this.stockBalances);
         const holdingsHtml = holdingNames.length > 0
-            ? '<h2>Stocks Still in Portfolio</h2><table>' +
+            ? '<details id="sec-holdings" style="margin-top:2rem"><summary style="cursor:pointer;font-size:1.1rem;font-weight:600">Stocks Still in Portfolio (' + holdingNames.length + ')</summary><table>' +
               '<thead><tr><th>Stock</th><th>Qty</th><th>Value</th><th>Held since</th></tr></thead><tbody>' +
               holdingNames.map(s => {
                   const qty = this.stockBalances[s];
@@ -705,31 +708,37 @@ export default class Backtest {
                   const since = this.holdSince[s] ? formatDate(this.holdSince[s]) : '-';
                   return `<tr><td style="text-align:left">${s}</td><td>${qty.toLocaleString('en-US')}</td><td>$${val.toLocaleString('en-US')}</td><td>${since}</td></tr>`;
               }).join('') +
-              '</tbody></table>'
-            : '';
-
-        /* ---- feature correlations row ---- */
-        const corrHtml = m.featureCorrelations && m.featureCorrelations.length > 0
-            ? '<tr><td>Feature correlations</td><td>' +
-              m.featureCorrelations.map((r, i) => {
-                  const name = this.featuresDef[i]?.name ?? ('f' + i);
-                  const v = r == null ? 'n/a' : r.toFixed(3);
-                  return '<span style="color:#00ffff">' + name + ': ' + v + '</span>';
-              }).join('&nbsp;&nbsp;') +
-              '</td></tr>'
+              '</tbody></table></details>'
             : '';
 
         /* ---- feature chart HTML + JS ---- */
-        const featureSectionsHtml = featureCharts.map((fc, idx) =>
-            `<h2>Avg profit % &amp; count by ${fc.name}</h2>` +
-            `<div class="cw"><canvas id="fc${idx}"></canvas></div>`
-        ).join('\n');
+        const featureSectionsHtml = featureCharts.map((fc, idx) => {
+            const corrStr = fc.correlation == null ? 'n/a' : fc.correlation.toFixed(3);
+            const corrColor = fc.correlation == null ? '#888'
+                : Math.abs(fc.correlation) > 0.3 ? '#00ffff'
+                : Math.abs(fc.correlation) > 0.15 ? '#ffff44' : '#888';
+            return `<section id="sec-feat-${idx}">` +
+                `<h2>${fc.name}</h2>` +
+                `<p style="margin:0 0 0.5rem;font-size:0.9rem;color:#aaa">Correlation with profit: <span style="color:${corrColor};font-weight:600">${corrStr}</span></p>` +
+                `<div class="cw"><canvas id="fc${idx}"></canvas></div>` +
+                `</section>`;
+        }).join('\n');
 
         const featureSectionsJs = featureCharts.map((fc, idx) =>
             `new Chart(document.getElementById('fc${idx}'),{type:'bar',data:{labels:${JSON.stringify(fc.labels)},datasets:[{label:'Avg profit %',data:${JSON.stringify(fc.data)},backgroundColor:'rgba(255,246,124,0.7)',borderColor:'rgba(255,246,124,1)',borderWidth:1,yAxisID:'y'},{label:'Count',data:${JSON.stringify(fc.counts)},type:'line',borderColor:'rgba(100,200,150,1)',backgroundColor:'rgba(100,200,150,0.15)',borderWidth:2,pointRadius:2,fill:false,yAxisID:'y1'}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'%'},grid:{color:'#2a2a2e'},position:'left'},y1:{title:{display:true,text:'Count'},grid:{drawOnChartArea:false},position:'right'},x:{grid:{color:'#2a2a2e'},ticks:{maxRotation:45,maxTicksLimit:30}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});`
         ).join('\n');
 
         const dailyColors = dailyAvgs.map(v => v >= 0 ? 'rgba(68,255,68,0.7)' : 'rgba(255,68,68,0.7)');
+
+        /* ---- nav links ---- */
+        const navLinks = [
+            { href: '#sec-summary', label: 'Summary' },
+            { href: '#sec-equity', label: 'Equity' },
+            { href: '#sec-daily', label: 'Daily P/L' },
+            ...featureCharts.map((fc, i) => ({ href: `#sec-feat-${i}`, label: fc.name })),
+            ...(holdingNames.length > 0 ? [{ href: '#sec-holdings', label: 'Holdings' }] : []),
+        ];
+        const navHtml = navLinks.map(l => `<a href="${l.href}">${l.label}</a>`).join('\n');
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -739,11 +748,16 @@ export default class Backtest {
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 *{box-sizing:border-box}
-body{font-family:system-ui,sans-serif;margin:0;padding:1.5rem;background:#0f0f12;color:#e0e0e0}
+body{font-family:system-ui,sans-serif;margin:0;background:#0f0f12;color:#e0e0e0}
+.sidebar{position:fixed;top:0;left:0;width:180px;height:100vh;background:#141418;border-right:1px solid #2a2a2e;padding:1rem 0.75rem;display:flex;flex-direction:column;gap:0.25rem;z-index:10}
+.sidebar a{display:block;padding:0.4rem 0.6rem;border-radius:6px;color:#aaa;text-decoration:none;font-size:0.85rem;transition:background 0.15s,color 0.15s}
+.sidebar a:hover{background:#1f1f26;color:#fff}
+.main{margin-left:180px;padding:1.5rem 2rem}
 h1{font-size:1.5rem;margin-bottom:0.25rem}
 h2{font-size:1.1rem;margin:2rem 0 0.5rem}
-.rank{font-size:3.5rem;font-weight:900;margin:0.25rem 0 1rem}
-.metrics{border-collapse:collapse;margin-bottom:1.5rem;font-size:0.95rem}
+.rank-badge{display:inline-flex;align-items:center;justify-content:center;width:72px;height:72px;border-radius:14px;font-size:2.8rem;font-weight:900;letter-spacing:-2px;border:3px solid;margin:1rem 0 1.5rem;position:relative;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{filter:brightness(1) drop-shadow(0 0 6px var(--glow))}50%{filter:brightness(1.2) drop-shadow(0 0 18px var(--glow))}}
+.metrics{border-collapse:collapse;margin-bottom:0.5rem;font-size:0.95rem}
 .metrics td{padding:0.3rem 1rem 0.3rem 0;border:none;white-space:nowrap}
 .metrics td:first-child{color:#888;padding-right:2rem}
 .cw{max-width:1200px;height:400px;margin-bottom:1rem}
@@ -751,14 +765,16 @@ table{border-collapse:collapse;margin-top:1rem;font-size:0.85rem}
 th,td{border:1px solid #333;padding:0.3rem 0.6rem;text-align:right}
 th{background:#1a1a1f}
 tr:nth-child(even){background:#16161a}
+section{scroll-margin-top:1rem}
 </style>
 </head>
 <body>
+<nav class="sidebar">
+${navHtml}
+</nav>
+<div class="main">
+<section id="sec-summary">
 <h1>Backtest Report</h1>
-<div class="rank-container">
-<span class="rank-label">Rank: </span>
-<span class="rank" style="color:${rankColor}">${rank}</span>
-</div>
 <table class="metrics">
 <tr><td>Period</td><td>${this.startDate.toISOString().slice(0, 10)} → ${this.endDate.toISOString().slice(0, 10)}</td></tr>
 <tr><td>Trades</td><td>${this.trades.length} (win-rate ${winRate}%) / ${this.swaps.length} swaps</td></tr>
@@ -771,17 +787,26 @@ tr:nth-child(even){background:#16161a}
 <tr><td>Geo-mean annual</td><td style="color:${retColor(m.geoAnnualRet)}">${m.geoAnnualRet >= 0 ? '+' : ''}${(m.geoAnnualRet * 100).toFixed(2)}%</td></tr>
 <tr><td>Max drawdown</td><td style="color:${maxDDColor}">${(m.maxDrawdown * 100).toFixed(1)}%</td></tr>
 <tr><td>Sharpe</td><td style="color:${sharpeColor}">${m.sharpe.toFixed(2)}</td></tr>
-${corrHtml}
 </table>
-<h2>Equity Over Time</h2>
+<div class="rank-container">
+<span class="rank-label" style="font-size: 28px;margin-right: 305px;">Rank:</span>
+<div class="rank-badge" style="color:${rankColor};border-color:${rankColor};--glow:${rankGlow}">${rank}</div>
+</div>
+</section>
+<section id="sec-equity">
+<h2>Equity &amp; Cash Over Time</h2>
 <div class="cw"><canvas id="eqChart"></canvas></div>
+</section>
+<section id="sec-daily">
 <h2>Average Profit % Per Day</h2>
 <div class="cw"><canvas id="dpChart"></canvas></div>
+</section>
 ${featureSectionsHtml}
 ${holdingsHtml}
+</div>
 <script>
-new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:${JSON.stringify(equityLabels)},datasets:[{label:'Equity ($)',data:${JSON.stringify(equityValues)},borderColor:'#44ff44',backgroundColor:'rgba(68,255,68,0.08)',borderWidth:1.5,pointRadius:0,fill:true}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'$'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxRotation:45,maxTicksLimit:20}}},plugins:{legend:{position:'top'}}}});
-new Chart(document.getElementById('dpChart'),{type:'bar',data:{labels:${JSON.stringify(dailyDays)},datasets:[{label:'Avg profit %',data:${JSON.stringify(dailyAvgs)},backgroundColor:${JSON.stringify(dailyColors)},borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'%'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxTicksLimit:20,maxRotation:45}}},plugins:{legend:{position:'top'}}}});
+new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:${JSON.stringify(equityLabels)},datasets:[{label:'Equity ($)',data:${JSON.stringify(equityValues)},borderColor:'#44ff44',backgroundColor:'rgba(68,255,68,0.08)',borderWidth:1.5,pointRadius:0,fill:true},{label:'Cash ($)',data:${JSON.stringify(cashValues)},borderColor:'#ff9f1a',backgroundColor:'rgba(255,159,26,0.06)',borderWidth:1.5,pointRadius:0,fill:true}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'$'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxRotation:45,maxTicksLimit:20}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});
+new Chart(document.getElementById('dpChart'),{type:'bar',data:{labels:${JSON.stringify(dailyDays)},datasets:[{label:'Avg profit %',data:${JSON.stringify(dailyAvgs)},backgroundColor:${JSON.stringify(dailyColors)},borderWidth:0}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'%'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxTicksLimit:20,maxRotation:45}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});
 ${featureSectionsJs}
 </script>
 </body>
