@@ -601,7 +601,7 @@ export default class Backtest {
 
         let rank = 'F';
         let rankColor = 'redBright';
-        if(m.sharpe >= 3.5 && m.maxDrawdown >= -0.15 && m.avgDaily >= 0.008) {
+        if(m.sharpe >= 3.4 && m.maxDrawdown >= -0.17 && m.avgDaily >= 0.007) {
             rank = 'S';
             rankColor = 'cyanBright';
         } else if(m.sharpe >= 3 && m.maxDrawdown > -0.3) {
@@ -630,7 +630,7 @@ export default class Backtest {
         const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
         let rank = 'F', rankColor = '#ff4444', rankGlow = '#ff444480';
-        if (m.sharpe >= 3.5 && m.maxDrawdown >= -0.15 && m.avgDaily >= 0.008) {
+        if (m.sharpe >= 3.4 && m.maxDrawdown >= -0.17 && m.avgDaily >= 0.007) {
             rank = 'S'; rankColor = '#00ffff'; rankGlow = '#00ffff60';
         } else if (m.sharpe >= 3 && m.maxDrawdown > -0.3) {
             rank = 'A'; rankColor = '#44ff44'; rankGlow = '#44ff4460';
