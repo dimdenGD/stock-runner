@@ -730,6 +730,42 @@ export default class Backtest {
 
         const dailyColors = dailyAvgs.map(v => v >= 0 ? 'rgba(68,255,68,0.7)' : 'rgba(255,68,68,0.7)');
 
+        /* ---- swaps table ---- */
+        const fmtD = ts => formatDate(new Date(ts));
+        const fmtUSD = v => '$' + Math.round(v).toLocaleString('en-US');
+        const swapsHtml = this.swaps.length > 0
+            ? `<details id="sec-swaps" style="margin-top:2rem"><summary style="cursor:pointer;font-size:1.1rem;font-weight:600">Swaps (${this.swaps.length})</summary>` +
+              `<table class="log-table"><thead><tr><th>Date</th><th>Stock</th><th>Side</th><th>Qty</th><th>Price</th><th>Total</th><th>Fee</th></tr></thead><tbody>` +
+              this.swaps.map(s => {
+                  const side = s.type === 'buy' ? 'BUY' : 'SELL';
+                  const sideColor = s.type === 'buy' ? '#44ff44' : '#ff4444';
+                  return `<tr><td class="mono">${fmtD(s.timestamp)}</td><td class="bold">${s.stockName}</td><td style="color:${sideColor};font-weight:700">${side}</td><td>${s.quantity.toLocaleString('en-US')}</td><td>$${s.price.toLocaleString('en-US')}</td><td>${fmtUSD(s.quantity * s.price)}</td><td>${fmtUSD(s.fee)}</td></tr>`;
+              }).join('') +
+              '</tbody></table></details>'
+            : '';
+
+        /* ---- trades table ---- */
+        const tradesHtml = this.trades.length > 0
+            ? `<details id="sec-trades" style="margin-top:2rem"><summary style="cursor:pointer;font-size:1.1rem;font-weight:600">Trades (${this.trades.length})</summary>` +
+              `<table class="log-table"><thead><tr><th>Date</th><th>Stock</th><th>Profit $</th><th>Profit %</th><th>Qty</th><th>Price</th><th>Fee</th>` +
+              (this.featuresDef.length > 0 ? '<th>Features</th>' : '') +
+              `</tr></thead><tbody>` +
+              this.trades.map(t => {
+                  const pColor = t.profit >= 0 ? '#44ff44' : '#ff4444';
+                  const pSign = t.profit >= 0 ? '+' : '-';
+                  const featCells = this.featuresDef.length > 0
+                      ? '<td class="mono" style="color:#00ffff;font-size:0.8rem">' +
+                        (t.features ? t.features.map((f, i) => {
+                            const name = this.featuresDef[i]?.name ?? ('f' + i);
+                            const v = typeof f === 'number' ? f.toFixed(4) : f;
+                            return `${name}:${v}`;
+                        }).join(' ') : '-') + '</td>'
+                      : '';
+                  return `<tr><td class="mono">${fmtD(t.timestamp)}</td><td class="bold">${t.stockName}</td><td style="color:${pColor};font-weight:700">${pSign}$${Math.abs(+t.profit.toFixed(2)).toLocaleString('en-US')}</td><td style="color:${pColor}">${(t.profitPercent * 100).toFixed(1)}%</td><td>${t.quantity.toLocaleString('en-US')}</td><td>$${t.price.toLocaleString('en-US')}</td><td>${fmtUSD(t.fee)}</td>${featCells}</tr>`;
+              }).join('') +
+              '</tbody></table></details>'
+            : '';
+
         /* ---- nav links ---- */
         const navLinks = [
             { href: '#sec-summary', label: 'Summary' },
@@ -737,6 +773,8 @@ export default class Backtest {
             { href: '#sec-daily', label: 'Daily P/L' },
             ...featureCharts.map((fc, i) => ({ href: `#sec-feat-${i}`, label: fc.name })),
             ...(holdingNames.length > 0 ? [{ href: '#sec-holdings', label: 'Holdings' }] : []),
+            ...(this.trades.length > 0 ? [{ href: '#sec-trades', label: 'Trades' }] : []),
+            ...(this.swaps.length > 0 ? [{ href: '#sec-swaps', label: 'Swaps' }] : []),
         ];
         const navHtml = navLinks.map(l => `<a href="${l.href}">${l.label}</a>`).join('\n');
 
@@ -766,6 +804,12 @@ th,td{border:1px solid #333;padding:0.3rem 0.6rem;text-align:right}
 th{background:#1a1a1f}
 tr:nth-child(even){background:#16161a}
 section{scroll-margin-top:1rem}
+.log-table{width:100%;font-size:0.8rem;font-family:'SF Mono',Menlo,Consolas,monospace}
+.log-table th{text-align:left;padding:0.35rem 0.6rem;font-weight:600;color:#888;border-bottom:2px solid #333}
+.log-table td{padding:0.25rem 0.6rem;border:none;border-bottom:1px solid #1e1e24;white-space:nowrap}
+.log-table tr:hover{background:#1a1a22}
+.log-table .mono{font-family:'SF Mono',Menlo,Consolas,monospace;color:#888}
+.log-table .bold{font-weight:700}
 </style>
 </head>
 <body>
@@ -803,9 +847,11 @@ ${navHtml}
 </section>
 ${featureSectionsHtml}
 ${holdingsHtml}
+${tradesHtml}
+${swapsHtml}
 </div>
 <script>
-new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:${JSON.stringify(equityLabels)},datasets:[{label:'Equity ($)',data:${JSON.stringify(equityValues)},borderColor:'#44ff44',backgroundColor:'rgba(68,255,68,0.08)',borderWidth:1.5,pointRadius:0,fill:true},{label:'Cash ($)',data:${JSON.stringify(cashValues)},borderColor:'#ff9f1a',backgroundColor:'rgba(255,159,26,0.06)',borderWidth:1.5,pointRadius:0,fill:true}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'$'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxRotation:45,maxTicksLimit:20}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});
+new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:${JSON.stringify(equityLabels)},datasets:[{label:'Equity ($)',data:${JSON.stringify(equityValues)},borderColor:'#44ff44',backgroundColor:'rgba(68,255,68,0.08)',borderWidth:1.5,pointRadius:0,fill:true},{hidden: true,label:'Cash ($)',data:${JSON.stringify(cashValues)},borderColor:'#ff9f1a',backgroundColor:'rgba(255,159,26,0.06)',borderWidth:1.5,pointRadius:0,fill:true}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'$'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxRotation:45,maxTicksLimit:20}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});
 new Chart(document.getElementById('dpChart'),{type:'bar',data:{labels:${JSON.stringify(dailyDays)},datasets:[{label:'Avg profit %',data:${JSON.stringify(dailyAvgs)},backgroundColor:${JSON.stringify(dailyColors)},borderWidth:0}]},options:{interaction:{mode:'index',intersect:false},responsive:true,maintainAspectRatio:false,scales:{y:{title:{display:true,text:'%'},grid:{color:'#2a2a2e'}},x:{grid:{color:'#2a2a2e'},ticks:{maxTicksLimit:20,maxRotation:45}}},plugins:{tooltip:{mode:'index',intersect:false},legend:{position:'top'}}}});
 ${featureSectionsJs}
 </script>

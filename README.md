@@ -94,6 +94,9 @@ const bt = new Backtest({
     startCashBalance: 10_000,
     broker: new IBKR('tiered'),
     logs: { swaps: false, trades: true },
+    features: [ // optional
+        { name: 'volume', bucketSize: 1_000_000 },
+    ],
 });
 
 const result = await bt.runOnStock('AAPL');   // single symbol
@@ -106,6 +109,7 @@ bt.logMetrics(result);
 - **`runOnStock(stockName)`** - Runs backtest on one ticker; returns metrics object.
 - **`runOnAllStocks()`** - Runs on all tickers with data in the range; returns metrics object.
 - **`logMetrics(metrics)`** - Prints summary (CAGR, Sharpe, max drawdown, win rate, etc.) and any open positions.
+- **`buildReport(metrics)`** - Builds a HTML report with charts and tables.
 
 **Metrics returned by `getMetrics()` / `runOnStock` / `runOnAllStocks`:**
 
@@ -127,13 +131,14 @@ bt.logMetrics(result);
 **Single-stock** (`runOnStock`):
 
 - `stockName`, `candle` (current bar), `stockBalance`, `ctx` (backtest instance)
-- `getCandles(intervalName, count, ts?)` - returns `Promise<Array>` of bars (newest to oldest); `ts` defaults to current bar.
+- `getCandles(intervalName, count, ts?)` - returns `Promise<Array>` of bars (newest to oldest), includes the current bar; `ts` defaults to current bar.
 - `buy(quantity, price)`, `sell(quantity, price)` - execute at given price (fees applied by broker).
+- `setFeatures(features)` - set features for the trade. Used for calculating profit correlations. You must set `features` in Backtest options. for example: `.setFeatures([0.1, 0.2, 0.3])`
 
 **All-stocks** (`runOnAllStocks`):
 
 - `currentDate`, `ctx`, `stocks` (array of per-stock objects), `raw` (all loaded symbols)
-- Each element of `stocks` has: `stockName`, `candle`, `stockBalance`, `getCandles`, `buy`, `sell` (see above).
+- Each element of `stocks` has: `stockName`, `candle`, `stockBalance`, `getCandles`, `buy`, `sell`, `setFeatures` (see above).
 - Use `ctx.cashBalance`, `ctx.stockBalances` for portfolio state. Delisted symbols are detected and positions cleared after missing bars.
 
 ### Brokers
