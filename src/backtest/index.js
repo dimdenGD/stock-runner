@@ -601,7 +601,7 @@ export default class Backtest {
 
         let rank = 'F';
         let rankColor = 'redBright';
-        if(m.sharpe >= 3.4 && m.maxDrawdown >= -0.17 && m.avgDaily >= 0.007) {
+        if(m.sharpe >= 3.4 && m.maxDrawdown >= -0.2 && m.avgDaily >= 0.007) {
             rank = 'S';
             rankColor = 'cyanBright';
         } else if(m.sharpe >= 3 && m.maxDrawdown > -0.3) {
@@ -630,7 +630,7 @@ export default class Backtest {
         const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
         let rank = 'F', rankColor = '#ff4444', rankGlow = '#ff444480';
-        if (m.sharpe >= 3.4 && m.maxDrawdown >= -0.17 && m.avgDaily >= 0.007) {
+        if (m.sharpe >= 3.4 && m.maxDrawdown >= -0.2 && m.avgDaily >= 0.007) {
             rank = 'S'; rankColor = '#00ffff'; rankGlow = '#00ffff60';
         } else if (m.sharpe >= 3 && m.maxDrawdown > -0.3) {
             rank = 'A'; rankColor = '#44ff44'; rankGlow = '#44ff4460';
@@ -766,17 +766,34 @@ export default class Backtest {
               '</tbody></table></details>'
             : '';
 
-        /* ---- nav links ---- */
-        const navLinks = [
-            { href: '#sec-summary', label: 'Summary' },
-            { href: '#sec-equity', label: 'Equity' },
-            { href: '#sec-daily', label: 'Daily P/L' },
-            ...featureCharts.map((fc, i) => ({ href: `#sec-feat-${i}`, label: fc.name })),
-            ...(holdingNames.length > 0 ? [{ href: '#sec-holdings', label: 'Holdings' }] : []),
-            ...(this.trades.length > 0 ? [{ href: '#sec-trades', label: 'Trades' }] : []),
-            ...(this.swaps.length > 0 ? [{ href: '#sec-swaps', label: 'Swaps' }] : []),
-        ];
-        const navHtml = navLinks.map(l => `<a href="${l.href}">${l.label}</a>`).join('\n');
+        /* ---- nav with sections ---- */
+        const navSections = [
+            { title: 'Overview', links: [{ href: '#sec-summary', label: 'Summary' }] },
+            {
+                title: 'Charts',
+                links: [
+                    { href: '#sec-equity', label: 'Equity' },
+                    { href: '#sec-daily', label: 'Daily P/L' },
+                ],
+            },
+            {
+                title: 'Features',
+                links: featureCharts.map((fc, idx) => ({ href: `#sec-feat-${idx}`, label: fc.name })),
+            },
+            {
+                title: 'Data',
+                links: [
+                    ...(holdingNames.length > 0 ? [{ href: '#sec-holdings', label: 'Holdings' }] : []),
+                    ...(this.trades.length > 0 ? [{ href: '#sec-trades', label: 'Trades' }] : []),
+                    ...(this.swaps.length > 0 ? [{ href: '#sec-swaps', label: 'Swaps' }] : []),
+                ],
+            },
+        ].filter(s => s.links.length > 0);
+        const navHtml = navSections.filter(s => s.links.length > 0).map(s =>
+            `<div class="nav-section"><div class="nav-section-title">${s.title}</div>` +
+            s.links.map(l => `<a href="${l.href}">${l.label}</a>`).join('') +
+            '</div>'
+        ).join('\n');
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -788,6 +805,8 @@ export default class Backtest {
 *{box-sizing:border-box}
 body{font-family:system-ui,sans-serif;margin:0;background:#0f0f12;color:#e0e0e0}
 .sidebar{position:fixed;top:0;left:0;width:180px;height:100vh;background:#141418;border-right:1px solid #2a2a2e;padding:1rem 0.75rem;display:flex;flex-direction:column;gap:0.25rem;z-index:10}
+.sidebar .nav-section{margin-bottom:0.75rem}
+.sidebar .nav-section-title{font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#666;padding:0.25rem 0.6rem;margin-bottom:0.2rem}
 .sidebar a{display:block;padding:0.4rem 0.6rem;border-radius:6px;color:#aaa;text-decoration:none;font-size:0.85rem;transition:background 0.15s,color 0.15s}
 .sidebar a:hover{background:#1f1f26;color:#fff}
 .main{margin-left:180px;padding:1.5rem 2rem}
@@ -833,9 +852,10 @@ ${navHtml}
 <tr><td>Sharpe</td><td style="color:${sharpeColor}">${m.sharpe.toFixed(2)}</td></tr>
 </table>
 <div class="rank-container">
-<span class="rank-label" style="font-size: 28px;margin-right: 305px;">Rank:</span>
+<span class="rank-label" style="font-size: 28px;margin-right: 300px;">Rank:</span>
 <div class="rank-badge" style="color:${rankColor};border-color:${rankColor};--glow:${rankGlow}">${rank}</div>
 </div>
+${this.totalFees === 0 && (rank === 'B' || rank === 'A' || rank === 'S') ? '<div style="opacity: 0.5; font-style: italic; font-size: 12px;">Good job, now do it with fees on.</div>' : ''}
 </section>
 <section id="sec-equity">
 <h2>Equity &amp; Cash Over Time</h2>
