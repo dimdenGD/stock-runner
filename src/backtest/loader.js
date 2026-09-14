@@ -7,6 +7,14 @@ import parse from 'csv-simple-parser';
 
 const columnsFor = (market) => market === 'crypto' ? 'ticker, open, high, low, close, volume, quote_volume, timestamp' : '*';
 
+const stockNamePattern = /^[A-Za-z0-9_.\-]+$/;
+function assertValidStockName(stockName) {
+    if (typeof stockName !== 'string' || !stockNamePattern.test(stockName)) {
+        throw new TypeError(`Invalid stockName: ${stockName}`);
+    }
+    return stockName;
+}
+
 function rowToCandle(row, market) {
     if (market === 'crypto') {
         return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], new Date(row[7]).getTime(), +row[6]);
@@ -107,10 +115,11 @@ export async function loadStockInRange(stockName, interval, startDate, endDate, 
     if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
         throw new TypeError('startDate and endDate must be instances of Date');
     }
+    const safeStockName = assertValidStockName(stockName);
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${safeStockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const candle of candles) {
         stock.pushCandle(rowToCandle(candle, market));
     }
@@ -141,10 +150,11 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
     if (candlesCount < 1) {
         throw new TypeError('candlesCount must be greater than 0');
     }
+    const safeStockName = assertValidStockName(stockName);
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${safeStockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
     for await (const candle of candles) {
         stock.pushCandle(rowToCandle(candle, market));
     }
@@ -261,12 +271,12 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
     if (!(date instanceof Date)) {
         throw new TypeError('date must be an instance of Date');
     }
+    const safeStockName = assertValidStockName(stockName);
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
     let aboveTimestamp = startDate(interval, date, candlesCount, market).getTime();
-    const q = `SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp <= ${date.getTime() * 1000} AND timestamp >= ${aboveTimestamp * 1000} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
-    const candles = fastFetch(q);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${safeStockName}' AND timestamp <= ${date.getTime() * 1000} AND timestamp >= ${aboveTimestamp * 1000} ORDER BY timestamp DESC LIMIT ${candlesCount}`);
     const start = Date.now();
     for await (const candle of candles) {
         stock.pushCandle(rowToCandle(candle, market));
