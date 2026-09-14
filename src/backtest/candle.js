@@ -8,15 +8,17 @@
  * @param {number} close - The close price.
  * @param {number} volume - The volume.
  * @param {number} timestamp - The timestamp.
+ * @param {number} quoteVolume - Traded value in USD.
  */
 class Candle {
-    constructor(open, high, low, close, volume, timestamp) {
+    constructor(open, high, low, close, volume, timestamp, quoteVolume = volume * close) {
         this.open = open;
         this.high = high;
         this.low = low;
         this.close = close;
         this.volume = volume;
         this.timestamp = timestamp;
+        this.quoteVolume = quoteVolume;
     }
 }
 

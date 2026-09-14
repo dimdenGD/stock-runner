@@ -29,6 +29,20 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
    ```
 4. Re-run to update data.
 
+### Binance (free, crypto futures)
+
+1. Download klines and funding rates into `data/binance/`:
+   ```bash
+   node scripts/binance_download.js <interval> [startMonth] [endMonth]
+   ```
+   - Example: `node scripts/binance_download.js 15m 2023-09`
+   - `interval` can be `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
+   - Re-run to update data.
+2. Ingest into QuestDB (`crypto_candles_<interval>` and `crypto_funding`):
+   ```bash
+   node scripts/binance_ingest.js <interval>
+   ```
+
 ### Massive (paid)
 
 1. Get API key from [massive.com](https://massive.com/)
@@ -76,7 +90,7 @@ const strategy = new Strategy({
 });
 ```
 
-- **`intervals`** - Timeframes your strategy uses. Keys: `'1d'`, `'1h'`, `'5m'`, `'1m'`.
+- **`intervals`** - Timeframes your strategy uses. Keys: `'1d'`, `'4h'`, `'1h'`, `'15m'`, `'5m'`, `'1m'`.
   - **`count`** - Number of bars to keep in lookback (≥ 1).
   - **`main: true`** - Exactly one interval must be main; it drives the simulation (one tick per bar).
   - **`preload`** - If `true`, bars are preloaded for speed; non-main intervals can set this to avoid on-demand DB reads.
@@ -111,6 +125,12 @@ bt.logMetrics(result);
 - **`logMetrics(metrics)`** - Prints summary (CAGR, Sharpe, max drawdown, win rate, etc.) and any open positions.
 - **`buildReport(metrics)`** - Builds a HTML report with charts and tables.
 
+**Crypto options:**
+
+- **`market`** - `'stocks'` (default) or `'crypto'`.
+- **`allowShort`** - Override shorting. Default: `true` for crypto, `false` for stocks.
+- **`maxLeverage`** - Maximum gross exposure / equity.
+
 **Metrics returned by `getMetrics()` / `runOnStock` / `runOnAllStocks`:**
 
 | Field           | Description                    |
@@ -125,6 +145,8 @@ bt.logMetrics(result);
 | `maxDrawdown`  | Worst peak-to-trough decline   |
 | `geoPeriodRet` | Geometric mean period return   |
 | `geoAnnualRet` | Geometric mean annualized return |
+| `totalFunding` | Crypto: funding paid (positive) or received (negative) |
+| `ruined`       | Crypto: equity hit zero and the run stopped |
 
 ### onTick context
 
@@ -153,6 +175,11 @@ bt.logMetrics(result);
   - `new Alpaca(slippage?)`
   - Commission: $0. Sells: FINRA TAF $0.000195/share (max $9.79, qty cap 50,205). All: CAT $0.0000265/share. Rounded up to nearest penny.
   - `slippage` - fraction (e.g. `0.001` = 0.1%), default `0`.
+- **`Binance`** - USD-M futures, fees as a share of notional:
+  - `new Binance({ feeBps, slippage, impactCoef })`
+  - `feeBps` - fee in basis points, default `5` (VIP0 taker).
+  - `slippage` - extra fraction of notional per fill, default `0`.
+  - `impactCoef` - square-root market impact, default `1`
 ---
 
 ## Strategies

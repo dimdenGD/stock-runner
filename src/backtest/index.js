@@ -2,36 +2,48 @@ import { formatDate, splitArray } from '../utils.js';
 import Broker from '../brokers/base.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
-import { loadStockBeforeTimestamp, loadAllStocksInRange } from './loader.js';
-import { intervalMsMap } from './consts.js';
+import { loadStockBeforeTimestamp, loadAllStocksInRange, loadFundingInRange } from './loader.js';
+import { intervalMsMap, markets } from './consts.js';
 import chalk from 'chalk';
 import { eachDayOfInterval, eachMinuteOfInterval, eachHourOfInterval, subDays, addDays, addMinutes } from 'date-fns';
 import ms from 'ms';
 
 const sharpePeriods = {
     '1d': 252,
+    '4h': 252 * 1.625, // 6.5 trading hours per day
     '1h': 252 * 6.5,   // 6.5 trading hours per day
+    '15m': 252 * 26,   // 26 fifteen-min bars per 6.5h day
     '5m': 252 * 78,    // 78 five-min bars per 6.5h day
     '1m': 252 * 390,   // 390 minutes in a trading day
 }
 
+const cryptoSharpePeriods = Object.fromEntries(
+    Object.entries(intervalMsMap).map(([name, ms]) => [name, 365 * 86400000 / ms])
+);
+
 const oneStockPreloadAmounts = {
     '1d': 600,
+    '4h': 1000,
     '1h': 2000,
+    '15m': 3000,
     '5m': 5000,
     '1m': 10000,
 }
 
 const allStocksPreloadAmounts = {
     '1d': 250,
+    '4h': 250,
     '1h': 500,
+    '15m': 500,
     '5m': 1000,
     '1m': 2000,
 }
 
 const preloadWindowMs = {
     '1d': 1000 * 60 * 60 * 24 * 365,   // 1 year
+    '4h': 1000 * 60 * 60 * 24 * 365,   // 1 year
     '1h': 1000 * 60 * 60 * 24 * 31 * 4,    // 4 months
+    '15m': 1000 * 60 * 60 * 24 * 7 * 4,    // 4 weeks
     '5m': 1000 * 60 * 60 * 24 * 7 * 4,    // 4 weeks
     '1m': 1000 * 60 * 60 * 24 * 14,    // 2 weeks
 }
@@ -98,7 +110,7 @@ export default class Backtest {
      * @param {Date}   params.endDate             – Backtest end
      * @param {number} params.startCashBalance    – Starting cash balance
      */
-    constructor({ strategy, startDate, endDate, startCashBalance, broker = new Broker(), logs = {}, features = [] }) {
+    constructor({ strategy, startDate, endDate, startCashBalance, broker = new Broker(), logs = {}, features = [], market = 'stocks', allowShort, maxLeverage }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -134,6 +146,18 @@ export default class Backtest {
 
         this.logs = logs;
         this.featuresDef = features;
+
+        if (!markets.includes(market)) {
+            throw new TypeError(`market must be one of: ${markets.join(', ')}`);
+        }
+        this.market = market;
+        this.allowShort = allowShort ?? market === 'crypto';
+        this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : null);
+        this.positions = {};      // stockName -> { avgPrice, entryFees }
+        this.totalFunding = 0;    // funding paid (+) or received (-)
+        this.fundingEvents = null;
+        this.lastSeen = {};       // crypto: stockName -> timestamp of its last candle
+        this.ruined = false;
     }
 
     async runOnStock(stockName) {
@@ -145,7 +169,7 @@ export default class Backtest {
         for(let iv in this.strategy.intervals) {
             const interval = this.strategy.intervals[iv];
             if(interval.preload) {
-                buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.startDate, this.endDate, interval.count, oneStockPreloadAmounts[interval.name]);
+                buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.startDate, this.endDate, interval.count, oneStockPreloadAmounts[interval.name], this.market);
             }
         }
         // preload initial chunks
@@ -162,7 +186,7 @@ export default class Backtest {
             if(!interval.preload) {
                 return new Promise(async (resolve, reject) => {
                     try {
-                        const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2);
+                        const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2, this.market);
                         if(stock.size < count) {
                             return resolve(null);
                         }
@@ -174,10 +198,15 @@ export default class Backtest {
             }
             const candles = buffers[intervalName].getLast(count, ts);
             if(candles.length < count) {
-                return resolve(null);
+                return null;
             }
-            return resolve(candles.reverse().slice(0, count));
+            return candles.slice(0, count);
         };
+
+        if (this.market === 'crypto') {
+            this.fundingEvents = await loadFundingInRange(new Date(this.startDate.getTime() - 86400000), this.endDate);
+        }
+        let prevTs = null;
 
         // iterate once we have full lookback
         for (let i = lookback - 1; i < mainBuf.length; i++) {
@@ -191,6 +220,10 @@ export default class Backtest {
             );
 
             this.stockPrices[stockName] = mainCandle.close;
+            if (this.market === 'crypto') {
+                this.applyFunding(prevTs ?? ts, ts);
+                prevTs = ts;
+            }
 
             const tickObj = {
                 stockName,
@@ -206,8 +239,8 @@ export default class Backtest {
                     }
                     return getCandles(ts, intervalName, count);
                 },
-                buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp, tickObj._features),
-                sell: (quantity, price) => this.sell(stockName, quantity, price, mainCandle.timestamp),
+                buy: (quantity, price) => this.buy(stockName, quantity, price, mainCandle.timestamp, tickObj._features, mainCandle),
+                sell: (quantity, price) => this.sell(stockName, quantity, price, mainCandle.timestamp, mainCandle),
             };
             await this.strategy.onTick(tickObj);
 
@@ -219,18 +252,29 @@ export default class Backtest {
 
     async runOnAllStocks() {
         const interval = this.strategy.mainInterval.name;
-        const intervalFns = {
-            '1d': eachDayOfInterval,
-            '1h': eachHourOfInterval,
-            '5m': (opts) => eachStepMinuteOfInterval(opts, 5),
-            '1m': eachMinuteOfInterval,
-        };
-        const intervalFn = intervalFns[interval] ?? eachMinuteOfInterval;
-        const dates = intervalFn({ start: this.startDate, end: this.endDate });
+        let dates;
+        if (this.market === 'crypto') {
+            const stepMs = intervalMsMap[interval];
+            dates = [];
+            for (let t = Math.ceil(this.startDate.getTime() / stepMs) * stepMs; t <= this.endDate.getTime(); t += stepMs) {
+                dates.push(new Date(t));
+            }
+        } else {
+            const intervalFns = {
+                '1d': eachDayOfInterval,
+                '4h': (opts) => eachStepMinuteOfInterval(opts, 240),
+                '1h': eachHourOfInterval,
+                '15m': (opts) => eachStepMinuteOfInterval(opts, 15),
+                '5m': (opts) => eachStepMinuteOfInterval(opts, 5),
+                '1m': eachMinuteOfInterval,
+            };
+            const intervalFn = intervalFns[interval] ?? eachMinuteOfInterval;
+            dates = intervalFn({ start: this.startDate, end: this.endDate });
+        }
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
         const start = Date.now();
 
-        if(interval === '1d') {
+        if(interval === '1d' && this.market !== 'crypto') {
             for(const date of dates) {
                 // set to 4 PM EST (closing time)
                 const nyDate = setHoursDifferentTZ(date, 'America/New_York', [16, 0, 0]);
@@ -239,7 +283,7 @@ export default class Backtest {
         }
 
         const dbFallback = (stockName, intervalName, ts, count) => {
-            return loadStockBeforeTimestamp(stockName, intervalName, new Date(ts), count * 2)
+            return loadStockBeforeTimestamp(stockName, intervalName, new Date(ts), count * 2, this.market)
                 .then(loaded => {
                     if(loaded.size < count) return null;
                     return [...loaded].slice(0, count);
@@ -266,7 +310,7 @@ export default class Backtest {
                     const windowMs = preloadWindowMs[ivName];
                     const startDate = new Date(ts - lookbackMs);
                     const endDate = new Date(ts + windowMs);
-                    preloadedStocks[ivName] = await loadAllStocksInRange(ivName, startDate, endDate);
+                    preloadedStocks[ivName] = await loadAllStocksInRange(ivName, startDate, endDate, this.market);
                     preloadWindowEnd[ivName] = endDate.getTime();
                 }
             }
@@ -316,14 +360,21 @@ export default class Backtest {
         }
 
         let min = this.strategy.mainInterval.count;
+        if (this.market === 'crypto') {
+            this.fundingEvents = await loadFundingInRange(new Date(this.startDate.getTime() - 86400000), this.endDate);
+        }
+        let prevTs = null;
         for(let i = 0; i < chunks.length; i++) {
+            if (this.ruined) break;
             const chunk = chunks[i];
             console.log(`++++++++++++++++++++ ${((i / chunks.length) * 100).toFixed(2)}%`);
-            const stocks = await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
+            const stocks = this.market === 'crypto'
+                ? await loadAllStocksInRange(interval, new Date(chunk[0].getTime() - (min * 2 + 1) * intervalMsMap[interval]), chunk[chunk.length - 1], 'crypto')
+                : await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
             for(const currentDate of chunk) {
                 await ensurePreloaded(currentDate);
                 const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
-                if(day === 'Sat' || day === 'Sun') {
+                if(this.market !== 'crypto' && (day === 'Sat' || day === 'Sun')) {
                     continue;
                 }
                 if(currentDate < chunk[0]) {
@@ -335,6 +386,10 @@ export default class Backtest {
                     const stock = stocks[stockName];
                     const candle = stock.getCandle(stock.getIndex(currentDate));
                     if(!candle) continue;
+                    if (this.market === 'crypto') {
+                        if (candle.timestamp !== currentDate.getTime()) continue;
+                        this.lastSeen[stockName] = candle.timestamp;
+                    }
 
                     this.stockPrices[stockName] = candle.close;
 
@@ -351,15 +406,31 @@ export default class Backtest {
                             }
                             return getCandles(ts, stock, intervalName, count);
                         },
-                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate, item._features),
-                        sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate),
+                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate, item._features, candle),
+                        sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate, candle),
                     };
                     arr.push(item);
                 }
 
                 if(arr.length > 0) {
+                    if (this.market === 'crypto') {
+                        const ts = currentDate.getTime();
+                        this.applyFunding(prevTs ?? ts, ts);
+                        prevTs = ts;
+                        for (const stockName in this.stockBalances) {
+                            if (ts - (this.lastSeen[stockName] ?? ts) > 3 * 86400000) {
+                                this.settle(stockName, currentDate);
+                            }
+                        }
+                        if (this.totalValue() <= 0) {
+                            this.ruined = true;
+                            console.log(chalk.red(`ACCOUNT LIQUIDATED ON ${formatDate(currentDate)}`));
+                            this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
+                            break;
+                        }
+                    }
                     // delisted stocks
-                    if(Object.keys(this.stockBalances).length > 0) {
+                    if(this.market !== 'crypto' && Object.keys(this.stockBalances).length > 0) {
                         for(const stockName in this.stockBalances) {
                             if(!arr.find(s => s.stockName === stockName)) {
                                 this.delistCounter[stockName] = (this.delistCounter[stockName] || 0) + 1;
@@ -391,99 +462,152 @@ export default class Backtest {
         return this.cashBalance + Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + quantity * this.stockPrices[stockName], 0);
     }
 
-    buy(stockName, quantity, price, timestamp, features) {
-        const cost = quantity * price;
-        const fee = this.broker.calculateFees(quantity, price, 'buy');
-        if (cost + fee > this.cashBalance) {
-            throw new Error(`Insufficient cash: need ${cost + fee}, have ${this.cashBalance}`);
-        }
-        this.cashBalance -= (cost + fee);
-        this.stockBalances[stockName] = (this.stockBalances[stockName] || 0) + quantity;
-        this.totalFees += fee;
-        this.swaps.push({ type: 'buy', quantity, price, timestamp, fee, stockName });
-        this.stockPrices[stockName] = price;
-        this.holdSince[stockName] = timestamp;
-        if (features != null && Array.isArray(features)) {
-            this.stockFeatures[stockName] = features;
-        }
+    grossExposure() {
+        return Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + Math.abs(quantity * this.stockPrices[stockName]), 0);
+    }
 
-        if(this.logs.swaps) {
-            const equity = this.totalValue();
-            console.log(
-                chalk.gray(`${formatDate(new Date(timestamp))} `) +
-                chalk.bold(`${stockName.padEnd(7)} `) +
-                chalk.greenBright(`BUY  `) +
-                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
-                chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +
-                chalk.gray(` | `) +
-                chalk.white(`$${Math.round(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
-                chalk.white(` + $${Math.round(fee).toLocaleString('en-US')} fee`.padEnd(16)) +
-                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
-            );
+    applyFunding(fromTs, toTs) {
+        if (!this.fundingEvents) return;
+        for (const stockName in this.stockBalances) {
+            const ev = this.fundingEvents[stockName];
+            if (!ev) continue;
+            let lo = 0, hi = ev.time.length;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if (ev.time[mid] < fromTs) lo = mid + 1; else hi = mid; }
+            for (let i = lo; i < ev.time.length && ev.time[i] < toTs; i++) {
+                const pay = this.stockBalances[stockName] * this.stockPrices[stockName] * ev.rate[i];
+                this.cashBalance -= pay;
+                this.totalFunding += pay;
+            }
         }
     }
 
-    sell(stockName, quantity, price, timestamp) {
-        if(!this.stockBalances[stockName]) {
-            throw new Error(`Insufficient shares: have 0, trying to sell ${quantity}`);
-        }
-        if (quantity > this.stockBalances[stockName]) {
-            throw new Error(`Insufficient shares: have ${this.stockBalances[stockName]}, trying to sell ${quantity}`);
-        }
-        const proceeds = quantity * price;
-        const fee = this.broker.calculateFees(quantity, price, 'sell');
-        this.cashBalance += (proceeds - fee);
-        this.stockBalances[stockName] -= quantity;
-        this.totalFees += fee;
-        this.stockPrices[stockName] = price;
+    settle(stockName, timestamp) {
+        const quantity = this.stockBalances[stockName];
+        if (!quantity) return;
+        console.log(chalk.red(`${stockName} DELISTED - settled at $${this.stockPrices[stockName]} on ${formatDate(new Date(+timestamp))}`));
+        this._trade(stockName, -quantity, this.stockPrices[stockName], timestamp, null, null, { settle: true });
+    }
 
-        if(this.logs.swaps) {
+    buy(stockName, quantity, price, timestamp, features, candle) {
+        this._trade(stockName, quantity, price, timestamp, features, candle);
+    }
+
+    sell(stockName, quantity, price, timestamp, candle) {
+        this._trade(stockName, -quantity, price, timestamp, null, candle);
+    }
+
+    _trade(stockName, signedQty, price, timestamp, features, candle, { settle = false } = {}) {
+        const side = signedQty > 0 ? 'buy' : 'sell';
+        const quantity = Math.abs(signedQty);
+        if (!(quantity > 0) || !isFinite(quantity) || !(price > 0)) {
+            throw new Error(`Invalid order: ${side} ${quantity} ${stockName} @ ${price}`);
+        }
+        const prev = this.stockBalances[stockName] || 0;
+
+        if (side === 'sell' && !this.allowShort) {
+            if (!prev) {
+                throw new Error(`Insufficient shares: have 0, trying to sell ${quantity}`);
+            }
+            if (quantity > prev) {
+                throw new Error(`Insufficient shares: have ${prev}, trying to sell ${quantity}`);
+            }
+        }
+        if (this.market === 'crypto' && !settle && candle && !(candle.volume > 0)) {
+            throw new Error(`Untradeable: ${stockName} had no volume in this bar`);
+        }
+
+        const fee = this.broker.calculateFees(quantity, price, side, candle);
+        const notional = quantity * price;
+        let next = prev + signedQty;
+        if (Math.abs(next) <= 1e-12 * Math.max(1, Math.abs(prev))) next = 0;
+
+        this.stockPrices[stockName] = price;
+        if (this.maxLeverage == null) {
+            if (side === 'buy' && notional + fee > this.cashBalance) {
+                throw new Error(`Insufficient cash: need ${notional + fee}, have ${this.cashBalance}`);
+            }
+        } else if (!settle) {
+            const grossNow = this.grossExposure();
+            const grossAfter = grossNow - Math.abs(prev * price) + Math.abs(next * price);
+            const equity = this.totalValue() - fee;
+            if (grossAfter > grossNow + 1e-9 && grossAfter > this.maxLeverage * equity) {
+                throw new Error(`Insufficient margin: ${stockName} would take gross exposure to $${Math.round(grossAfter)} on $${Math.round(equity)} equity (max ${this.maxLeverage}x)`);
+            }
+        }
+
+        this.cashBalance += side === 'buy' ? -(notional + fee) : (notional - fee);
+        this.totalFees += fee;
+        this.swaps.push({ type: side, quantity, price, timestamp, fee, stockName });
+        if (this.market === 'crypto' && this.lastSeen[stockName] == null) this.lastSeen[stockName] = +timestamp;
+
+        if (this.logs.swaps) {
             const equity = this.totalValue();
             console.log(
-                chalk.gray(`${formatDate(new Date(timestamp))} `) +
+                chalk.gray(`${formatDate(new Date(+timestamp))} `) +
                 chalk.bold(`${stockName.padEnd(7)} `) +
-                chalk.redBright(`SELL `) +
+                (side === 'buy' ? chalk.greenBright(`BUY  `) : chalk.redBright(`SELL `)) +
                 chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
                 chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +
                 chalk.gray(` | `) +
-                chalk.white(`$${Math.round(price * quantity).toLocaleString('en-US')}`.padEnd(11)) +
+                chalk.white(`$${Math.round(notional).toLocaleString('en-US')}`.padEnd(11)) +
                 chalk.white(` + $${Math.round(fee).toLocaleString('en-US')} fee`.padEnd(16)) +
                 chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
             );
         }
-        const swaps = this.swaps.toReversed().filter(t => t.stockName === stockName);
-        const lastSell = swaps.findIndex(t => t.type === 'sell');
-        const buys = swaps.slice(0, lastSell === -1 ? swaps.length : lastSell).filter(t => t.type === 'buy');
-        const cost = buys.reduce((acc, t) => acc + t.quantity * t.price, 0);
-        const buyFees = buys.reduce((acc, t) => acc + t.fee, 0);
-        const profit = proceeds - cost - buyFees - fee;
-        const profitPercent = cost ? profit / cost : 0;
-        const features = this.stockFeatures[stockName];
-        this.trades.push({ stockName, quantity, price, timestamp, fee, profit, profitPercent, features: features ?? undefined });
 
-        if(this.logs.trades) {
-            const holdTime = ms(timestamp - this.holdSince[stockName]);
-            let line = chalk.gray(`${formatDate(new Date(timestamp))} `) +
-                chalk.bold(`${stockName.padEnd(7)} `) +
-                chalk[profit > 0 ? 'green' : 'red'](
-                    `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
-                    `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
-                ) +
-                chalk.white(`${holdTime}`.padEnd(5)) +
-                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`);
-            if (features != null && features.length > 0) {
-                line += chalk.cyan(` [${features.map(f => typeof f === 'number' ? f.toFixed(4) : f).join(', ')}]`);
+        const pos = this.positions[stockName] ?? { avgPrice: 0, entryFees: 0 };
+        const closing = prev !== 0 && Math.sign(signedQty) !== Math.sign(prev);
+        const closedQty = closing ? Math.min(quantity, Math.abs(prev)) : 0;
+
+        if (closedQty > 0) {
+            const dir = Math.sign(prev);
+            const entryFee = pos.entryFees * (closedQty / Math.abs(prev));
+            const exitFee = fee * (closedQty / quantity);
+            const profit = dir * closedQty * (price - pos.avgPrice) - entryFee - exitFee;
+            const profitPercent = profit / (closedQty * pos.avgPrice);
+            pos.entryFees -= entryFee;
+            const tradeFeatures = this.stockFeatures[stockName];
+            this.trades.push({
+                stockName, side: dir > 0 ? 'long' : 'short', quantity: closedQty, price, entryPrice: pos.avgPrice,
+                timestamp, fee: exitFee, profit, profitPercent, features: tradeFeatures ?? undefined,
+            });
+
+            if (this.logs.trades) {
+                const holdTime = ms(Math.max(0, +timestamp - +this.holdSince[stockName]));
+                let line = chalk.gray(`${formatDate(new Date(+timestamp))} `) +
+                    chalk.bold(`${stockName.padEnd(7)} `) +
+                    (dir < 0 ? chalk.magenta('SHORT ') : '') +
+                    chalk[profit > 0 ? 'green' : 'red'](
+                        `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
+                        `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
+                    ) +
+                    chalk.white(`${holdTime}`.padEnd(5)) +
+                    chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`);
+                if (tradeFeatures != null && tradeFeatures.length > 0) {
+                    line += chalk.cyan(` [${tradeFeatures.map(f => typeof f === 'number' ? f.toFixed(4) : f).join(', ')}]`);
+                }
+                console.log(line);
             }
-            console.log(line);
         }
 
-        if(this.stockBalances[stockName] === 0) {
+        const opened = quantity - closedQty;
+        if (opened > 0 && next !== 0) {
+            const base = closing ? 0 : Math.abs(prev);
+            pos.avgPrice = (base * (closing ? 0 : pos.avgPrice) + opened * price) / (base + opened);
+            pos.entryFees = (closing ? 0 : pos.entryFees) + fee * (opened / quantity);
+            if (base === 0) this.holdSince[stockName] = timestamp;
+            if (features != null && Array.isArray(features)) this.stockFeatures[stockName] = features;
+        }
+
+        if (next === 0) {
             delete this.stockBalances[stockName];
+            delete this.positions[stockName];
             delete this.holdSince[stockName];
             delete this.stockFeatures[stockName];
+        } else {
+            this.stockBalances[stockName] = next;
+            this.positions[stockName] = pos;
         }
-
-        this.swaps.push({ type: 'sell', quantity, price, timestamp, fee, stockName });
     }
 
     getMetrics() {
@@ -508,7 +632,7 @@ export default class Backtest {
         const CAGR         = Math.pow(1 + totalReturn, 1 / years) - 1;
 
         /* ---------- Sharpe (annualised) -------------------------------- */
-        const periodsPerYr = sharpePeriods[this.strategy.mainInterval.name] ?? 252;
+        const periodsPerYr = (this.market === 'crypto' ? cryptoSharpePeriods : sharpePeriods)[this.strategy.mainInterval.name] ?? 252;
         const meanRet      = periodRets.reduce((s, r) => s + r, 0) / periodRets.length;
         const stdRet       = Math.sqrt(
             periodRets.reduce((s, r) => s + (r - meanRet) ** 2, 0) / periodRets.length
@@ -564,6 +688,8 @@ export default class Backtest {
             geoPeriodRet,
             geoAnnualRet,
             featureCorrelations,
+            totalFunding  : this.totalFunding,
+            ruined        : this.ruined,
         };
     }
 
@@ -580,6 +706,10 @@ export default class Backtest {
         console.log(`Period            : ${this.startDate.toISOString().slice(0,10)} → ${this.endDate.toISOString().slice(0,10)}`);
         console.log(`Trades            : ${this.trades.length}  (win-rate ${(this.trades.filter(t => t.profit > 0).length / this.trades.length * 100).toFixed(2)}%) / ${this.swaps.length} swaps`);
         console.log(`Fees              : $${Math.round(this.totalFees).toLocaleString('en-US')}`);
+        if (this.market === 'crypto') {
+            const funding = Math.round(Math.abs(this.totalFunding)).toLocaleString('en-US');
+            console.log(`Funding           : ${this.totalFunding <= 0 ? chalk.greenBright(`received $${funding}`) : chalk.redBright(`paid $${funding}`)}`);
+        }
         console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US'))} ($${this.startCashBalance.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);

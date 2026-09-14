@@ -5,8 +5,8 @@ import { loadStockAfterTimestamp, loadStockBeforeTimestamp } from './loader.js';
  * Returns a plain Candle[] instead of a Stock,
  * so our buffer logic is simpler.
  */
-async function fetchCandlesAfter(stockName, interval, startDate, count) {
-    const stock = await loadStockAfterTimestamp(stockName, interval, startDate, count);
+async function fetchCandlesAfter(stockName, interval, startDate, count, market) {
+    const stock = await loadStockAfterTimestamp(stockName, interval, startDate, count, market);
     return [...stock];         // Stock is iterable over Candle
 }
 
@@ -18,8 +18,9 @@ export default class CandleBuffer {
      * @param {Date}   endDate    – backtest end
      * @param {number} lookback   – how many past bars your strategy will ever request
      */
-    constructor(stockName, interval, startDate, endDate, lookback, prefetch) {
+    constructor(stockName, interval, startDate, endDate, lookback, prefetch, market = 'stocks') {
       this.stockName = stockName;
+      this.market    = market;
       this.interval  = interval;
       this.startDate = startDate;
       this.endDate   = endDate;
@@ -47,7 +48,8 @@ export default class CandleBuffer {
         this.stockName,
         this.interval,
         this.nextTs,
-        this.prefetch
+        this.prefetch,
+        this.market
       );
   
       if (chunk.length === 0) {
