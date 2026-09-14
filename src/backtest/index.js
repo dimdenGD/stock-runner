@@ -575,8 +575,8 @@ export default class Backtest {
             if (this.logs.trades) {
                 const holdTime = ms(Math.max(0, +timestamp - +this.holdSince[stockName]));
                 let line = chalk.gray(`${formatDate(new Date(+timestamp))} `) +
-                    chalk.bold(`${stockName.padEnd(7)} `) +
-                    (dir < 0 ? chalk.magenta('SHORT ') : '') +
+                    chalk.bold(`${stockName.padEnd(this.market === 'crypto' ? 15 : 7)} `) +
+                    (dir < 0 ? chalk.magenta('SHORT ') : chalk.blue('LONG  ')) +
                     chalk[profit > 0 ? 'green' : 'red'](
                         `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
                         `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
