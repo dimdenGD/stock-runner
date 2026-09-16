@@ -22,7 +22,7 @@ export default class BinanceKlineStream {
         symbols,
         interval,
         stepMs,
-        url = 'wss://fstream.binance.com/ws',
+        url = 'wss://fstream.binance.com/market/ws',
         graceMs = 5000,
         staleMs = 90000,
         reconnectMinMs = 1000,
