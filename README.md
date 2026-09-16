@@ -176,10 +176,11 @@ bt.logMetrics(result);
   - Commission: $0. Sells: FINRA TAF $0.000195/share (max $9.79, qty cap 50,205). All: CAT $0.0000265/share. Rounded up to nearest penny.
   - `slippage` - fraction (e.g. `0.001` = 0.1%), default `0`.
 - **`Binance`** - USD-M futures, fees as a share of notional:
-  - `new Binance({ feeBps, slippage, impactCoef })`
+  - `new Binance({ feeBps, slippage, impactCoef, depthRatio })`
   - `feeBps` - fee in basis points, default `5` (VIP0 taker).
   - `slippage` - extra fraction of notional per fill, default `0`.
-  - `impactCoef` - square-root market impact, default `1`
+  - `impactCoef` - multiplier on the book walk, default `1`
+  - `depthRatio` - depth within 1% of mid, as a fraction of the bar quote volume
 ---
 
 ## Strategies

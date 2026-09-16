@@ -388,7 +388,7 @@ export default class Backtest {
                     if(!candle) continue;
                     if (this.market === 'crypto') {
                         if (candle.timestamp !== currentDate.getTime()) continue;
-                        this.lastSeen[stockName] = candle.timestamp;
+                        if (candle.volume > 0) this.lastSeen[stockName] = candle.timestamp;
                     }
 
                     this.stockPrices[stockName] = candle.close;
