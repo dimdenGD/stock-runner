@@ -3,11 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
-  "scripts": {
-    "test": "node test/forward.test.js",
-    "xsdd:backtest": "node strategies/private/crypto_xsdd.js",
-    "xsdd:forward": "node strategies/private/crypto_xsdd_forward.js"
-  },
+  "scripts": {},
   "author": "",
   "license": "ISC",
   "description": "",

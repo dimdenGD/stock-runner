@@ -51,8 +51,14 @@ export default class BinanceKlineStream {
         this.stopped = false;
         this.connectionId = 0;
         this.requestId = 1;
+        this.requests = new Map();
         this.reconnectDelay = reconnectMinMs;
         this.lastMessageAt = 0;
+        this.lastDataAt = 0;
+        this.connectedAt = 0;
+        this.dataMessages = 0;
+        this.closedKlines = 0;
+        this.healthWaiters = [];
         this.pending = new Map();
         this.finalized = new Set();
         this.queue = [];
@@ -69,7 +75,9 @@ export default class BinanceKlineStream {
         if (!this.open || !this.socket || !symbols.length) return;
         for (let i = 0; i < symbols.length; i += this.subscribeBatchSize) {
             const params = symbols.slice(i, i + this.subscribeBatchSize).map(s => this.streamName(s));
-            this.socket.send(JSON.stringify({ method, params, id: this.requestId++ }));
+            const id = this.requestId++;
+            this.requests.set(id, { method, streams: params.length });
+            this.socket.send(JSON.stringify({ method, params, id }));
         }
     }
 
@@ -92,8 +100,9 @@ export default class BinanceKlineStream {
         this.stopped = false;
         await this.connect();
         this.watchdog = setInterval(() => {
-            if (this.open && this.lastMessageAt && Date.now() - this.lastMessageAt > this.staleMs) {
-                this.logger.warn(`Binance WebSocket stale for ${Date.now() - this.lastMessageAt}ms; reconnecting`);
+            const lastData = this.lastDataAt || this.connectedAt;
+            if (this.open && lastData && Date.now() - lastData > this.staleMs) {
+                this.logger.warn(`Binance WebSocket has no market data for ${Date.now() - lastData}ms; reconnecting`);
                 this.socket?.close(4000, 'stale');
             }
         }, Math.min(30000, Math.max(1000, Math.floor(this.staleMs / 3))));
@@ -109,8 +118,11 @@ export default class BinanceKlineStream {
             listen(socket, 'open', () => {
                 if (id !== this.connectionId || this.stopped) return;
                 this.open = true;
-                this.lastMessageAt = Date.now();
+                this.connectedAt = Date.now();
+                this.lastMessageAt = this.connectedAt;
+                this.lastDataAt = 0;
                 this.reconnectDelay = this.reconnectMinMs;
+                this.logger.log(`Binance WebSocket connected; subscribing to ${this.symbols.size} ${this.interval} streams`);
                 this.send('SUBSCRIBE', [...this.symbols]);
                 settled = true;
                 resolve();
@@ -153,10 +165,28 @@ export default class BinanceKlineStream {
         const raw = await messageText(event);
         const parsed = JSON.parse(raw);
         const data = parsed.data || parsed;
-        if (data.result === null && data.id != null) return;
-        if (data.e !== 'kline' || !data.k?.x || data.k.i !== this.interval) return;
+        if (data.id != null && (Object.hasOwn(data, 'result') || data.code != null)) {
+            const request = this.requests.get(data.id);
+            this.requests.delete(data.id);
+            if (data.code != null) {
+                this.logger.error(`Binance WebSocket ${request?.method || 'request'} failed: ${data.code} ${data.msg || ''}`.trim());
+            } else {
+                this.logger.log(`Binance WebSocket ${request?.method || 'request'} acknowledged (${request?.streams || 0} streams)`);
+            }
+            return;
+        }
+        if (data.e !== 'kline' || data.k?.i !== this.interval) return;
         const symbol = String(data.s || data.k.s);
         if (!this.symbols.has(symbol)) return;
+        const firstOnConnection = !this.lastDataAt;
+        this.lastDataAt = Date.now();
+        this.dataMessages++;
+        if (firstOnConnection) {
+            this.logger.log(`Binance WebSocket market data live: ${symbol} ${this.interval}`);
+            for (const waiter of this.healthWaiters.splice(0)) waiter.resolve(this.getHealth());
+        }
+        if (!data.k.x) return;
+        this.closedKlines++;
         const timestamp = Number(data.k.t) + this.stepMs;
         if (!Number.isFinite(timestamp) || this.finalized.has(timestamp)) return;
         const candle = new Candle(
@@ -205,6 +235,34 @@ export default class BinanceKlineStream {
         return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
     }
 
+    getHealth() {
+        return {
+            connected: this.open,
+            symbols: this.symbols.size,
+            lastMessageAt: this.lastMessageAt,
+            lastDataAt: this.lastDataAt,
+            dataMessages: this.dataMessages,
+            closedKlines: this.closedKlines,
+        };
+    }
+
+    waitForData(timeoutMs = 15000) {
+        if (this.lastDataAt) return Promise.resolve(this.getHealth());
+        if (this.stopped) return Promise.reject(new Error('Binance WebSocket is stopped'));
+        return new Promise((resolve, reject) => {
+            const waiter = {
+                resolve: value => { clearTimeout(timer); resolve(value); },
+                reject: error => { clearTimeout(timer); reject(error); },
+            };
+            const timer = setTimeout(() => {
+                const at = this.healthWaiters.indexOf(waiter);
+                if (at >= 0) this.healthWaiters.splice(at, 1);
+                reject(new Error(`Binance WebSocket opened but received no market data within ${timeoutMs}ms`));
+            }, timeoutMs);
+            this.healthWaiters.push(waiter);
+        });
+    }
+
     async stop() {
         this.stopped = true;
         this.open = false;
@@ -212,10 +270,12 @@ export default class BinanceKlineStream {
         if (this.watchdog) clearInterval(this.watchdog);
         for (const batch of this.pending.values()) clearTimeout(batch.timer);
         this.pending.clear();
+        this.requests.clear();
         const socket = this.socket;
         this.socket = null;
         try { socket?.close(1000, 'stopped'); } catch {}
         for (const waiter of this.waiters.splice(0)) waiter.resolve(null);
+        for (const waiter of this.healthWaiters.splice(0)) waiter.reject(new Error('Binance WebSocket stopped before receiving market data'));
         await sleep(0);
     }
 }

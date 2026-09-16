@@ -37,6 +37,7 @@ export default class ForwardRunner {
         concurrency = 16,
         symbolRefreshMs = 3600000,
         streamGraceMs = 5000,
+        streamHealthTimeoutMs = 15000,
         maxMissingFraction = 0.02,
         streamFactory = null,
         dryRun = false,
@@ -68,6 +69,7 @@ export default class ForwardRunner {
         this.concurrency = concurrency;
         this.symbolRefreshMs = symbolRefreshMs;
         this.streamGraceMs = streamGraceMs;
+        this.streamHealthTimeoutMs = streamHealthTimeoutMs;
         this.maxMissingFraction = maxMissingFraction;
         this.streamFactory = streamFactory;
         this.dryRun = dryRun;
@@ -333,6 +335,9 @@ export default class ForwardRunner {
             logger: this.logger,
         });
         await this.stream.start();
+        if (this.streamHealthTimeoutMs > 0 && typeof this.stream.waitForData === 'function') {
+            await this.stream.waitForData(this.streamHealthTimeoutMs);
+        }
         return this.preload();
     }
 
