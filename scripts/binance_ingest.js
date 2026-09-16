@@ -15,17 +15,31 @@ if (!intervalMsMap[interval] || !fs.existsSync(klineDir)) {
 const stepMs = intervalMsMap[interval];
 const toMs = (x) => (x > 1e14 ? Math.floor(x / 1000) : x);
 const isDataLine = (line) => line.charCodeAt(0) >= 48 && line.charCodeAt(0) <= 57; // skips headers
+const yyyymm = (ms) => {
+    const d = new Date(ms);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+const lastMonthOf = async (table) => Object.fromEntries(
+    (await sql.unsafe(`SELECT ticker, timestamp FROM ${table} LATEST ON timestamp PARTITION BY ticker`))
+        .map(r => [r.ticker, yyyymm(new Date(r.timestamp).getTime())])
+);
 
 function csvLines(zipPath) {
     return unzipSingle(fs.readFileSync(zipPath)).toString('utf8').split('\n').filter(isDataLine);
 }
 const zipsIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.zip')).sort() : [];
 
+const lastCandleMonth = await lastMonthOf(`crypto_candles_${interval}`);
+const lastFundingMonth = await lastMonthOf('crypto_funding');
+console.log(`Resuming from last month: ${Object.keys(lastCandleMonth).length} tickers with candles, ${Object.keys(lastFundingMonth).length} with funding`);
+
 const symbols = fs.readdirSync(klineDir).sort();
 let candles = 0, funding = 0;
 const started = Date.now();
 for (const [i, sym] of symbols.entries()) {
+    const fromCandle = lastCandleMonth[sym];
     for (const f of zipsIn(`${klineDir}/${sym}`)) {
+        if (fromCandle && f.slice(0, 7) < fromCandle) continue;
         // open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore
         for (const line of csvLines(`${klineDir}/${sym}/${f}`)) {
             const c = line.split(',');
@@ -42,8 +56,10 @@ for (const [i, sym] of symbols.entries()) {
             candles++;
         }
     }
+    const fromFunding = lastFundingMonth[sym];
     const fundingDir = `data/binance/funding/${sym}`;
     for (const f of zipsIn(fundingDir)) {
+        if (fromFunding && f.slice(0, 7) < fromFunding) continue;
         // calc_time,funding_interval_hours,last_funding_rate
         for (const line of csvLines(`${fundingDir}/${f}`)) {
             const c = line.split(',');

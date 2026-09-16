@@ -4,7 +4,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test/forward.test.js",
+    "xsdd:backtest": "node strategies/private/crypto_xsdd.js",
+    "xsdd:forward": "node strategies/private/crypto_xsdd_forward.js"
   },
   "author": "",
   "license": "ISC",
