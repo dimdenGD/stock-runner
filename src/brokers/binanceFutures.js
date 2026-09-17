@@ -1,4 +1,6 @@
 import { createHash, createHmac } from 'node:crypto';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import Broker from './base.js';
 import Candle from '../backtest/candle.js';
 import BinanceKlineStream from './binanceKlineStream.js';
@@ -84,6 +86,9 @@ export default class BinanceFutures extends Broker {
         timeoutMs = 15000,
         maxRequestWeightPerMinute = 1800,
         fetchImpl = globalThis.fetch,
+        strictQuantization = false,
+        exchangeInfoCachePath = 'data/binance/exchangeInfo.json',
+        exchangeInfoMaxAgeMs = 7 * 86400000,
     } = {}) {
         super();
         if (!['demo', 'live'].includes(environment)) {
@@ -109,6 +114,10 @@ export default class BinanceFutures extends Broker {
         this.timeOffsetMs = 0;
         this.symbolRules = new Map();
         this.marketSymbols = new Set();
+        this.unquantizedSymbols = new Set();
+        this.strictQuantization = strictQuantization;
+        this.exchangeInfoCachePath = exchangeInfoCachePath;
+        this.exchangeInfoMaxAgeMs = exchangeInfoMaxAgeMs;
         this.limiter = new MinuteWeightLimiter(maxRequestWeightPerMinute);
     }
 
@@ -206,21 +215,7 @@ export default class BinanceFutures extends Broker {
         this.marketSymbols = new Set((market.symbols || [])
             .filter(s => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
             .map(s => s.symbol));
-        this.symbolRules.clear();
-        for (const s of execution.symbols || []) {
-            const lot = s.filters?.find(f => f.filterType === 'MARKET_LOT_SIZE')
-                || s.filters?.find(f => f.filterType === 'LOT_SIZE');
-            const minNotional = s.filters?.find(f => f.filterType === 'MIN_NOTIONAL');
-            this.symbolRules.set(s.symbol, {
-                status: s.status,
-                contractType: s.contractType,
-                quoteAsset: s.quoteAsset,
-                stepSize: Number(lot?.stepSize || 1),
-                minQty: Number(lot?.minQty || 0),
-                maxQty: Number(lot?.maxQty || Infinity),
-                minNotional: Number(minNotional?.notional || minNotional?.minNotional || 0),
-            });
-        }
+        this.applyExchangeRules(execution);
         return { market, execution };
     }
 
@@ -327,14 +322,66 @@ export default class BinanceFutures extends Broker {
         });
     }
 
-    normalizeQuantity(symbol, quantity, price, { reduceOnly = false } = {}) {
+    quantize(symbol, signedQty, price, { reduceOnly = false } = {}) {
         const r = this.symbolRules.get(symbol);
-        if (!r) throw new Error(`No Binance Futures exchange rules for ${symbol}`);
+        if (!r) {
+            if (this.strictQuantization) throw new Error(`No Binance Futures exchange rules for ${symbol}`);
+            this.unquantizedSymbols.add(symbol);
+            return signedQty;
+        }
         const step = r.stepSize;
-        const rounded = Math.floor((Math.abs(quantity) + step * 1e-9) / step) * step;
-        if (!(rounded >= r.minQty) || rounded > r.maxQty) return null;
-        if (!reduceOnly && price > 0 && rounded * price < r.minNotional) return null;
-        return rounded.toFixed(decimalsFor(step));
+        const rounded = Math.floor((Math.abs(signedQty) + step * 1e-9) / step) * step;
+        if (!(rounded >= r.minQty) || rounded > r.maxQty) return 0;
+        if (!reduceOnly && price > 0 && rounded * price < r.minNotional) return 0;
+        return Math.sign(signedQty) * rounded;
+    }
+
+    normalizeQuantity(symbol, quantity, price, { reduceOnly = false } = {}) {
+        if (!this.symbolRules.has(symbol)) throw new Error(`No Binance Futures exchange rules for ${symbol}`);
+        const signed = this.quantize(symbol, quantity, price, { reduceOnly });
+        if (!signed) return null;
+        return Math.abs(signed).toFixed(decimalsFor(this.symbolRules.get(symbol).stepSize));
+    }
+
+    async prepareBacktest() {
+        if (this.symbolRules.size) return;
+        const path = this.exchangeInfoCachePath;
+        const maxAgeMs = this.exchangeInfoMaxAgeMs;
+        let info = null;
+        try {
+            const stat = statSync(path);
+            if (Date.now() - stat.mtimeMs < maxAgeMs) info = JSON.parse(readFileSync(path, 'utf8'));
+        } catch {}
+        if (!info) {
+            const res = await fetch(`${PROD_REST}/fapi/v1/exchangeInfo`);
+            if (!res.ok) throw new BinanceFuturesError(`exchangeInfo failed: HTTP ${res.status}`, { status: res.status });
+            info = await res.json();
+            try {
+                mkdirSync(dirname(path), { recursive: true });
+                writeFileSync(path, JSON.stringify(info));
+            } catch {}
+        }
+        this.applyExchangeRules(info);
+        return this.symbolRules.size;
+    }
+
+    applyExchangeRules(info) {
+        this.symbolRules.clear();
+        for (const s of info.symbols || []) {
+            const lot = s.filters?.find(f => f.filterType === 'MARKET_LOT_SIZE')
+                || s.filters?.find(f => f.filterType === 'LOT_SIZE');
+            const minNotional = s.filters?.find(f => f.filterType === 'MIN_NOTIONAL');
+            this.symbolRules.set(s.symbol, {
+                status: s.status,
+                contractType: s.contractType,
+                quoteAsset: s.quoteAsset,
+                stepSize: Number(lot?.stepSize || 1),
+                minQty: Number(lot?.minQty || 0),
+                maxQty: Number(lot?.maxQty || Infinity),
+                minNotional: Number(minNotional?.notional || minNotional?.minNotional || 0),
+            });
+        }
+        return this.symbolRules;
     }
 
     async placeMarketOrder({ symbol, side, quantity, reduceOnly = false, clientOrderId }) {

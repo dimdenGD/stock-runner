@@ -154,6 +154,8 @@ bt.logMetrics(result);
 | `geoPeriodRet` | Geometric mean return per main-interval bar |
 | `geoAnnualRet` | Geometric mean annualized return |
 | `totalFunding` | Crypto: funding paid (positive) or received (negative) |
+| `skippedOrders`, `skippedNotional` | Orders the broker's `quantize` rejected, and their requested notional |
+| `quantizedOrders`, `quantizedDrift` | Orders rounded down to a lot boundary, and the notional lost to rounding |
 | `ruined`       | Crypto: equity hit zero and the run stopped |
 
 ### onTick context
@@ -179,6 +181,8 @@ bt.logMetrics(result);
 ### Brokers
 
 - **`Broker`** (base) - No fees, override `calculateFees(quantity, price, side)` for custom logic.
+  - `quantize(symbol, signedQty, price, { reduceOnly })` - Returns the signed quantity the venue would accept, or `0` to reject.
+  - `prepareBacktest()` - Awaited once by `Backtest.runOnAllTickers()`. Base is a no-op; override to load whatever `quantize` needs.
 - **`IBKR`** - Interactive Brokers:
   - `new IBKR('tiered')` or `new IBKR('fixed')`
   - Tiered: $0.0035/share, min $0.35, max 1% notional + clearing/regulatory.
@@ -196,6 +200,8 @@ bt.logMetrics(result);
   - `depthRatio` - depth within 1% of mid, as a fraction of the bar quote volume
   - `environment` - `demo` (default) or `live`.
   - `apiKey`, `apiSecret` - needed for forward testing.
+  - `strictQuantization` - throw instead of passing the order through when a symbol has no rules, default `false`.
+  - `quantize` floors to `MARKET_LOT_SIZE`/`LOT_SIZE` step and rejects below `minQty` or `MIN_NOTIONAL`
 
 ### ForwardRunner
 

@@ -22,6 +22,13 @@ export default class Broker {
         return 0;
     }
 
+    async prepareBacktest() {
+    }
+
+    quantize(symbol, signedQty, price, { reduceOnly = false } = {}) {
+        return signedQty;
+    }
+
     missingForwardMethods() {
         return FORWARD_METHODS.filter(method => typeof this[method] !== 'function');
     }

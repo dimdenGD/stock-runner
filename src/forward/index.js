@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import Strategy from '../backtest/strategy.js';
 import Broker from '../brokers/base.js';
+import { splitPositionOrder } from '../brokers/orderLegs.js';
 import { intervalMsMap, markets } from '../backtest/consts.js';
 import { formatSwapLine, formatTradeLine } from '../backtest/logFormat.js';
 import ForwardJournal from './journal.js';
@@ -20,17 +21,7 @@ async function pool(items, limit, fn) {
     return out;
 }
 
-export function splitPositionOrder(currentQty, signedQty) {
-    if (!(signedQty !== 0) || !Number.isFinite(signedQty)) return [];
-    if (!currentQty || Math.sign(currentQty) === Math.sign(signedQty)) {
-        return [{ signedQty, reduceOnly: false }];
-    }
-    const closing = Math.min(Math.abs(currentQty), Math.abs(signedQty));
-    const out = [{ signedQty: -Math.sign(currentQty) * closing, reduceOnly: true }];
-    const remainder = Math.abs(signedQty) - closing;
-    if (remainder > 1e-12) out.push({ signedQty: Math.sign(signedQty) * remainder, reduceOnly: false });
-    return out;
-}
+export { splitPositionOrder };
 
 const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
 

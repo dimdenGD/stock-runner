@@ -1,5 +1,6 @@
 import { formatDate } from '../utils.js';
 import Broker from '../brokers/base.js';
+import { splitPositionOrder } from '../brokers/orderLegs.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadFundingInRange } from './loader.js';
@@ -110,6 +111,10 @@ export default class Backtest {
         this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : null);
         this.positions = {};      // stockName -> { avgPrice, entryFees }
         this.totalFunding = 0;    // funding paid (+) or received (-)
+        this.skippedOrders = 0;   // rejected by exchange lot/notional minimums
+        this.skippedNotional = 0;
+        this.quantizedOrders = 0; // filled, but rounded down to a lot boundary
+        this.quantizedDrift = 0;
         this.fundingEvents = null;
         this.fundingCursor = {};
         this.lastSeen = {};       // crypto: stockName -> timestamp of its last candle
@@ -197,6 +202,7 @@ export default class Backtest {
     }
 
     async runOnAllTickers() {
+        await this.broker.prepareBacktest();
         return runAllTickersStream(this);
     }
 
@@ -274,11 +280,29 @@ export default class Backtest {
             throw new Error(`Orders are not allowed during warm-up: ${stockName}`);
         }
         const side = signedQty > 0 ? 'buy' : 'sell';
-        const quantity = Math.abs(signedQty);
-        if (!(quantity > 0) || !isFinite(quantity) || !(price > 0)) {
-            throw new Error(`Invalid order: ${side} ${quantity} ${stockName} @ ${price}`);
+        if (!(Math.abs(signedQty) > 0) || !isFinite(signedQty) || !(price > 0)) {
+            throw new Error(`Invalid order: ${side} ${Math.abs(signedQty)} ${stockName} @ ${price}`);
         }
         const prev = this.stockBalances[stockName] || 0;
+
+        if (!settle) {
+            const requested = signedQty;
+            let accepted = 0;
+            for (const leg of splitPositionOrder(prev, requested)) {
+                accepted += this.broker.quantize(stockName, leg.signedQty, price, { reduceOnly: leg.reduceOnly }) || 0;
+            }
+            if (!accepted) {
+                this.skippedOrders++;
+                this.skippedNotional += Math.abs(requested) * price;
+                return;
+            }
+            if (accepted !== requested) {
+                this.quantizedOrders++;
+                this.quantizedDrift += Math.abs(requested - accepted) * price;
+            }
+            signedQty = accepted;
+        }
+        const quantity = Math.abs(signedQty);
 
         if (side === 'sell' && !this.allowShort) {
             if (!prev) {
@@ -495,7 +519,7 @@ export default class Backtest {
         const pctColor = (v, d) => (v > 0 ? chalk.greenBright('+' + (v * 100).toFixed(d) + '%') : chalk.redBright('' + (v * 100).toFixed(d) + '%'));
         console.log(`Avg daily return  : ${pctColor(m.avgDaily, 3)}  (geo ${(m.geoDaily * 100).toFixed(3)}%, ${(m.dailyWinRate * 100).toFixed(1)}% of ${m.days} days up)`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
-        console.log(`Geo-mean ${this.strategy.mainInterval.name.padEnd(8)}: ${pctColor(m.geoPeriodRet, 4)}  (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)`);
+        console.log(`Geo-mean ${this.strategy.mainInterval.name.padEnd(9)}: ${pctColor(m.geoPeriodRet, 4)}  (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)`);
         console.log(`Geo-mean annual   : ${m.geoAnnualRet > 0 ? chalk.greenBright('+' + (m.geoAnnualRet * 100).toFixed(2) + '%') : chalk.redBright('' + (m.geoAnnualRet * 100).toFixed(2) + '%')}`);
         
         const maxDrawdownColor = m.maxDrawdown >= -0.025 ? 'cyanBright' : m.maxDrawdown >= -0.1 ? 'greenBright' : m.maxDrawdown >= -0.2 ? 'yellowBright' : m.maxDrawdown >= -0.3 ? 'redBright' : 'red';
