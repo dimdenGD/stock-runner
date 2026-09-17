@@ -272,6 +272,16 @@ export default class BinanceFutures extends Broker {
         await this.loadExchangeInfo();
     }
 
+    async excludedSymbols() {
+        if (!this.excludedSymbolSet) {
+            const market = await this.request('/fapi/v1/exchangeInfo');
+            this.excludedSymbolSet = new Set((market.symbols || [])
+                .filter(s => s.contractType !== 'PERPETUAL' || s.quoteAsset !== 'USDT')
+                .map(s => s.symbol));
+        }
+        return this.excludedSymbolSet;
+    }
+
     async getTradableSymbols() {
         await this.loadExchangeInfo();
         return [...this.symbolRules]

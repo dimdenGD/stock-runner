@@ -30,7 +30,10 @@ class Column {
      */
     finish() {
         // shrink‐wrap to exact length
-        return this.buffer.subarray(0, this.length);
+        if (this.length !== this.buffer.length) {
+            this.buffer = this.buffer.slice(0, this.length);
+        }
+        return this.buffer;
     }
 }
 

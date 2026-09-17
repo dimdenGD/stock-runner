@@ -42,4 +42,8 @@ export default class Broker {
     async getIncome() {
         return null;
     }
+
+    async excludedSymbols() {
+        return new Set();
+    }
 }

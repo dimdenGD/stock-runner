@@ -4,7 +4,7 @@ import { allowedIntervals } from './consts.js';
 export default class Strategy {
     /**
      * @param {Object} options
-     * @param {Object[]} options.intervals         — Array of { name, count, main, preload }
+     * @param {Object} options.intervals          — Map of interval names to { count, main }
      * @param {Function} options.onTick           — Called each tick with context
      * @throws {TypeError} on invalid intervals or onTick
      */
@@ -36,18 +36,19 @@ export default class Strategy {
             throw new TypeError('`name` may only contain letters, digits, dots, dashes and underscores');
         }
 
-        for(let iv in intervals) {
-            const interval = intervals[iv];
-            interval.name = iv;
-            interval.main = !!interval.main;
-            interval.preload = interval.main ? true : !!interval.preload;
-        }
+        const normalizedIntervals = Object.fromEntries(
+            Object.entries(intervals).map(([intervalName, interval]) => [intervalName, {
+                name: intervalName,
+                count: interval.count,
+                main: !!interval.main,
+            }]),
+        );
 
         this.name = resolvedName;
         this.params = params;
         this.warmup = warmup;
-        this.intervals = intervals;
-        this.mainInterval = mains[0];
+        this.intervals = normalizedIntervals;
+        this.mainInterval = Object.values(normalizedIntervals).find(interval => interval.main);
         this.onTick = onTick;
     }
 }

@@ -3,15 +3,45 @@ import { sql } from '../db.js';
 import { allowedIntervals, intervalMsMap, candleTable } from './consts.js';
 import Candle from './candle.js';
 import http from 'http';
-import parse from 'csv-simple-parser';
+import { StringDecoder } from 'node:string_decoder';
 
-const columnsFor = (market) => market === 'crypto' ? 'ticker, open, high, low, close, volume, quote_volume, timestamp' : '*';
+const columnsFor = (market) => market === 'crypto'
+    ? 'ticker, open, high, low, close, volume, quote_volume, cast(timestamp as long) timestamp_us'
+    : 'ticker, open, high, low, close, volume, cast(timestamp as long) timestamp_us';
+
+const timestampMs = value => {
+    const numeric = Number(value);
+    // QuestDB TIMESTAMP values cast to LONG are microseconds.
+    if (Number.isFinite(numeric)) return numeric / 1000;
+    return Date.parse(value);
+};
 
 function rowToCandle(row, market) {
     if (market === 'crypto') {
-        return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], new Date(row[7]).getTime(), +row[6]);
+        return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[7]), +row[6]);
     }
-    return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], new Date(row[row.length === 8 ? 7 : 6]).getTime());
+    return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[6]));
+}
+
+function pushRow(stock, row, market) {
+    if (market === 'crypto') {
+        stock.pushValues(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[7]), +row[6]);
+        return;
+    }
+    const close = +row[4];
+    const volume = +row[5];
+    stock.pushValues(+row[1], +row[2], +row[3], close, volume, timestampMs(row[6]), volume * close);
+}
+
+function parseCsvLine(line) {
+    const fields = line.split(',');
+    for (let i = 0; i < fields.length; i++) {
+        const field = fields[i];
+        if (field.length >= 2 && field.charCodeAt(0) === 34 && field.charCodeAt(field.length - 1) === 34) {
+            fields[i] = field.slice(1, -1).replaceAll('""', '"');
+        }
+    }
+    return fields;
 }
 
 /**
@@ -51,43 +81,35 @@ async function* fastFetch(
         throw new Error(`QuestDB error: ${res.statusCode}`);
     }
 
+    const decoder = new StringDecoder('utf8');
     let leftover = '';
-    let i = 0;
+    let header = true;
 
-    // 3) stream chunks, accumulate partial lines
+    const consumeLine = line => {
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (!line) return null;
+        if (header) {
+            header = false;
+            return null;
+        }
+        return parseCsvLine(line);
+    };
+
     for await (const chunk of res) {
-        const text = leftover + chunk.toString('utf8');
-        const lines = text.split(/\r?\n/);
-        leftover = lines.pop();  // last element is possibly an incomplete line
-
-        if (lines.length) {
-            // re-join complete lines into one CSV blob (you can also feed each line individually)
-            const csvBatch = lines.join('\n');
-            const parsed = parse(csvBatch);
-            for (const row of parsed) {
-                // skip header
-                if (i === 0) {
-                    i = 1;
-                    continue;
-                }
-                if (row.length === 0) {
-                    continue;
-                }
-                yield row;
-            }
+        const text = leftover + decoder.write(chunk);
+        let start = 0;
+        for (let i = 0; i < text.length; i++) {
+            if (text.charCodeAt(i) !== 10) continue;
+            const row = consumeLine(text.slice(start, i));
+            if (row) yield row;
+            start = i + 1;
         }
+        leftover = text.slice(start);
     }
 
-    // 4) flush any remaining line
-    if (leftover) {
-        const parsed = parse(leftover);
-        for (const row of parsed) {
-            if (row[0] === '') {
-                continue;
-            }
-            yield row;
-        }
-    }
+    leftover += decoder.end();
+    const row = consumeLine(leftover);
+    if (row) yield row;
 }
 
 /**
@@ -112,7 +134,7 @@ export async function loadStockInRange(stockName, interval, startDate, endDate, 
     const stock = new Stock(stockName, intervalMs);
     const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const candle of candles) {
-        stock.pushCandle(rowToCandle(candle, market));
+        pushRow(stock, candle, market);
     }
     stock.finish();
     return stock;
@@ -146,7 +168,7 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
     const stock = new Stock(stockName, intervalMs);
     const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
     for await (const candle of candles) {
-        stock.pushCandle(rowToCandle(candle, market));
+        pushRow(stock, candle, market);
     }
     stock.finish();
     return stock;
@@ -269,7 +291,7 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
     const candles = fastFetch(q);
     const start = Date.now();
     for await (const candle of candles) {
-        stock.pushCandle(rowToCandle(candle, market));
+        pushRow(stock, candle, market);
     }
     stock.finish();
     return stock;
@@ -301,13 +323,30 @@ export async function loadAllStocksInRange(interval, startDate, endDate, market 
         if (!stocks[stockName]) {
             stocks[stockName] = new Stock(stockName, intervalMs);
         }
-        stocks[stockName].pushCandle(rowToCandle(candle, market));
+        pushRow(stocks[stockName], candle, market);
     }
 
     for (const stock in stocks) {
         stocks[stock].finish();
     }
     return stocks;
+}
+
+/**
+ * Streams all candles in timestamp order without materializing per-symbol columns.
+ */
+export async function* streamAllStocksInRange(interval, startDate, endDate, market = 'stocks') {
+    if (!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
+    }
+    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
+        throw new TypeError('startDate and endDate must be instances of Date');
+    }
+
+    const rows = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    for await (const row of rows) {
+        yield { stockName: row[0], candle: rowToCandle(row, market) };
+    }
 }
 
 /**

@@ -27,23 +27,24 @@ class Stock {
      * @returns {number} The index of the candle.
      */
     getIndex(timestamp) {
+        const target = timestamp instanceof Date ? timestamp.getTime() : +timestamp;
         // binary search
         let left = 0;
         let right = this.size - 1;
         while(left <= right) {
-            const mid = Math.floor((left + right) / 2);
-            if(this.timestamps.buffer[mid] === timestamp) {
+            const mid = (left + right) >> 1;
+            if(this.timestamps.buffer[mid] === target) {
                 return mid;
             }
-            if(this.timestamps.buffer[mid] < timestamp) {
+            if(this.timestamps.buffer[mid] < target) {
                 left = mid + 1;
             } else {
                 right = mid - 1;
             }
         }
         if(left > 0 && right < this.size - 1) {
-            const leftDiff = Math.abs(this.timestamps.buffer[left - 1] - timestamp);
-            const rightDiff = Math.abs(this.timestamps.buffer[right + 1] - timestamp);
+            const leftDiff = Math.abs(this.timestamps.buffer[left - 1] - target);
+            const rightDiff = Math.abs(this.timestamps.buffer[right + 1] - target);
             return leftDiff < rightDiff ? left - 1 : right + 1;
         }
         return left;
@@ -90,13 +91,17 @@ class Stock {
      * @param {Candle} candle - The candle to push.
      */
     pushCandle(candle) {
-        this.volumes.push(candle.volume);
-        this.opens.push(candle.open);
-        this.closes.push(candle.close);
-        this.highs.push(candle.high);
-        this.lows.push(candle.low);
-        this.timestamps.push(candle.timestamp);
-        this.quoteVolumes.push(candle.quoteVolume);
+        this.pushValues(candle.open, candle.high, candle.low, candle.close, candle.volume, candle.timestamp, candle.quoteVolume);
+    }
+
+    pushValues(open, high, low, close, volume, timestamp, quoteVolume = volume * close) {
+        this.volumes.push(volume);
+        this.opens.push(open);
+        this.closes.push(close);
+        this.highs.push(high);
+        this.lows.push(low);
+        this.timestamps.push(timestamp);
+        this.quoteVolumes.push(quoteVolume);
         this.size++;
     }
 

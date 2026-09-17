@@ -1,13 +1,12 @@
-import { formatDate, splitArray } from '../utils.js';
+import { formatDate } from '../utils.js';
 import Broker from '../brokers/base.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
-import { loadStockBeforeTimestamp, loadAllStocksInRange, loadFundingInRange } from './loader.js';
+import { loadFundingInRange } from './loader.js';
 import { intervalMsMap, markets } from './consts.js';
 import chalk from 'chalk';
-import { eachDayOfInterval, eachMinuteOfInterval, eachHourOfInterval, subDays, addDays, addMinutes } from 'date-fns';
-import ms from 'ms';
 import { formatSwapLine, formatTradeLine } from './logFormat.js';
+import { runAllTickersStream } from './multiIntervalStream.js';
 
 const sharpePeriods = {
     '1d': 252,
@@ -22,7 +21,7 @@ const cryptoSharpePeriods = Object.fromEntries(
     Object.entries(intervalMsMap).map(([name, ms]) => [name, 365 * 86400000 / ms])
 );
 
-const oneStockPreloadAmounts = {
+const oneStockChunkBars = {
     '1d': 600,
     '4h': 1000,
     '1h': 2000,
@@ -30,37 +29,6 @@ const oneStockPreloadAmounts = {
     '5m': 5000,
     '1m': 10000,
 }
-
-const allStocksPreloadAmounts = {
-    '1d': 250,
-    '4h': 250,
-    '1h': 500,
-    '15m': 500,
-    '5m': 1000,
-    '1m': 2000,
-}
-
-const preloadWindowMs = {
-    '1d': 1000 * 60 * 60 * 24 * 365,   // 1 year
-    '4h': 1000 * 60 * 60 * 24 * 365,   // 1 year
-    '1h': 1000 * 60 * 60 * 24 * 31 * 4,    // 4 months
-    '15m': 1000 * 60 * 60 * 24 * 7 * 4,    // 4 weeks
-    '5m': 1000 * 60 * 60 * 24 * 7 * 4,    // 4 weeks
-    '1m': 1000 * 60 * 60 * 24 * 14,    // 2 weeks
-}
-
-/** Returns dates at step-minute intervals in [start, end]. */
-function eachStepMinuteOfInterval({ start, end }, stepMinutes) {
-    const dates = [];
-    let d = new Date(start);
-    while (d <= end) {
-        dates.push(d);
-        d = addMinutes(d, stepMinutes);
-    }
-    return dates;
-}
-
-
 
 function pearsonCorrelation(xs, ys) {
     const n = xs.length;
@@ -79,23 +47,6 @@ function pearsonCorrelation(xs, ys) {
     }
     const den = Math.sqrt(denX * denY);
     return den === 0 ? null : num / den;
-}
-
-const setHoursDifferentTZ = (inputDateTime, timeZone, setHoursArray) => {
-    inputDateTime.setHours(setHoursArray[0],setHoursArray[1]);
-
-    const dateTZShifted = inputDateTime.toLocaleString("en-US", {timeZone : timeZone , dateStyle: 'long', timeStyle: 'long'});
-    let timeTZShifted = dateTZShifted.split(" ").slice(4,5).join(' ').toString().split(':');
-    let originalTime = inputDateTime.toString().split(" ").slice(4,5).join(' ').toString().split(':');
-    let newLocalTime = [
-        Number(originalTime[0]) - Number(timeTZShifted[0]) + Number(originalTime[0]),
-        Number(originalTime[1]) - Number(timeTZShifted[1]) + Number(originalTime[1]), 
-        Number(originalTime[2]) - Number(timeTZShifted[2]) + Number(originalTime[2])
-    ];
-    let outputDate = new Date(inputDateTime);
-    outputDate.setHours(Number(newLocalTime[0]), Number(newLocalTime[1]),Number(newLocalTime[2]));
-
-    return outputDate;   
 }
 
 /**
@@ -160,8 +111,12 @@ export default class Backtest {
         this.positions = {};      // stockName -> { avgPrice, entryFees }
         this.totalFunding = 0;    // funding paid (+) or received (-)
         this.fundingEvents = null;
+        this.fundingCursor = {};
         this.lastSeen = {};       // crypto: stockName -> timestamp of its last candle
         this.ruined = false;
+        this._valuationVersion = 0;
+        this._totalValueCache = null;
+        this._grossExposureCache = null;
     }
 
     async runOnTicker(stockName) {
@@ -169,14 +124,12 @@ export default class Backtest {
             this.buffers[stockName] = {};
         }
         const buffers = this.buffers[stockName];
-        // initialize buffers
+        // Initialize every declared interval so getCandles has the same behavior for each one.
         for(let iv in this.strategy.intervals) {
             const interval = this.strategy.intervals[iv];
-            if(interval.preload) {
-                buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.warmupStart, this.endDate, interval.count, oneStockPreloadAmounts[interval.name], this.market);
-            }
+            buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.warmupStart, this.endDate, interval.count, oneStockChunkBars[interval.name], this.market);
         }
-        // preload initial chunks
+        // Load the initial chunks.
         await Promise.all(
             Object.values(buffers).map(buf => buf.ensure(this.warmupStart))
         );
@@ -187,24 +140,11 @@ export default class Backtest {
             if(!interval) {
                 throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
             }
-            if(!interval.preload) {
-                return new Promise(async (resolve, reject) => {
-                    try {
-                        const stock = await loadStockBeforeTimestamp(stockName, interval.name, new Date(ts), count*2, this.market);
-                        if(stock.size < count) {
-                            return resolve(null);
-                        }
-                        resolve([...stock].slice(0, count));
-                    } catch(e) {
-                        reject(e);
-                    }
-                });
-            }
             const candles = buffers[intervalName].getLast(count, ts);
             if(candles.length < count) {
                 return null;
             }
-            return candles.slice(0, count);
+            return candles;
         };
 
         if (this.market === 'crypto') {
@@ -220,11 +160,12 @@ export default class Backtest {
             this.isWarmup = this.strategy.warmup > 0 && ts < this.startDate.getTime();
 
             // top up all buffers as we advance
-            await Promise.all(
-                Object.values(buffers).map(buf => buf.ensure(ts))
-            );
+            const fetches = Object.values(buffers)
+                .filter(buf => buf.needsFetch(ts))
+                .map(buf => buf.ensure(ts));
+            if (fetches.length) await Promise.all(fetches);
 
-            this.stockPrices[stockName] = mainCandle.close;
+            this._markPrice(stockName, mainCandle.close);
             if (this.market === 'crypto') {
                 this.applyFunding(prevTs ?? ts, ts);
                 prevTs = ts;
@@ -256,223 +197,38 @@ export default class Backtest {
     }
 
     async runOnAllTickers() {
-        const interval = this.strategy.mainInterval.name;
-        let dates;
-        if (this.market === 'crypto') {
-            const stepMs = intervalMsMap[interval];
-            dates = [];
-            for (let t = Math.ceil(this.warmupStart.getTime() / stepMs) * stepMs; t <= this.endDate.getTime(); t += stepMs) {
-                dates.push(new Date(t));
-            }
-        } else {
-            const intervalFns = {
-                '1d': eachDayOfInterval,
-                '4h': (opts) => eachStepMinuteOfInterval(opts, 240),
-                '1h': eachHourOfInterval,
-                '15m': (opts) => eachStepMinuteOfInterval(opts, 15),
-                '5m': (opts) => eachStepMinuteOfInterval(opts, 5),
-                '1m': eachMinuteOfInterval,
-            };
-            const intervalFn = intervalFns[interval] ?? eachMinuteOfInterval;
-            dates = intervalFn({ start: this.warmupStart, end: this.endDate });
-        }
-        const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
-        const start = Date.now();
-
-        if(interval === '1d' && this.market !== 'crypto') {
-            for(const date of dates) {
-                // set to 4 PM EST (closing time)
-                const nyDate = setHoursDifferentTZ(date, 'America/New_York', [16, 0, 0]);
-                date.setTime(nyDate.getTime());
-            }
-        }
-
-        const dbFallback = (stockName, intervalName, ts, count) => {
-            return loadStockBeforeTimestamp(stockName, intervalName, new Date(ts), count * 2, this.market)
-                .then(loaded => {
-                    if(loaded.size < count) return null;
-                    return [...loaded].slice(0, count);
-                });
-        };
-
-        const preloadedIntervals = {};
-        for (const ivName in this.strategy.intervals) {
-            const iv = this.strategy.intervals[ivName];
-            if (iv.preload && ivName !== interval) {
-                preloadedIntervals[ivName] = iv;
-            }
-        }
-
-        const preloadedStocks = {};
-        const preloadWindowEnd = {};
-
-        const ensurePreloaded = async (currentDate) => {
-            const ts = currentDate.getTime();
-            for (const ivName in preloadedIntervals) {
-                if (!preloadWindowEnd[ivName] || ts >= preloadWindowEnd[ivName]) {
-                    const iv = preloadedIntervals[ivName];
-                    const lookbackMs = iv.count * intervalMsMap[ivName] * 3;
-                    const windowMs = preloadWindowMs[ivName];
-                    const startDate = new Date(ts - lookbackMs);
-                    const endDate = new Date(ts + windowMs);
-                    preloadedStocks[ivName] = await loadAllStocksInRange(ivName, startDate, endDate, this.market);
-                    preloadWindowEnd[ivName] = endDate.getTime();
-                }
-            }
-        };
-
-        const getCandles = (ts, stock, intervalName, count) => {
-            const iv = this.strategy.intervals[intervalName];
-            if(!iv) {
-                throw new Error(`Interval ${intervalName} not found. You need to request it in the strategy constructor.`);
-            }
-            if(!iv.preload) {
-                return dbFallback(stock.name, iv.name, ts, count);
-            }
-
-            const targetStock = (intervalName === this.strategy.mainInterval.name)
-                ? stock
-                : preloadedStocks[intervalName]?.[stock.name];
-
-            if(!targetStock) {
-                return dbFallback(stock.name, intervalName, ts, count);
-            }
-
-            let index = targetStock.getIndex(ts);
-            if (index >= targetStock.size) {
-                return dbFallback(stock.name, intervalName, ts, count);
-            }
-            const barAtIndex = targetStock.getCandle(index);
-            if (barAtIndex && barAtIndex.timestamp > ts) {
-                index--;
-            }
-            if (index < 0) {
-                return dbFallback(stock.name, intervalName, ts, count);
-            }
-            const start = index - count + 1;
-            if (start < 0) {
-                return dbFallback(stock.name, intervalName, ts, count);
-            }
-            const arr = [];
-            for (let i = start; i <= index; i++) {
-                const candle = targetStock.getCandle(i);
-                if (candle) arr.push(candle);
-            }
-            if (arr.length < count) {
-                return dbFallback(stock.name, intervalName, ts, count);
-            }
-            return arr.reverse().slice(0, count);
-        }
-
-        let min = this.strategy.mainInterval.count;
-        if (this.market === 'crypto') {
-            this.fundingEvents = await loadFundingInRange(new Date(this.warmupStart.getTime() - 86400000), this.endDate);
-        }
-        let prevTs = null;
-        for(let i = 0; i < chunks.length; i++) {
-            if (this.ruined) break;
-            const chunk = chunks[i];
-            console.log(`++++++++++++++++++++ ${((i / chunks.length) * 100).toFixed(2)}%`);
-            const stocks = this.market === 'crypto'
-                ? await loadAllStocksInRange(interval, new Date(chunk[0].getTime() - (min * 2 + 1) * intervalMsMap[interval]), chunk[chunk.length - 1], 'crypto')
-                : await loadAllStocksInRange(interval, subDays(chunk[0], min*2), addDays(chunk[chunk.length - 1], 4));
-            for(const currentDate of chunk) {
-                await ensurePreloaded(currentDate);
-                const day = currentDate.toLocaleDateString('en-US', { weekday: 'short', timeZone: "UTC" });
-                if(this.market !== 'crypto' && (day === 'Sat' || day === 'Sun')) {
-                    continue;
-                }
-                if(currentDate < chunk[0]) {
-                    continue;
-                }
-                const arr = [];
-                this.isWarmup = this.strategy.warmup > 0 && currentDate.getTime() < this.startDate.getTime();
-
-                for(const stockName in stocks) {
-                    const stock = stocks[stockName];
-                    const candle = stock.getCandle(stock.getIndex(currentDate));
-                    if(!candle) continue;
-                    if (this.market === 'crypto') {
-                        if (candle.timestamp !== currentDate.getTime()) continue;
-                        if (candle.volume > 0) this.lastSeen[stockName] = candle.timestamp;
-                    }
-
-                    this.stockPrices[stockName] = candle.close;
-
-                    const item = {
-                        stockName,
-                        candle,
-                        stockBalance: this.stockBalances[stockName] || 0,
-                        _features: null,
-                        features: this.stockFeatures[stockName] ?? null,
-                        setFeatures(features) { this._features = features; },
-                        getCandles: (intervalName, count, ts = currentDate) => {
-                            if(ts.getTime() > currentDate.getTime()) {
-                                throw new Error(`Requested candles in the future: ${ts.toISOString()} > ${currentDate.toISOString()}`);
-                            }
-                            return getCandles(ts, stock, intervalName, count);
-                        },
-                        buy: (quantity, price) => this.buy(stockName, quantity, price, currentDate, item._features, candle),
-                        sell: (quantity, price) => this.sell(stockName, quantity, price, currentDate, candle),
-                    };
-                    arr.push(item);
-                }
-
-                if(arr.length > 0) {
-                    if (this.market === 'crypto') {
-                        const ts = currentDate.getTime();
-                        this.applyFunding(prevTs ?? ts, ts);
-                        prevTs = ts;
-                        for (const stockName in this.stockBalances) {
-                            if (ts - (this.lastSeen[stockName] ?? ts) > 3 * 86400000) {
-                                this.settle(stockName, currentDate);
-                            }
-                        }
-                        if (this.totalValue() <= 0) {
-                            this.ruined = true;
-                            console.log(chalk.red(`ACCOUNT LIQUIDATED ON ${formatDate(currentDate)}`));
-                            if (!this.isWarmup) this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
-                            break;
-                        }
-                    }
-                    // delisted stocks
-                    if(this.market !== 'crypto' && Object.keys(this.stockBalances).length > 0) {
-                        for(const stockName in this.stockBalances) {
-                            if(!arr.find(s => s.stockName === stockName)) {
-                                this.delistCounter[stockName] = (this.delistCounter[stockName] || 0) + 1;
-                                if(this.delistCounter[stockName] > 10) {
-                                    delete this.stockBalances[stockName];
-                                    console.log(chalk.red(`${stockName} DELISTED ON ${formatDate(subDays(currentDate, interval === '1d' ? 10 : 0))}`));
-                                }
-                            }
-                        }
-                    }
-
-                    await this.strategy.onTick({
-                        raw: stocks,
-                        currentDate,
-                        ctx: this,
-                        stocks: arr
-                    });
-                    if (!this.isWarmup) this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
-                }
-            }
-        }
-
-        this.isWarmup = false;
-        console.log('Backtest finished in', ms(Date.now() - start));
-        return this.getMetrics();
+        return runAllTickersStream(this);
     }
 
     record() {}
 
-    totalValue() {
+    _invalidateValuation() {
+        this._valuationVersion++;
+    }
 
-        return this.cashBalance + Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + quantity * this.stockPrices[stockName], 0);
+    _markPrice(stockName, price) {
+        if (this.stockBalances[stockName] && this.stockPrices[stockName] !== price) {
+            this._invalidateValuation();
+        }
+        this.stockPrices[stockName] = price;
+    }
+
+    totalValue() {
+        if (this._totalValueCache?.version === this._valuationVersion) {
+            return this._totalValueCache.value;
+        }
+        const value = this.cashBalance + Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + quantity * this.stockPrices[stockName], 0);
+        this._totalValueCache = { version: this._valuationVersion, value };
+        return value;
     }
 
     grossExposure() {
-        return Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + Math.abs(quantity * this.stockPrices[stockName]), 0);
+        if (this._grossExposureCache?.version === this._valuationVersion) {
+            return this._grossExposureCache.value;
+        }
+        const value = Object.entries(this.stockBalances).reduce((acc, [stockName, quantity]) => acc + Math.abs(quantity * this.stockPrices[stockName]), 0);
+        this._grossExposureCache = { version: this._valuationVersion, value };
+        return value;
     }
 
     applyFunding(fromTs, toTs) {
@@ -480,13 +236,21 @@ export default class Backtest {
         for (const stockName in this.stockBalances) {
             const ev = this.fundingEvents[stockName];
             if (!ev) continue;
-            let lo = 0, hi = ev.time.length;
-            while (lo < hi) { const mid = (lo + hi) >> 1; if (ev.time[mid] < fromTs) lo = mid + 1; else hi = mid; }
-            for (let i = lo; i < ev.time.length && ev.time[i] < toTs; i++) {
-                const pay = this.stockBalances[stockName] * this.stockPrices[stockName] * ev.rate[i];
+            let cursor = this.fundingCursor[stockName];
+            if (cursor == null) {
+                let lo = 0, hi = ev.time.length;
+                while (lo < hi) { const mid = (lo + hi) >> 1; if (ev.time[mid] < fromTs) lo = mid + 1; else hi = mid; }
+                cursor = lo;
+            } else {
+                while (cursor < ev.time.length && ev.time[cursor] < fromTs) cursor++;
+            }
+            for (; cursor < ev.time.length && ev.time[cursor] < toTs; cursor++) {
+                const pay = this.stockBalances[stockName] * this.stockPrices[stockName] * ev.rate[cursor];
                 this.cashBalance -= pay;
                 this.totalFunding += pay;
+                this._invalidateValuation();
             }
+            this.fundingCursor[stockName] = cursor;
         }
     }
 
@@ -533,7 +297,7 @@ export default class Backtest {
         let next = prev + signedQty;
         if (Math.abs(next) <= 1e-12 * Math.max(1, Math.abs(prev))) next = 0;
 
-        this.stockPrices[stockName] = price;
+        this._markPrice(stockName, price);
         if (this.maxLeverage == null) {
             if (side === 'buy' && notional + fee > this.cashBalance) {
                 throw new Error(`Insufficient cash: need ${notional + fee}, have ${this.cashBalance}`);
@@ -548,6 +312,7 @@ export default class Backtest {
         }
 
         this.cashBalance += side === 'buy' ? -(notional + fee) : (notional - fee);
+        this._invalidateValuation();
         this.totalFees += fee;
         this.swaps.push({ type: side, quantity, price, timestamp, fee, stockName });
         if (this.market === 'crypto' && this.lastSeen[stockName] == null) this.lastSeen[stockName] = +timestamp;
@@ -600,6 +365,7 @@ export default class Backtest {
             this.stockBalances[stockName] = next;
             this.positions[stockName] = pos;
         }
+        this._invalidateValuation();
     }
 
     getMetrics() {
@@ -608,9 +374,7 @@ export default class Backtest {
         }
 
         /* ---------- equity series & simple returns ---------------------- */
-        const series = this.equityCurve
-            .toSorted((a, b) => a[0] - b[0])       // sort by timestamp
-            .map(e => e[1]);                       // strip to equity values
+        const series = this.equityCurve.map(e => e[1]);
 
         const periodRets = [];
         for (let i = 1; i < series.length; i++) {
@@ -723,7 +487,7 @@ export default class Backtest {
 
         let rank = 'F';
         let rankColor = 'redBright';
-        if(m.sharpe >= 3.4 && m.maxDrawdown >= -0.2 && m.avgDaily >= 0.007) {
+        if(m.sharpe >= 3.4 && m.maxDrawdown >= -0.2) {
             rank = 'S';
             rankColor = 'cyanBright';
         } else if(m.sharpe >= 3 && m.maxDrawdown > -0.3) {
@@ -752,7 +516,7 @@ export default class Backtest {
         const mean = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 
         let rank = 'F', rankColor = '#ff4444', rankGlow = '#ff444480';
-        if (m.sharpe >= 3.4 && m.maxDrawdown >= -0.2 && m.avgDaily >= 0.007) {
+        if (m.sharpe >= 3.4 && m.maxDrawdown >= -0.2) {
             rank = 'S'; rankColor = '#00ffff'; rankGlow = '#00ffff60';
         } else if (m.sharpe >= 3 && m.maxDrawdown > -0.3) {
             rank = 'A'; rankColor = '#44ff44'; rankGlow = '#44ff4460';

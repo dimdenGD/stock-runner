@@ -293,7 +293,7 @@ export default class ForwardRunner {
         this.isWarmup = !execute;
         this.currentTimestamp = timestamp;
         try {
-            await this.strategy.onTick({ stocks, currentDate: new Date(timestamp), ctx: this, raw: null });
+            await this.strategy.onTick({ stocks, currentDate: new Date(timestamp), ctx: this });
         } finally {
             this.isWarmup = false;
             this.currentTimestamp = null;
@@ -462,7 +462,7 @@ export default class ForwardRunner {
         return fetched;
     }
 
-    async preload() {
+    async warmUp() {
         this.logger.log(`ForwardRunner: ${this.strategy.name} loading ${this.warmupBars} ${this.interval} bars for ${this.symbols.length} symbols`);
         const startedAt = Date.now();
         const endTime = this.broker.now();
@@ -515,7 +515,7 @@ export default class ForwardRunner {
         if (this.streamHealthTimeoutMs > 0 && typeof this.stream.waitForData === 'function') {
             await this.stream.waitForData(this.streamHealthTimeoutMs);
         }
-        return this.preload();
+        return this.warmUp();
     }
 
     async stop() {
