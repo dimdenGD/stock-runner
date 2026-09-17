@@ -4,7 +4,9 @@
 import 'dotenv/config';
 import fs from 'fs';
 import { writeFile } from 'fs/promises';
-import { sender, sql } from "../src/db.js";
+import { sender, sql, createTables } from "../src/db.js";
+
+await createTables();
 
 if(!fs.existsSync('data')) {
     fs.mkdirSync('data');

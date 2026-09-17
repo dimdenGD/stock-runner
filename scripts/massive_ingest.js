@@ -1,5 +1,7 @@
-import { sender, sql } from "../src/db.js";
+import { sender, sql, createTables } from "../src/db.js";
 import fs from 'fs';
+
+await createTables();
 
 const type = process.argv[2];
 

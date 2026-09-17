@@ -2,9 +2,11 @@
 // example: node scripts/binance_ingest.js 15m
 
 import fs from 'fs';
-import { sender, sql } from '../src/db.js';
+import { sender, sql, createTables } from '../src/db.js';
 import { unzipSingle } from '../src/lib/zip.js';
 import { intervalMsMap } from '../src/backtest/consts.js';
+
+await createTables();
 
 const interval = process.argv[2];
 const klineDir = `data/binance/klines/${interval}`;

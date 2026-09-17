@@ -1,8 +1,10 @@
-import { sender, sql } from "../src/db.js";
+import { sender, sql, createTables } from "../src/db.js";
 import fs from 'fs';
 import { eachDayOfInterval, format, addDays } from 'date-fns';
 import path from 'path';
 import { Temporal } from '@js-temporal/polyfill';
+
+await createTables();
 
 const type = process.argv[2];
 
