@@ -144,11 +144,14 @@ bt.logMetrics(result);
 | `trades`       | Number of completed round-trip trades |
 | `totalFees`    | Sum of broker fees             |
 | `totalReturn`  | (final equity / start cash) − 1 |
-| `avgDaily`     | Average period return          |
+| `avgDaily`     | Mean UTC-day return, from start cash |
+| `geoDaily`     | Geometric mean UTC-day return  |
+| `dailyWinRate` | Share of days with a positive return |
+| `days`         | Number of daily returns        |
 | `CAGR`         | Compound annual growth rate    |
 | `sharpe`       | Annualized Sharpe ratio        |
 | `maxDrawdown`  | Worst peak-to-trough decline   |
-| `geoPeriodRet` | Geometric mean period return   |
+| `geoPeriodRet` | Geometric mean return per main-interval bar |
 | `geoAnnualRet` | Geometric mean annualized return |
 | `totalFunding` | Crypto: funding paid (positive) or received (negative) |
 | `ruined`       | Crypto: equity hit zero and the run stopped |

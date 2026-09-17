@@ -381,6 +381,18 @@ export default class Backtest {
             periodRets.push(series[i] / series[i - 1] - 1);
         }
 
+        const dayCloses = [[null, this.capital]];
+        let lastDay = null;
+        for (const [ts, equity] of this.equityCurve) {
+            const day = new Date(ts).toISOString().slice(0, 10);
+            if (day === lastDay) dayCloses[dayCloses.length - 1][1] = equity;
+            else { dayCloses.push([day, equity]); lastDay = day; }
+        }
+        const dailyRets = [];
+        for (let i = 1; i < dayCloses.length; i++) {
+            dailyRets.push(dayCloses[i][1] / dayCloses[i - 1][1] - 1);
+        }
+
         /* ---------- totals & CAGR -------------------------------------- */
         const finalEquity  = series.at(-1);
         const totalReturn  = finalEquity / this.capital - 1;
@@ -409,7 +421,16 @@ export default class Backtest {
             if (dd < maxDD) maxDD = dd;
         }
 
-        const avgDaily = periodRets.reduce((s, r) => s + r, 0) / periodRets.length;
+        const avgDaily = dailyRets.length
+            ? dailyRets.reduce((s, r) => s + r, 0) / dailyRets.length
+            : 0;
+        const geoDaily = dailyRets.length
+            ? Math.exp(dailyRets.reduce((s, r) => s + Math.log(1 + r), 0) / dailyRets.length) - 1
+            : 0;
+        const dailyWinRate = dailyRets.length
+            ? dailyRets.filter(r => r > 0).length / dailyRets.length
+            : 0;
+        const days = dailyRets.length;
 
         /* --------- feature correlations ---------------------------- */
         const tradesWithFeatures = this.trades.filter(t =>
@@ -438,6 +459,9 @@ export default class Backtest {
             totalFees     : this.totalFees,
             totalReturn,
             avgDaily,
+            geoDaily,
+            dailyWinRate,
+            days,
             CAGR,
             sharpe,
             maxDrawdown   : maxDD,
@@ -468,9 +492,10 @@ export default class Backtest {
         }
         console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US'))} ($${this.capital.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
-        console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);
+        const pctColor = (v, d) => (v > 0 ? chalk.greenBright('+' + (v * 100).toFixed(d) + '%') : chalk.redBright('' + (v * 100).toFixed(d) + '%'));
+        console.log(`Avg daily return  : ${pctColor(m.avgDaily, 3)}  (geo ${(m.geoDaily * 100).toFixed(3)}%, ${(m.dailyWinRate * 100).toFixed(1)}% of ${m.days} days up)`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
-        console.log(`Geo-mean period   : ${m.geoPeriodRet > 0 ? chalk.greenBright('+' + (m.geoPeriodRet * 100).toFixed(2) + '%') : chalk.redBright('' + (m.geoPeriodRet * 100).toFixed(2) + '%')}  (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)`);
+        console.log(`Geo-mean ${this.strategy.mainInterval.name.padEnd(8)}: ${pctColor(m.geoPeriodRet, 4)}  (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)`);
         console.log(`Geo-mean annual   : ${m.geoAnnualRet > 0 ? chalk.greenBright('+' + (m.geoAnnualRet * 100).toFixed(2) + '%') : chalk.redBright('' + (m.geoAnnualRet * 100).toFixed(2) + '%')}`);
         
         const maxDrawdownColor = m.maxDrawdown >= -0.025 ? 'cyanBright' : m.maxDrawdown >= -0.1 ? 'greenBright' : m.maxDrawdown >= -0.2 ? 'yellowBright' : m.maxDrawdown >= -0.3 ? 'redBright' : 'red';
@@ -730,9 +755,9 @@ ${navHtml}
 <tr><td>Fees</td><td>$${Math.round(this.totalFees).toLocaleString('en-US')}</td></tr>
 <tr><td>Total USD return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : '-'}$${Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')} ($${this.capital.toLocaleString('en-US')} → $${finalEquity.toLocaleString('en-US')})</td></tr>
 <tr><td>Total % return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : ''}${(m.totalReturn * 100).toFixed(2)}%</td></tr>
-<tr><td>Avg daily return</td><td style="color:${retColor(m.avgDaily)}">${m.avgDaily >= 0 ? '+' : ''}${(m.avgDaily * 100).toFixed(4)}%</td></tr>
+<tr><td>Avg daily return</td><td style="color:${retColor(m.avgDaily)}">${m.avgDaily >= 0 ? '+' : ''}${(m.avgDaily * 100).toFixed(3)}% (geo ${(m.geoDaily * 100).toFixed(3)}%, ${(m.dailyWinRate * 100).toFixed(1)}% of ${m.days} days up)</td></tr>
 <tr><td>CAGR (Annualized)</td><td style="color:${retColor(m.CAGR)}">${m.CAGR >= 0 ? '+' : ''}${(m.CAGR * 100).toFixed(1)}%</td></tr>
-<tr><td>Geo-mean period</td><td style="color:${retColor(m.geoPeriodRet)}">${m.geoPeriodRet >= 0 ? '+' : ''}${(m.geoPeriodRet * 100).toFixed(4)}% (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)</td></tr>
+<tr><td>Geo-mean ${this.strategy.mainInterval.name}</td><td style="color:${retColor(m.geoPeriodRet)}">${m.geoPeriodRet >= 0 ? '+' : ''}${(m.geoPeriodRet * 100).toFixed(4)}% (annual ≈ ${(m.geoAnnualRet * 100).toFixed(1)}%)</td></tr>
 <tr><td>Geo-mean annual</td><td style="color:${retColor(m.geoAnnualRet)}">${m.geoAnnualRet >= 0 ? '+' : ''}${(m.geoAnnualRet * 100).toFixed(2)}%</td></tr>
 <tr><td>Max drawdown</td><td style="color:${maxDDColor}">${(m.maxDrawdown * 100).toFixed(1)}%</td></tr>
 <tr><td>Sharpe</td><td style="color:${sharpeColor}">${m.sharpe.toFixed(2)}</td></tr>
