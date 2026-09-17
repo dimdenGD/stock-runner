@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import Strategy from '../backtest/strategy.js';
-import { intervalMsMap } from '../backtest/consts.js';
+import Broker from '../brokers/base.js';
+import { intervalMsMap, markets } from '../backtest/consts.js';
+import { formatSwapLine, formatTradeLine } from '../backtest/logFormat.js';
+import ForwardJournal from './journal.js';
+import TradeLedger from './tradeLedger.js';
 
 async function pool(items, limit, fn) {
     const out = new Array(items.length);
@@ -27,58 +31,68 @@ export function splitPositionOrder(currentQty, signedQty) {
     return out;
 }
 
+const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
+
 export default class ForwardRunner {
     constructor({
         strategy,
         broker,
-        warmupBars = 30 * 96,
-        stateFile = 'output/forward-state.json',
-        stateIdentity = 'forward-v1',
+        capital,
+        logs = {},
+        market,
+        allowShort,
+        maxLeverage,
+        maxNetExposure = Infinity,
+        maxOrderNotional = Infinity,
+        symbols = null,
+        dryRun = false,
+        dataDir = 'output/forward',
+        logger = console,
         concurrency = 16,
         symbolRefreshMs = 3600000,
         streamGraceMs = 5000,
         streamHealthTimeoutMs = 15000,
         maxMissingFraction = 0.02,
-        streamFactory = null,
-        dryRun = false,
-        capitalLimit = Infinity,
-        maxGross = 1.10,
-        maxAbsNet = 0.15,
-        maxOrderNotional = 10000,
-        symbols = null,
-        logger = console,
+        incomePollMs = 3600000,
+        incomeLookbackMs = 7 * 86400000,
     }) {
-        if (!(strategy instanceof Strategy)) throw new TypeError('strategy must be a Strategy');
-        const methods = [
-            'initialize', 'getTradableSymbols', 'getPortfolio', 'getHistory',
-            'getClosedCandle', 'createStream', 'normalizeQuantity', 'placeMarketOrder',
-        ];
-        const missing = methods.filter(method => typeof broker?.[method] !== 'function');
+        if (!(strategy instanceof Strategy)) throw new TypeError('strategy must be an instance of Strategy');
+        if (!(broker instanceof Broker)) throw new TypeError('broker must be an instance of Broker');
+        const missing = broker.missingForwardMethods();
         if (missing.length) {
-            throw new TypeError(`broker does not implement the forward contract: ${missing.join(', ')}`);
+            throw new TypeError(`${broker.label} does not support forward trading; missing ${missing.join(', ')}`);
         }
-        const intervalNames = Object.keys(strategy.intervals);
-        if (intervalNames.length !== 1) throw new Error('ForwardRunner currently supports one strategy interval');
+        if (typeof capital !== 'number' || !(capital > 0)) throw new TypeError('capital must be a positive number');
+        if (Object.keys(strategy.intervals).length !== 1) throw new Error('ForwardRunner currently supports one strategy interval');
+        market = market ?? broker.market ?? 'stocks';
+        if (!markets.includes(market)) throw new TypeError(`market must be one of: ${markets.join(', ')}`);
+
         this.strategy = strategy;
         this.broker = broker;
-        this.interval = strategy.mainInterval.name;
-        this.stepMs = intervalMsMap[this.interval];
-        this.warmupBars = warmupBars;
-        this.stateFile = stateFile;
-        this.stateIdentity = stateIdentity;
+        this.capital = capital;
+        this.logs = { swaps: false, trades: false, ticks: false, ...logs };
+        this.market = market;
+        this.allowShort = allowShort ?? market === 'crypto';
+        this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : 1);
+        this.maxNetExposure = maxNetExposure;
+        this.maxOrderNotional = maxOrderNotional;
+        this.fixedSymbols = symbols ? [...symbols].sort() : null;
+        this.dryRun = dryRun;
+        this.logger = logger;
         this.concurrency = concurrency;
         this.symbolRefreshMs = symbolRefreshMs;
         this.streamGraceMs = streamGraceMs;
         this.streamHealthTimeoutMs = streamHealthTimeoutMs;
         this.maxMissingFraction = maxMissingFraction;
-        this.streamFactory = streamFactory;
-        this.dryRun = dryRun;
-        this.capitalLimit = capitalLimit;
-        this.maxGross = maxGross;
-        this.maxAbsNet = maxAbsNet;
-        this.maxOrderNotional = maxOrderNotional;
-        this.fixedSymbols = symbols ? [...symbols].sort() : null;
-        this.logger = logger;
+        this.incomePollMs = incomePollMs;
+        this.incomeLookbackMs = incomeLookbackMs;
+
+        this.interval = strategy.mainInterval.name;
+        this.stepMs = intervalMsMap[this.interval];
+        this.warmupBars = Math.max(strategy.warmup, strategy.mainInterval.count);
+        this.dataDir = join(dataDir, strategy.name);
+        this.stateFile = join(this.dataDir, `state-${fileSafe(broker.account)}${dryRun ? '-dry' : ''}.json`);
+        this.journal = new ForwardJournal({ file: join(this.dataDir, 'journal.sqlite') });
 
         this.symbols = [];
         this.buffers = new Map();
@@ -88,41 +102,40 @@ export default class ForwardRunner {
         this.equity = 0;
         this.availableBalance = 0;
         this.intents = [];
+        this.pendingLogs = [];
         this.lastSymbolRefresh = 0;
+        this.lastIncomePoll = 0;
+        this.lastPortfolio = null;
+        this.lastBatchInfo = {};
+        this.currentTimestamp = null;
+        this.runId = null;
         this.stopped = false;
         this.stream = null;
         this.state = this.readState();
-        this.ctx = {
-            stockBalances: this.stockBalances,
-            stockPrices: this.stockPrices,
-            cashBalance: this.cashBalance,
-            totalValue: () => this.strategyEquity(),
-            grossExposure: () => this.grossExposure(),
-        };
+        this.ledger = new TradeLedger(this.state.ledger);
+        this.isWarmup = false;
+        this.ctx = this;
     }
 
     readState() {
-        if (!this.stateFile || !existsSync(this.stateFile)) {
-            return { identity: this.stateIdentity, lastProcessedBar: 0, status: 'new' };
-        }
+        if (!existsSync(this.stateFile)) return { lastProcessedBar: 0, status: 'new' };
         try {
-            const state = JSON.parse(readFileSync(this.stateFile, 'utf8'));
-            if (state.identity && state.identity !== this.stateIdentity) {
-                throw new Error(`state belongs to ${state.identity}, expected ${this.stateIdentity}`);
-            }
-            return { identity: this.stateIdentity, ...state };
+            return JSON.parse(readFileSync(this.stateFile, 'utf8'));
         } catch (err) {
             throw new Error(`Cannot read forward state ${this.stateFile}: ${err.message}`);
         }
     }
 
     writeState(patch) {
-        if (!this.stateFile) return;
-        this.state = { ...this.state, identity: this.stateIdentity, ...patch, updatedAt: new Date().toISOString() };
+        this.state = { ...this.state, ...patch, updatedAt: new Date().toISOString() };
         mkdirSync(dirname(this.stateFile), { recursive: true });
         const tmp = `${this.stateFile}.tmp`;
         writeFileSync(tmp, JSON.stringify(this.state, null, 2));
         renameSync(tmp, this.stateFile);
+    }
+
+    totalValue() {
+        return Math.min(this.equity, this.capital);
     }
 
     grossExposure() {
@@ -134,12 +147,68 @@ export default class ForwardRunner {
         return gross;
     }
 
-    strategyEquity() {
-        return Math.min(this.equity, this.capitalLimit);
+    netExposure() {
+        let net = 0;
+        for (const [symbol, qty] of Object.entries(this.stockBalances)) {
+            const px = this.stockPrices[symbol];
+            if (px > 0) net += qty * px;
+        }
+        return net;
+    }
+
+    record(kind, data) {
+        if (this.isWarmup || this.currentTimestamp == null) return;
+        this.journal.record(this.runId, this.currentTimestamp, kind, data);
+    }
+
+    event(level, type, message, options) {
+        this.journal.event(this.runId, level, type, message, options);
+    }
+
+    lastCandle(symbol) {
+        return this.buffers.get(symbol)?.at(-1);
+    }
+
+    fee(symbol, quantity, price, side) {
+        return Number(this.broker.calculateFees(quantity, price, side, this.lastCandle(symbol))) || 0;
+    }
+
+    snapshot(ts, phase) {
+        this.journal.snapshot(this.runId, ts, phase, this.lastPortfolio, this.stockPrices);
+    }
+
+    flushTradeLogs() {
+        const entries = this.pendingLogs;
+        this.pendingLogs = [];
+        for (const e of entries) {
+            if (e.kind === 'swap' && this.logs.swaps) {
+                this.logger.log(formatSwapLine({ ...e, cash: this.cashBalance, equity: this.equity }));
+            } else if (e.kind === 'trade' && this.logs.trades) {
+                this.logger.log(formatTradeLine({ ...e, market: this.market, cash: this.cashBalance, equity: this.equity }));
+            }
+        }
+    }
+
+    async pollIncome(force = false) {
+        if (!force && Date.now() - this.lastIncomePoll < this.incomePollMs) return;
+        this.lastIncomePoll = Date.now();
+        try {
+            const last = this.journal.lastIncomeTime(this.broker.account);
+            const startTime = last != null ? last : Date.now() - this.incomeLookbackMs;
+            const rows = await this.broker.getIncome({ startTime });
+            if (!rows) return;
+            const inserted = this.journal.income(this.broker.account, this.runId, rows);
+            if (inserted) this.event('info', 'income', `${inserted} income rows`);
+        } catch (err) {
+            this.logger.warn(`ForwardRunner: income poll failed: ${err.message}`);
+            this.event('warn', 'income-failed', err.message);
+        }
     }
 
     async refreshAccount() {
         const portfolio = await this.broker.getPortfolio();
+        this.lastPortfolio = portfolio;
+        this.ledger.reconcile(portfolio.positions, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
         this.cashBalance = Number(portfolio.cash ?? 0);
         this.availableBalance = Number(portfolio.available ?? 0);
         this.equity = Number(portfolio.equity ?? 0);
@@ -150,7 +219,6 @@ export default class ForwardRunner {
             const mark = Number(p.markPrice);
             if (mark > 0) this.stockPrices[p.symbol] = mark;
         }
-        this.ctx.cashBalance = this.cashBalance;
     }
 
     async refreshSymbols(force = false) {
@@ -165,7 +233,10 @@ export default class ForwardRunner {
         const added = this.symbols.filter(s => !before.has(s));
         for (const s of added) if (!this.buffers.has(s)) this.buffers.set(s, []);
         this.stream?.setSymbols(this.symbols);
-        if (before.size && added.length) this.logger.log(`ForwardRunner: discovered ${added.length} new symbols`);
+        if (before.size && added.length) {
+            this.logger.log(`ForwardRunner: discovered ${added.length} new symbols`);
+            this.event('info', 'symbols-added', `${added.length} new symbols`, { data: added });
+        }
         return added;
     }
 
@@ -175,17 +246,18 @@ export default class ForwardRunner {
         const last = buffer.at(-1);
         if (!last || last.timestamp < candle.timestamp) buffer.push(candle);
         else if (last.timestamp === candle.timestamp) buffer[buffer.length - 1] = candle;
-        const keep = Math.max(this.warmupBars + 2, this.strategy.mainInterval.count + 2);
+        const keep = this.strategy.mainInterval.count + 2;
         if (buffer.length > keep) buffer.splice(0, buffer.length - keep);
         this.buffers.set(symbol, buffer);
     }
 
     stockView(symbol, candle) {
         const enqueue = (signedQty, price) => {
+            if (this.isWarmup) throw new Error(`Orders are not allowed during warm-up: ${symbol}`);
             if (!(Math.abs(signedQty) > 0) || !Number.isFinite(signedQty) || !(price > 0)) {
-                throw new Error(`Invalid order intent for ${symbol}`);
+                throw new Error(`Invalid order: ${signedQty > 0 ? 'buy' : 'sell'} ${Math.abs(signedQty)} ${symbol} @ ${price}`);
             }
-            this.intents.push({ symbol, signedQty, price });
+            this.intents.push({ symbol, signedQty, price, heldQty: this.stockBalances[symbol] || 0 });
         };
         return {
             stockName: symbol,
@@ -194,51 +266,88 @@ export default class ForwardRunner {
             features: null,
             setFeatures() {},
             getCandles: (interval, count) => {
-                if (interval !== this.interval) throw new Error(`Forward interval ${interval} is not loaded`);
-                return (this.buffers.get(symbol) || []).slice(-count).reverse();
+                if (interval !== this.interval) throw new Error(`Interval ${interval} not found. You need to request it in the strategy constructor.`);
+                const candles = this.buffers.get(symbol) || [];
+                return candles.length < count ? null : candles.slice(-count).reverse();
             },
             buy: (quantity, price) => enqueue(quantity, price),
             sell: (quantity, price) => enqueue(-quantity, price),
         };
     }
 
-    async tick(timestamp, candles, { execute = true } = {}) {
+    async tick(timestamp, candles, { execute = true, info = {} } = {}) {
         if (execute && timestamp <= Number(this.state.lastProcessedBar || 0)) return { skipped: true, intents: [] };
-        if (execute) await this.refreshAccount();
+        const startedAt = Date.now();
+        if (execute) {
+            await this.refreshAccount();
+            this.snapshot(timestamp, 'pre');
+        }
         this.intents = [];
         for (const { symbol, candle } of candles) this.addCandle(symbol, candle);
         const stocks = candles.map(({ symbol, candle }) => this.stockView(symbol, candle));
-        this.ctx.isWarmup = !execute;
+        this.isWarmup = !execute;
+        this.currentTimestamp = timestamp;
         try {
-            await this.strategy.onTick({ stocks, currentDate: new Date(timestamp), ctx: this.ctx, raw: null });
+            await this.strategy.onTick({ stocks, currentDate: new Date(timestamp), ctx: this, raw: null });
         } finally {
-            this.ctx.isWarmup = false;
+            this.isWarmup = false;
+            this.currentTimestamp = null;
         }
         const intents = this.intents.slice();
-        if (!execute) {
-            if (intents.length) throw new Error(`Strategy generated ${intents.length} orders during warm-up at ${new Date(timestamp).toISOString()}`);
-            return { skipped: false, intents };
+        if (!execute) return { skipped: false, intents };
+
+        const sizingEquity = this.totalValue();
+        for (const intent of intents) intent.journalId = this.journal.intent(this.runId, timestamp, { ...intent, sizingEquity });
+        const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
+        const finish = (status) => this.journal.tick(this.runId, {
+            ts: timestamp, durationMs: Date.now() - startedAt, ...info,
+            equity: this.equity, sizingEquity: this.totalValue(), available: this.availableBalance,
+            gross: this.grossExposure(), net: this.netExposure(),
+            positions: Object.keys(this.stockBalances).length, intents: intents.length, ...stats, status,
+        });
+        try {
+            this.validateBatch(intents);
+        } catch (err) {
+            finish('blocked');
+            this.event('error', 'batch-blocked', err.message, { barTs: timestamp });
+            throw err;
         }
-        this.validateBatch(intents);
         this.writeState({ lastProcessedBar: timestamp, status: 'executing', intentCount: intents.length });
-        const fills = this.dryRun ? [] : await this.executeBatch(timestamp, intents);
-        if (!this.dryRun) await this.refreshAccount();
-        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length });
+        let fills = [];
+        if (!this.dryRun) {
+            try {
+                fills = await this.executeBatch(timestamp, intents, stats);
+            } catch (err) {
+                this.snapshot(timestamp, 'post');
+                this.flushTradeLogs();
+                this.writeState({ ledger: this.ledger.toJSON() });
+                finish('failed');
+                throw err;
+            }
+            await this.refreshAccount();
+            this.snapshot(timestamp, 'post');
+            this.flushTradeLogs();
+        }
+        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON() });
+        finish(this.dryRun ? 'dry-run' : 'complete');
         return { skipped: false, intents, fills };
     }
 
     validateBatch(intents) {
-        const sizingEquity = this.strategyEquity();
+        const sizingEquity = this.totalValue();
         if (!(sizingEquity > 0)) throw new Error('Broker account equity is not positive');
         const projected = { ...this.stockBalances };
         for (const intent of intents) {
             const current = projected[intent.symbol] || 0;
             for (const leg of splitPositionOrder(current, intent.signedQty)) {
                 if (!leg.reduceOnly && Math.abs(leg.signedQty * intent.price) > this.maxOrderNotional) {
-                    throw new Error(`${intent.symbol} opening order exceeds $${this.maxOrderNotional} safety cap`);
+                    throw new Error(`${intent.symbol} opening order exceeds $${this.maxOrderNotional} cap`);
                 }
             }
             projected[intent.symbol] = current + intent.signedQty;
+            if (!this.allowShort && projected[intent.symbol] < -1e-12) {
+                throw new Error(`${intent.symbol} would open a short but shorting is not allowed`);
+            }
         }
         let gross = 0, net = 0;
         for (const [symbol, qty] of Object.entries(projected)) {
@@ -247,15 +356,15 @@ export default class ForwardRunner {
             gross += Math.abs(qty * px);
             net += qty * px;
         }
-        if (gross > this.maxGross * sizingEquity) {
-            throw new Error(`Projected gross ${(gross / sizingEquity).toFixed(2)}x exceeds ${this.maxGross.toFixed(2)}x cap`);
+        if (gross > this.maxLeverage * sizingEquity) {
+            throw new Error(`Projected gross ${(gross / sizingEquity).toFixed(2)}x exceeds maxLeverage ${this.maxLeverage}x`);
         }
-        if (Math.abs(net) > this.maxAbsNet * sizingEquity) {
-            throw new Error(`Projected net ${(net / sizingEquity).toFixed(2)}x exceeds ${this.maxAbsNet.toFixed(2)}x cap`);
+        if (Math.abs(net) > this.maxNetExposure * sizingEquity) {
+            throw new Error(`Projected net ${(net / sizingEquity).toFixed(2)}x exceeds maxNetExposure ${this.maxNetExposure}x`);
         }
     }
 
-    async executeBatch(timestamp, intents) {
+    async executeBatch(timestamp, intents, stats) {
         const fills = [];
         const projected = { ...this.stockBalances };
         let sequence = 0;
@@ -263,25 +372,37 @@ export default class ForwardRunner {
             const current = projected[intent.symbol] || 0;
             for (const leg of splitPositionOrder(current, intent.signedQty)) {
                 const quantity = this.broker.normalizeQuantity(intent.symbol, leg.signedQty, intent.price, { reduceOnly: leg.reduceOnly });
+                const side = leg.signedQty > 0 ? 'buy' : 'sell';
+                const orderInfo = {
+                    intentId: intent.journalId, symbol: intent.symbol, side,
+                    reduceOnly: leg.reduceOnly, decisionPrice: intent.price,
+                };
                 if (!quantity) {
                     this.logger.warn(`ForwardRunner: skipped sub-minimum order ${intent.symbol}`);
+                    this.journal.orderSkipped(this.runId, timestamp, { ...orderInfo, quantity: Math.abs(leg.signedQty) }, 'below exchange quantity/notional minimum');
+                    stats.skipped++;
                     continue;
                 }
                 const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
-                const idParts = { timestamp, symbol: intent.symbol, sequence: sequence++ };
-                const clientOrderId = this.broker.createClientOrderId?.(idParts)
-                    || `fw-${timestamp.toString(36)}-${intent.symbol}-${idParts.sequence}`;
+                const clientOrderId = this.broker.createClientOrderId({ timestamp, symbol: intent.symbol, sequence: sequence++ });
+                const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity: Number(quantity), clientOrderId });
+                stats.orders++;
                 try {
                     const fill = await this.broker.placeMarketOrder({
-                        symbol: intent.symbol,
-                        side: signedRounded > 0 ? 'buy' : 'sell',
-                        quantity,
-                        reduceOnly: leg.reduceOnly,
-                        clientOrderId,
+                        symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
                     });
+                    const parsed = this.broker.parseOrderResult(fill) || {};
+                    this.journal.orderResult(orderId, parsed, fill);
+                    this.recordFill(timestamp, intent, side, Number(quantity), parsed);
                     fills.push(fill);
+                    stats.fills++;
                     projected[intent.symbol] = (projected[intent.symbol] || 0) + signedRounded;
                 } catch (err) {
+                    this.journal.orderFailed(orderId, err);
+                    stats.failed++;
+                    this.event('error', 'order-failed', `${intent.symbol} ${side} ${quantity}: ${err.message}`, {
+                        barTs: timestamp, data: { clientOrderId, code: err.code ?? null, body: err.body ?? null },
+                    });
                     await this.refreshAccount();
                     throw new Error(`Order batch stopped after ${fills.length} fills: ${err.message}`, { cause: err });
                 }
@@ -290,9 +411,24 @@ export default class ForwardRunner {
         return fills;
     }
 
+    recordFill(timestamp, intent, side, requestedQty, parsed) {
+        const quantity = parsed.executedQty > 0 ? Number(parsed.executedQty) : requestedQty;
+        const price = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : intent.price;
+        if (!(quantity > 0) || !(price > 0)) return;
+        const fee = this.fee(intent.symbol, quantity, price, side);
+        this.pendingLogs.push({ kind: 'swap', timestamp, stockName: intent.symbol, side, quantity, price, fee });
+        const closed = this.ledger.apply({ symbol: intent.symbol, signedQty: side === 'buy' ? quantity : -quantity, price, fee, timestamp });
+        if (closed) {
+            this.pendingLogs.push({
+                kind: 'trade', timestamp, stockName: intent.symbol, dir: closed.dir,
+                profit: closed.profit, profitPercent: closed.profitPercent, holdMs: closed.holdMs,
+            });
+        }
+    }
+
     async preload() {
-        this.logger.log(`ForwardRunner: loading ${this.warmupBars} ${this.interval} bars for ${this.symbols.length} symbols`);
-        const endTime = typeof this.broker.now === 'function' ? this.broker.now() : Date.now();
+        this.logger.log(`ForwardRunner: ${this.strategy.name} loading ${this.warmupBars} ${this.interval} bars for ${this.symbols.length} symbols`);
+        const endTime = this.broker.now();
         const historiesRaw = await pool(this.symbols, this.concurrency,
             symbol => this.broker.getHistory(symbol, this.interval, this.warmupBars, { endTime, stepMs: this.stepMs }));
         const histories = historiesRaw.map((candles, i) => ({ symbol: this.symbols[i], candles, at: 0 }));
@@ -311,6 +447,7 @@ export default class ForwardRunner {
         }
         const latest = sortedTimes.at(-1) || 0;
         this.logger.log(`ForwardRunner: warm-up complete through ${latest ? new Date(latest).toISOString() : 'n/a'}`);
+        this.event('info', 'warmup-complete', `${sortedTimes.length} bars, ${this.symbols.length} symbols`, { barTs: latest || null });
         return latest;
     }
 
@@ -326,8 +463,7 @@ export default class ForwardRunner {
         await this.broker.initialize();
         await this.refreshSymbols(true);
         await this.refreshAccount();
-        const createStream = this.streamFactory || (opts => this.broker.createStream(opts));
-        this.stream = createStream({
+        this.stream = this.broker.createStream({
             symbols: this.symbols,
             interval: this.interval,
             stepMs: this.stepMs,
@@ -347,6 +483,7 @@ export default class ForwardRunner {
     }
 
     async recoverMissing(batch) {
+        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, recovered: 0, missing: 0 };
         if (!batch.missing.length) return batch.candles;
         const recovered = await this.fetchClosedBatch(batch.timestamp, batch.missing);
         const got = new Set(recovered.map(x => x.symbol));
@@ -354,28 +491,58 @@ export default class ForwardRunner {
         if (stillMissing.length / Math.max(1, batch.expected) > this.maxMissingFraction) {
             throw new Error(`Market-data batch ${new Date(batch.timestamp).toISOString()} remains incomplete: ${stillMissing.length}/${batch.expected} symbols missing after history recovery`);
         }
-        if (stillMissing.length) this.logger.warn(`ForwardRunner: ${stillMissing.length} inactive symbols omitted after history recovery`);
+        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, recovered: recovered.length, missing: stillMissing.length };
+        if (stillMissing.length) {
+            this.logger.warn(`ForwardRunner: ${stillMissing.length} inactive symbols omitted after history recovery`);
+            this.event('warn', 'symbols-missing', `${stillMissing.length} symbols omitted after history recovery`, { barTs: batch.timestamp, data: stillMissing });
+        }
         return [...batch.candles, ...recovered];
     }
 
     async recoverGap(afterTimestamp, beforeTimestamp) {
         for (let timestamp = afterTimestamp + this.stepMs; timestamp < beforeTimestamp; timestamp += this.stepMs) {
             this.logger.warn(`ForwardRunner: recovering missed bar ${new Date(timestamp).toISOString()} from history`);
+            this.event('warn', 'gap-recovery', 'recovering missed bar from history', { barTs: timestamp });
             const candles = await this.fetchClosedBatch(timestamp);
             if (!candles.length) throw new Error(`No candles available for missed bar ${new Date(timestamp).toISOString()}`);
-            await this.tick(timestamp, candles, { execute: true });
+            await this.tick(timestamp, candles, {
+                execute: true,
+                info: { expected: this.symbols.length, streamed: 0, recovered: candles.length, missing: this.symbols.length - candles.length },
+            });
         }
     }
 
     async run() {
+        this.runId = this.journal.startRun({
+            strategy: this.strategy.name,
+            broker: this.broker.label,
+            account: this.broker.account,
+            dryRun: this.dryRun,
+            capital: this.capital,
+            interval: this.interval,
+            config: {
+                params: this.strategy.params,
+                warmupBars: this.warmupBars,
+                market: this.market,
+                allowShort: this.allowShort,
+                maxLeverage: this.maxLeverage,
+                maxNetExposure: Number.isFinite(this.maxNetExposure) ? this.maxNetExposure : null,
+                maxOrderNotional: Number.isFinite(this.maxOrderNotional) ? this.maxOrderNotional : null,
+                maxMissingFraction: this.maxMissingFraction,
+                symbols: this.fixedSymbols,
+            },
+        });
+        let endReason = 'stopped';
+        let fatal = null;
         try {
             const latestWarmup = await this.initialize();
             if (this.state.status === 'executing') {
                 this.logger.warn(`ForwardRunner: previous process stopped during bar ${this.state.lastProcessedBar}; it will not be replayed`);
+                this.event('warn', 'previous-incomplete', 'previous process stopped mid-batch; bar not replayed', { barTs: Number(this.state.lastProcessedBar) || null });
             }
+            await this.pollIncome(true);
             let last = Math.max(latestWarmup, Number(this.state.lastProcessedBar || 0));
-            const brokerLabel = this.broker.label || 'broker';
-            this.logger.log(`ForwardRunner: ${brokerLabel}${this.dryRun ? ' dry-run' : ''} stream; live after ${new Date(last).toISOString()}`);
+            this.logger.log(`ForwardRunner: ${this.strategy.name} on ${this.broker.label}${this.dryRun ? ' (dry-run)' : ''}, $${this.capital.toLocaleString('en-US')} capital; live after ${new Date(last).toISOString()}`);
             while (!this.stopped) {
                 const batch = await this.stream.nextBatch();
                 if (!batch) break;
@@ -383,12 +550,22 @@ export default class ForwardRunner {
                 if (batch.timestamp <= last) continue;
                 if (batch.timestamp > last + this.stepMs) await this.recoverGap(last, batch.timestamp);
                 const candles = await this.recoverMissing(batch);
-                const result = await this.tick(batch.timestamp, candles, { execute: true });
+                const result = await this.tick(batch.timestamp, candles, { execute: true, info: this.lastBatchInfo });
                 last = batch.timestamp;
-                this.logger.log(`ForwardRunner: ${new Date(last).toISOString()} ${candles.length}/${batch.expected} streamed candles, ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
+                if (this.logs.ticks) this.logger.log(`ForwardRunner: ${new Date(last).toISOString()} ${candles.length}/${batch.expected} candles, ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
+                await this.pollIncome();
             }
+            if (!this.stopped) endReason = 'stream-ended';
+        } catch (err) {
+            endReason = 'error';
+            fatal = err;
+            this.event('error', 'fatal', err.message, { data: { stack: err.stack } });
+            throw err;
         } finally {
             await this.stream?.stop();
+            if (!fatal) await this.pollIncome(true);
+            this.journal.endRun(this.runId, endReason, fatal);
+            this.journal.close();
         }
     }
 }

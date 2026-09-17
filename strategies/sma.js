@@ -32,7 +32,7 @@ const bt = new Backtest({
     strategy: smaCrossover,
     startDate: new Date('2020-07-14'),
     endDate: new Date('2025-07-30'),
-    startCashBalance: 10_000,
+    capital: 10_000,
     broker: new IBKR('tiered'),
     logs: {
         swaps: false,
@@ -40,5 +40,5 @@ const bt = new Backtest({
     }
 });
 
-const result = await bt.runOnStock('AAPL');
+const result = await bt.runOnTicker('AAPL');
 bt.logMetrics(result);

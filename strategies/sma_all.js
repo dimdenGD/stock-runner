@@ -55,7 +55,7 @@ const bt = new Backtest({
     strategy: smaCrossover,
     startDate: new Date('2025-09-14'),
     endDate: new Date('2026-02-12'),
-    startCashBalance: 100_000,
+    capital: 100_000,
     broker: new IBKR('tiered'),
     logs: {
         swaps: false,
@@ -63,5 +63,5 @@ const bt = new Backtest({
     }
 });
 
-const result = await bt.runOnAllStocks();
+const result = await bt.runOnAllTickers();
 bt.logMetrics(result);

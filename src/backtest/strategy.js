@@ -1,3 +1,4 @@
+import { basename } from 'node:path';
 import { allowedIntervals } from './consts.js';
 
 export default class Strategy {
@@ -7,7 +8,7 @@ export default class Strategy {
      * @param {Function} options.onTick           — Called each tick with context
      * @throws {TypeError} on invalid intervals or onTick
      */
-    constructor({ intervals, onTick }) {
+    constructor({ name, params = {}, warmup = 0, intervals, onTick }) {
         if (typeof intervals !== 'object') {
             throw new TypeError('Intervals must be an object');
         }
@@ -27,6 +28,13 @@ export default class Strategy {
         if (typeof onTick !== 'function') {
             throw new TypeError('`onTick` must be a function');
         }
+        if (!Number.isInteger(warmup) || warmup < 0) {
+            throw new TypeError('`warmup` must be a non-negative integer number of bars');
+        }
+        const resolvedName = name ?? basename(process.argv[1] || 'strategy', '.js');
+        if (!/^[A-Za-z0-9._-]+$/.test(resolvedName)) {
+            throw new TypeError('`name` may only contain letters, digits, dots, dashes and underscores');
+        }
 
         for(let iv in intervals) {
             const interval = intervals[iv];
@@ -35,6 +43,9 @@ export default class Strategy {
             interval.preload = interval.main ? true : !!interval.preload;
         }
 
+        this.name = resolvedName;
+        this.params = params;
+        this.warmup = warmup;
         this.intervals = intervals;
         this.mainInterval = mains[0];
         this.onTick = onTick;

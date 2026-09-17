@@ -1,6 +1,6 @@
 # Stock Runner
 
-Because of lack of good backtesting tools in JavaScript, I've decided to build my own.
+Because of lack of good algotrading tools in JavaScript, I've decided to build my own.
 It uses QuestDB to efficiently store and query the data.
 It's also quite fast and nice to use. You can run a 5 year backtest on ALL stocks in 1 minute (on daily ticks).
 
@@ -82,6 +82,9 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
 import Strategy from '../src/backtest/strategy.js';
 
 const strategy = new Strategy({
+    name: 'sma',
+    params: { short: 25, long: 50 },
+    warmup: 0,
     intervals: {
         '1d': { count: 50, main: true },
         '1h': { count: 24, main: false, preload: true },
@@ -90,6 +93,9 @@ const strategy = new Strategy({
 });
 ```
 
+- **`name`** - Used for forward test data folder. Default: script filename.
+- **`params`** - Saved with forward runs.
+- **`warmup`** - Bars to run before `startDate`. Orders are rejected during warmup.
 - **`intervals`** - Timeframes your strategy uses. Keys: `'1d'`, `'4h'`, `'1h'`, `'15m'`, `'5m'`, `'1m'`.
   - **`count`** - Number of bars to keep in lookback (≥ 1).
   - **`main: true`** - Exactly one interval must be main; it drives the simulation (one tick per bar).
@@ -105,7 +111,7 @@ const bt = new Backtest({
     strategy,
     startDate: new Date('2020-01-01'),
     endDate: new Date('2025-01-01'),
-    startCashBalance: 10_000,
+    capital: 10_000,
     broker: new IBKR('tiered'),
     logs: { swaps: false, trades: true },
     features: [ // optional
@@ -113,25 +119,25 @@ const bt = new Backtest({
     ],
 });
 
-const result = await bt.runOnStock('AAPL');   // single symbol
+const result = await bt.runOnTicker('AAPL');  // single symbol
 // or
-const result = await bt.runOnAllStocks();     // all symbols in DB
+const result = await bt.runOnAllTickers();    // all symbols in DB
 
 bt.logMetrics(result);
 ```
 
-- **`runOnStock(stockName)`** - Runs backtest on one ticker; returns metrics object.
-- **`runOnAllStocks()`** - Runs on all tickers with data in the range; returns metrics object.
+- **`runOnTicker(stockName)`** - Runs backtest on one ticker; returns metrics object.
+- **`runOnAllTickers()`** - Runs on all tickers with data in the range; returns metrics object.
 - **`logMetrics(metrics)`** - Prints summary (CAGR, Sharpe, max drawdown, win rate, etc.) and any open positions.
 - **`buildReport(metrics)`** - Builds a HTML report with charts and tables.
 
 **Crypto options:**
 
-- **`market`** - `'stocks'` (default) or `'crypto'`.
+- **`market`** - `'stocks'` or `'crypto'`. Crypto enables 24/7 trading. Default: `broker.market`.
 - **`allowShort`** - Override shorting. Default: `true` for crypto, `false` for stocks.
 - **`maxLeverage`** - Maximum gross exposure / equity.
 
-**Metrics returned by `getMetrics()` / `runOnStock` / `runOnAllStocks`:**
+**Metrics returned by `getMetrics()` / `runOnTicker` / `runOnAllTickers`:**
 
 | Field           | Description                    |
 |----------------|--------------------------------|
@@ -150,18 +156,23 @@ bt.logMetrics(result);
 
 ### onTick context
 
-**Single-stock** (`runOnStock`):
+**Single-stock** (`runOnTicker`):
 
 - `stockName`, `candle` (current bar), `stockBalance`, `ctx` (backtest instance)
 - `getCandles(intervalName, count, ts?)` - returns `Promise<Array>` of bars (newest to oldest), includes the current bar; `ts` defaults to current bar.
 - `buy(quantity, price)`, `sell(quantity, price)` - execute at given price (fees applied by broker).
 - `setFeatures(features)` - set features for the trade. Used for calculating profit correlations. You must set `features` in Backtest options. for example: `.setFeatures([0.1, 0.2, 0.3])`
 
-**All-stocks** (`runOnAllStocks`):
+**All-stocks** (`runOnAllTickers`):
 
 - `currentDate`, `ctx`, `stocks` (array of per-stock objects), `raw` (all loaded symbols)
 - Each element of `stocks` has: `stockName`, `candle`, `stockBalance`, `getCandles`, `buy`, `sell`, `setFeatures` (see above).
 - Use `ctx.cashBalance`, `ctx.stockBalances` for portfolio state. Delisted symbols are detected and positions cleared after missing bars.
+
+**`ctx`**:
+
+- `totalValue()`, `grossExposure()`, `cashBalance`, `stockBalances`, `stockPrices`, `isWarmup`
+- `record(kind, data)` - Saves `data` to the forward journal. `data.symbol` and numeric `data.value` get their own columns. No-op in backtest.
 
 ### Brokers
 
@@ -175,13 +186,50 @@ bt.logMetrics(result);
   - `new Alpaca(slippage?)`
   - Commission: $0. Sells: FINRA TAF $0.000195/share (max $9.79, qty cap 50,205). All: CAT $0.0000265/share. Rounded up to nearest penny.
   - `slippage` - fraction (e.g. `0.001` = 0.1%), default `0`.
-- **`BinanceFutures`** - USD-M futures fee model and execution adapter:
-  - `new BinanceFutures({ feeBps, slippage, impactCoef, depthRatio })`
+- **`BinanceFutures`** - USD-M futures. Supports forward testing:
+  - `new BinanceFutures({ feeBps, slippage, impactCoef, depthRatio, environment, apiKey, apiSecret })`
   - `feeBps` - fee in basis points, default `5` (VIP0 taker).
   - `slippage` - extra fraction of notional per fill, default `0`.
   - `impactCoef` - multiplier on the book walk, default `1`
   - `depthRatio` - depth within 1% of mid, as a fraction of the bar quote volume
   - `environment` - `demo` (default) or `live`.
+  - `apiKey`, `apiSecret` - needed for forward testing.
+
+### ForwardRunner
+
+```js
+import ForwardRunner from '../src/forward/index.js';
+
+const runner = new ForwardRunner({
+    strategy,
+    broker: new BinanceFutures({ environment: 'demo', apiKey: process.env.BINANCE_API_KEY, apiSecret: process.env.BINANCE_API_SECRET }),
+    capital: 50_000,
+    maxLeverage: 1.1,
+    logs: { swaps: false, trades: true, ticks: false },
+    dryRun: false,
+});
+
+process.on('SIGINT', () => runner.stop());
+await runner.run();
+```
+
+- **`capital`** - Sizing cap. `ctx.totalValue()` is `min(account equity, capital)`.
+- **`maxLeverage`** - Max gross exposure / equity per batch. Default: `3` for crypto, `1` for stocks.
+- **`dryRun`** - Run the strategy on live data without sending orders.
+- **`maxNetExposure`** - Max `|net| / equity` per batch. Default: none.
+- **`maxOrderNotional`** - Max notional of an opening order. Default: none.
+- **`symbols`** - Fixed universe. Default: all tradable symbols from the broker.
+- **`logs.ticks`** - Print a line per bar.
+- **`run()`** - Warms up on `strategy.warmup` bars of history, then trades on each closed bar until `stop()`.
+
+Data is saved to `output/forward/<strategy name>/`:
+
+- `journal.sqlite` - runs, ticks, account snapshots, positions, intents, orders, income, strategy records, events. Views `v_orders` (with `slippage_bps`) and `v_ticks`.
+- `state-<account>.json` - last processed bar and open position entries.
+
+```bash
+node scripts/forward_report.js --strategy=<name> [--run=N | --runs]
+```
 ---
 
 ## Strategies
@@ -223,12 +271,12 @@ const bt = new Backtest({
     strategy: smaCrossover,
     startDate: new Date('2020-07-14'),
     endDate: new Date('2025-07-30'),
-    startCashBalance: 10_000,
+    capital: 10_000,
     broker: new IBKR('tiered'),
     logs: { swaps: false, trades: true }
 });
 
-const result = await bt.runOnStock('AAPL');
+const result = await bt.runOnTicker('AAPL');
 bt.logMetrics(result);
 ```
 
@@ -289,12 +337,12 @@ const bt = new Backtest({
     strategy: smaCrossover,
     startDate: new Date('2024-07-14'),
     endDate: new Date('2025-07-30'),
-    startCashBalance: 100_000,
+    capital: 100_000,
     broker: new IBKR('tiered'),
     logs: { swaps: false, trades: true }
 });
 
-const result = await bt.runOnAllStocks();
+const result = await bt.runOnAllTickers();
 bt.logMetrics(result);
 ```
 

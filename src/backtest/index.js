@@ -7,6 +7,7 @@ import { intervalMsMap, markets } from './consts.js';
 import chalk from 'chalk';
 import { eachDayOfInterval, eachMinuteOfInterval, eachHourOfInterval, subDays, addDays, addMinutes } from 'date-fns';
 import ms from 'ms';
+import { formatSwapLine, formatTradeLine } from './logFormat.js';
 
 const sharpePeriods = {
     '1d': 252,
@@ -108,14 +109,14 @@ export default class Backtest {
      * @param {string} params.stockName           – Ticker symbol
      * @param {Date}   params.startDate           – Backtest start
      * @param {Date}   params.endDate             – Backtest end
-     * @param {number} params.startCashBalance    – Starting cash balance
+     * @param {number} params.capital             – Starting cash balance
      */
-    constructor({ strategy, startDate, endDate, startCashBalance, broker = new Broker(), logs = {}, features = [], market = 'stocks', allowShort, maxLeverage }) {
+    constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
-        if (typeof startCashBalance !== 'number') {
-            throw new TypeError('startCashBalance must be a number');
+        if (typeof capital !== 'number' || !(capital > 0)) {
+            throw new TypeError('capital must be a positive number');
         }
         if (!(strategy instanceof Strategy)) {
             throw new TypeError('strategy must be an instance of Strategy');
@@ -127,9 +128,11 @@ export default class Backtest {
         this.strategy = strategy;
         this.startDate = startDate;
         this.endDate = endDate;
+        this.warmupStart = new Date(startDate.getTime() - strategy.warmup * intervalMsMap[strategy.mainInterval.name]);
+        this.isWarmup = false;
 
-        this.startCashBalance = startCashBalance;
-        this.cashBalance = startCashBalance;
+        this.capital = capital;
+        this.cashBalance = capital;
         this.stockBalances = {};
         this.holdSince = {};
         this.stockPrices = {};
@@ -147,6 +150,7 @@ export default class Backtest {
         this.logs = logs;
         this.featuresDef = features;
 
+        market = market ?? broker.market ?? 'stocks';
         if (!markets.includes(market)) {
             throw new TypeError(`market must be one of: ${markets.join(', ')}`);
         }
@@ -160,7 +164,7 @@ export default class Backtest {
         this.ruined = false;
     }
 
-    async runOnStock(stockName) {
+    async runOnTicker(stockName) {
         if(!this.buffers[stockName]) {
             this.buffers[stockName] = {};
         }
@@ -169,12 +173,12 @@ export default class Backtest {
         for(let iv in this.strategy.intervals) {
             const interval = this.strategy.intervals[iv];
             if(interval.preload) {
-                buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.startDate, this.endDate, interval.count, oneStockPreloadAmounts[interval.name], this.market);
+                buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.warmupStart, this.endDate, interval.count, oneStockPreloadAmounts[interval.name], this.market);
             }
         }
         // preload initial chunks
         await Promise.all(
-            Object.values(buffers).map(buf => buf.ensure(this.startDate))
+            Object.values(buffers).map(buf => buf.ensure(this.warmupStart))
         );
         const mainBuf = buffers[this.strategy.mainInterval.name].buffer;
         const lookback = this.strategy.mainInterval.count;
@@ -204,7 +208,7 @@ export default class Backtest {
         };
 
         if (this.market === 'crypto') {
-            this.fundingEvents = await loadFundingInRange(new Date(this.startDate.getTime() - 86400000), this.endDate);
+            this.fundingEvents = await loadFundingInRange(new Date(this.warmupStart.getTime() - 86400000), this.endDate);
         }
         let prevTs = null;
 
@@ -213,6 +217,7 @@ export default class Backtest {
             const mainCandle = mainBuf[i];
             const ts = mainCandle.timestamp;
             if (ts >= this.endDate) break;
+            this.isWarmup = this.strategy.warmup > 0 && ts < this.startDate.getTime();
 
             // top up all buffers as we advance
             await Promise.all(
@@ -244,19 +249,19 @@ export default class Backtest {
             };
             await this.strategy.onTick(tickObj);
 
-            this.equityCurve.push([mainCandle.timestamp, this.totalValue(), this.cashBalance]);
+            if (!this.isWarmup) this.equityCurve.push([mainCandle.timestamp, this.totalValue(), this.cashBalance]);
         }
 
         return this.getMetrics();
     }
 
-    async runOnAllStocks() {
+    async runOnAllTickers() {
         const interval = this.strategy.mainInterval.name;
         let dates;
         if (this.market === 'crypto') {
             const stepMs = intervalMsMap[interval];
             dates = [];
-            for (let t = Math.ceil(this.startDate.getTime() / stepMs) * stepMs; t <= this.endDate.getTime(); t += stepMs) {
+            for (let t = Math.ceil(this.warmupStart.getTime() / stepMs) * stepMs; t <= this.endDate.getTime(); t += stepMs) {
                 dates.push(new Date(t));
             }
         } else {
@@ -269,7 +274,7 @@ export default class Backtest {
                 '1m': eachMinuteOfInterval,
             };
             const intervalFn = intervalFns[interval] ?? eachMinuteOfInterval;
-            dates = intervalFn({ start: this.startDate, end: this.endDate });
+            dates = intervalFn({ start: this.warmupStart, end: this.endDate });
         }
         const chunks = splitArray(dates, allStocksPreloadAmounts[interval]);
         const start = Date.now();
@@ -361,7 +366,7 @@ export default class Backtest {
 
         let min = this.strategy.mainInterval.count;
         if (this.market === 'crypto') {
-            this.fundingEvents = await loadFundingInRange(new Date(this.startDate.getTime() - 86400000), this.endDate);
+            this.fundingEvents = await loadFundingInRange(new Date(this.warmupStart.getTime() - 86400000), this.endDate);
         }
         let prevTs = null;
         for(let i = 0; i < chunks.length; i++) {
@@ -381,6 +386,7 @@ export default class Backtest {
                     continue;
                 }
                 const arr = [];
+                this.isWarmup = this.strategy.warmup > 0 && currentDate.getTime() < this.startDate.getTime();
 
                 for(const stockName in stocks) {
                     const stock = stocks[stockName];
@@ -425,7 +431,7 @@ export default class Backtest {
                         if (this.totalValue() <= 0) {
                             this.ruined = true;
                             console.log(chalk.red(`ACCOUNT LIQUIDATED ON ${formatDate(currentDate)}`));
-                            this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
+                            if (!this.isWarmup) this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
                             break;
                         }
                     }
@@ -448,14 +454,17 @@ export default class Backtest {
                         ctx: this,
                         stocks: arr
                     });
-                    this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
+                    if (!this.isWarmup) this.equityCurve.push([currentDate, this.totalValue(), this.cashBalance]);
                 }
             }
         }
 
+        this.isWarmup = false;
         console.log('Backtest finished in', ms(Date.now() - start));
         return this.getMetrics();
     }
+
+    record() {}
 
     totalValue() {
 
@@ -497,6 +506,9 @@ export default class Backtest {
     }
 
     _trade(stockName, signedQty, price, timestamp, features, candle, { settle = false } = {}) {
+        if (this.isWarmup && !settle) {
+            throw new Error(`Orders are not allowed during warm-up: ${stockName}`);
+        }
         const side = signedQty > 0 ? 'buy' : 'sell';
         const quantity = Math.abs(signedQty);
         if (!(quantity > 0) || !isFinite(quantity) || !(price > 0)) {
@@ -541,18 +553,7 @@ export default class Backtest {
         if (this.market === 'crypto' && this.lastSeen[stockName] == null) this.lastSeen[stockName] = +timestamp;
 
         if (this.logs.swaps) {
-            const equity = this.totalValue();
-            console.log(
-                chalk.gray(`${formatDate(new Date(+timestamp))} `) +
-                chalk.bold(`${stockName.padEnd(7)} `) +
-                (side === 'buy' ? chalk.greenBright(`BUY  `) : chalk.redBright(`SELL `)) +
-                chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
-                chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +
-                chalk.gray(` | `) +
-                chalk.white(`$${Math.round(notional).toLocaleString('en-US')}`.padEnd(11)) +
-                chalk.white(` + $${Math.round(fee).toLocaleString('en-US')} fee`.padEnd(16)) +
-                chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(equity).toLocaleString('en-US')}`.padEnd(10))
-            );
+            console.log(formatSwapLine({ timestamp, stockName, side, quantity, price, fee, cash: this.cashBalance, equity: this.totalValue() }));
         }
 
         const pos = this.positions[stockName] ?? { avgPrice: 0, entryFees: 0 };
@@ -573,20 +574,11 @@ export default class Backtest {
             });
 
             if (this.logs.trades) {
-                const holdTime = ms(Math.max(0, +timestamp - +this.holdSince[stockName]));
-                let line = chalk.gray(`${formatDate(new Date(+timestamp))} `) +
-                    chalk.bold(`${stockName.padEnd(this.market === 'crypto' ? 15 : 7)} `) +
-                    (dir < 0 ? chalk.magenta('SHORT ') : chalk.blue('LONG  ')) +
-                    chalk[profit > 0 ? 'green' : 'red'](
-                        `${profit > 0 ? '+$' : '-$'}${(+Math.abs(profit).toFixed(2)).toLocaleString('en-US').padEnd(10)} ` +
-                        `(${(profitPercent * 100).toFixed(1)}%)`.padEnd(12)
-                    ) +
-                    chalk.white(`${holdTime}`.padEnd(5)) +
-                    chalk.gray(`CASH $${Math.round(this.cashBalance).toLocaleString('en-US')} | EQUITY $${Math.round(this.totalValue()).toLocaleString('en-US')}`);
-                if (tradeFeatures != null && tradeFeatures.length > 0) {
-                    line += chalk.cyan(` [${tradeFeatures.map(f => typeof f === 'number' ? f.toFixed(4) : f).join(', ')}]`);
-                }
-                console.log(line);
+                console.log(formatTradeLine({
+                    timestamp, stockName, market: this.market, dir, profit, profitPercent,
+                    holdMs: +timestamp - +this.holdSince[stockName],
+                    cash: this.cashBalance, equity: this.totalValue(), features: tradeFeatures,
+                }));
             }
         }
 
@@ -627,7 +619,7 @@ export default class Backtest {
 
         /* ---------- totals & CAGR -------------------------------------- */
         const finalEquity  = series.at(-1);
-        const totalReturn  = finalEquity / this.startCashBalance - 1;
+        const totalReturn  = finalEquity / this.capital - 1;
         const years        = (this.endDate - this.startDate) / (365 * 24 * 3600 * 1e3);
         const CAGR         = Math.pow(1 + totalReturn, 1 / years) - 1;
 
@@ -710,7 +702,7 @@ export default class Backtest {
             const funding = Math.round(Math.abs(this.totalFunding)).toLocaleString('en-US');
             console.log(`Funding           : ${this.totalFunding <= 0 ? chalk.greenBright(`received $${funding}`) : chalk.redBright(`paid $${funding}`)}`);
         }
-        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US'))} ($${this.startCashBalance.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
+        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US'))} ($${this.capital.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         console.log(`Avg daily return  : ${m.avgDaily > 0 ? chalk.greenBright('+' + (m.avgDaily * 100).toFixed(2) + '%') : chalk.redBright('' + (m.avgDaily * 100).toFixed(2) + '%')}`);
         console.log(`CAGR (Annualized) : ${m.CAGR > 0 ? chalk.greenBright('+' + (m.CAGR * 100).toFixed(1) + '%') : chalk.redBright('' + (m.CAGR * 100).toFixed(1) + '%')}`);
@@ -972,7 +964,7 @@ ${navHtml}
 <tr><td>Period</td><td>${this.startDate.toISOString().slice(0, 10)} → ${this.endDate.toISOString().slice(0, 10)}</td></tr>
 <tr><td>Trades</td><td>${this.trades.length} (win-rate ${winRate}%) / ${this.swaps.length} swaps</td></tr>
 <tr><td>Fees</td><td>$${Math.round(this.totalFees).toLocaleString('en-US')}</td></tr>
-<tr><td>Total USD return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : '-'}$${Math.abs(Math.round(m.totalReturn * this.startCashBalance)).toLocaleString('en-US')} ($${this.startCashBalance.toLocaleString('en-US')} → $${finalEquity.toLocaleString('en-US')})</td></tr>
+<tr><td>Total USD return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : '-'}$${Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')} ($${this.capital.toLocaleString('en-US')} → $${finalEquity.toLocaleString('en-US')})</td></tr>
 <tr><td>Total % return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : ''}${(m.totalReturn * 100).toFixed(2)}%</td></tr>
 <tr><td>Avg daily return</td><td style="color:${retColor(m.avgDaily)}">${m.avgDaily >= 0 ? '+' : ''}${(m.avgDaily * 100).toFixed(4)}%</td></tr>
 <tr><td>CAGR (Annualized)</td><td style="color:${retColor(m.CAGR)}">${m.CAGR >= 0 ? '+' : ''}${(m.CAGR * 100).toFixed(1)}%</td></tr>

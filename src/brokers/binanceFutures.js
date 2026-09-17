@@ -1,5 +1,7 @@
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import Broker from './base.js';
+import Candle from '../backtest/candle.js';
+import BinanceKlineStream from './binanceKlineStream.js';
 
 const PROD_REST = 'https://fapi.binance.com';
 const DEMO_REST = 'https://demo-fapi.binance.com';
@@ -21,6 +23,13 @@ export function klineRequestWeight(limit) {
     if (limit < 500) return 2;
     if (limit <= 1000) return 5;
     return 10;
+}
+
+export function rowToClosedCandle(row, stepMs) {
+    return new Candle(
+        Number(row[1]), Number(row[2]), Number(row[3]), Number(row[4]),
+        Number(row[5]), Number(row[0]) + stepMs, Number(row[7]),
+    );
 }
 
 class MinuteWeightLimiter {
@@ -64,12 +73,13 @@ export default class BinanceFutures extends Broker {
         impactCoef = 1,
         depthRatio = 0.5,
         environment = 'demo',
-        allowLive = false,
         apiKey = null,
         apiSecret = null,
         marketDataBaseUrl = PROD_REST,
         demoBaseUrl = DEMO_REST,
         liveBaseUrl = PROD_REST,
+        webSocketUrl,
+        webSocketImpl = globalThis.WebSocket,
         recvWindow = 5000,
         timeoutMs = 15000,
         maxRequestWeightPerMinute = 1800,
@@ -79,11 +89,9 @@ export default class BinanceFutures extends Broker {
         if (!['demo', 'live'].includes(environment)) {
             throw new TypeError("environment must be 'demo' or 'live'");
         }
-        if (environment === 'live' && allowLive !== true) {
-            throw new Error('Live Binance Futures trading is locked; pass allowLive: true explicitly');
-        }
         if (typeof fetchImpl !== 'function') throw new Error('A fetch implementation is required');
 
+        this.market = 'crypto';
         this.feeBps = feeBps;
         this.slippage = slippage;
         this.impactCoef = impactCoef;
@@ -93,6 +101,8 @@ export default class BinanceFutures extends Broker {
         this.apiSecret = apiSecret;
         this.marketDataBaseUrl = marketDataBaseUrl.replace(/\/$/, '');
         this.tradeBaseUrl = (environment === 'demo' ? demoBaseUrl : liveBaseUrl).replace(/\/$/, '');
+        this.webSocketUrl = webSocketUrl;
+        this.webSocketImpl = webSocketImpl;
         this.recvWindow = recvWindow;
         this.timeoutMs = timeoutMs;
         this.fetchImpl = fetchImpl;
@@ -104,6 +114,15 @@ export default class BinanceFutures extends Broker {
 
     get isDemo() { return this.environment === 'demo'; }
 
+    get label() {
+        return `Binance Futures ${this.environment}`;
+    }
+
+    get account() {
+        const suffix = this.apiKey ? `-${createHash('sha256').update(this.apiKey).digest('hex').slice(0, 10)}` : '';
+        return `binance-futures-${this.environment}${suffix}`;
+    }
+
     calculateFees(quantity, price, side, candle) {
         const notional = quantity * price;
         let fee = notional * (this.feeBps / 1e4 + this.slippage);
@@ -114,12 +133,17 @@ export default class BinanceFutures extends Broker {
         return fee;
     }
 
+    now() {
+        return Date.now() + Number(this.timeOffsetMs || 0);
+    }
+
     async request(path, {
         method = 'GET', params = {}, signed = false, weight = 1,
         trade = signed, retry = !signed && method === 'GET',
     } = {}) {
-        if (signed && (!this.apiKey || !this.apiSecret)) {
-            throw new Error(`Missing Binance Futures ${this.environment} API credentials`);
+        const { apiKey, apiSecret } = this;
+        if (signed && (!apiKey || !apiSecret)) {
+            throw new Error(`Binance Futures ${this.environment} requests need apiKey and apiSecret`);
         }
         await this.limiter.acquire(weight);
 
@@ -130,12 +154,12 @@ export default class BinanceFutures extends Broker {
         if (signed) {
             query.set('timestamp', String(Date.now() + this.timeOffsetMs));
             query.set('recvWindow', String(this.recvWindow));
-            query.set('signature', createHmac('sha256', this.apiSecret).update(query.toString()).digest('hex'));
+            query.set('signature', createHmac('sha256', apiSecret).update(query.toString()).digest('hex'));
         }
 
         const base = trade ? this.tradeBaseUrl : this.marketDataBaseUrl;
         const url = `${base}${path}${query.size ? `?${query}` : ''}`;
-        const headers = signed ? { 'X-MBX-APIKEY': this.apiKey } : {};
+        const headers = signed ? { 'X-MBX-APIKEY': apiKey } : {};
         const attempts = retry ? 4 : 1;
         for (let attempt = 0; attempt < attempts; attempt++) {
             const controller = new AbortController();
@@ -196,15 +220,6 @@ export default class BinanceFutures extends Broker {
         return { market, execution };
     }
 
-    async getTradableSymbols() {
-        if (!this.symbolRules.size) await this.loadExchangeInfo();
-        return [...this.symbolRules]
-            .filter(([symbol, r]) => this.marketSymbols.has(symbol)
-                && r.status === 'TRADING' && r.contractType === 'PERPETUAL' && r.quoteAsset === 'USDT')
-            .map(([symbol]) => symbol)
-            .sort();
-    }
-
     async getKlines(symbol, interval, { startTime, endTime, limit = 1000 } = {}) {
         return this.request('/fapi/v1/klines', {
             params: { symbol, interval, startTime, endTime, limit },
@@ -240,7 +255,65 @@ export default class BinanceFutures extends Broker {
         return this.request('/fapi/v1/positionSide/dual', { signed: true });
     }
 
-    quantityFor(symbol, quantity, price, { reduceOnly = false } = {}) {
+    async fetchIncome({ startTime, endTime, limit = 1000 } = {}) {
+        return this.request('/fapi/v1/income', { signed: true, params: { startTime, endTime, limit }, weight: 30 });
+    }
+
+    async initialize() {
+        await this.syncTime();
+        const mode = await this.getPositionMode();
+        if (mode.dualSidePosition === true) {
+            throw new Error('Binance Futures forward trading requires one-way position mode');
+        }
+        await this.loadExchangeInfo();
+    }
+
+    async getTradableSymbols() {
+        await this.loadExchangeInfo();
+        return [...this.symbolRules]
+            .filter(([symbol, r]) => this.marketSymbols.has(symbol)
+                && r.status === 'TRADING' && r.contractType === 'PERPETUAL' && r.quoteAsset === 'USDT')
+            .map(([symbol]) => symbol)
+            .sort();
+    }
+
+    async getPortfolio() {
+        const [account, positions] = await Promise.all([this.getAccount(), this.getPositions()]);
+        return {
+            cash: Number(account.availableBalance ?? account.totalWalletBalance ?? 0),
+            available: Number(account.availableBalance ?? 0),
+            equity: Number(account.totalMarginBalance ?? account.totalWalletBalance ?? 0),
+            positions: (positions || []).map(position => ({
+                symbol: position.symbol,
+                quantity: Number(position.positionAmt),
+                markPrice: Number(position.markPrice),
+                entryPrice: Number(position.entryPrice),
+                unrealizedPnl: Number(position.unRealizedProfit),
+            })),
+        };
+    }
+
+    async getHistory(symbol, interval, bars, { endTime = this.now(), stepMs } = {}) {
+        const rows = await this.getKlineHistory(symbol, interval, bars, { endTime });
+        return rows.map(row => rowToClosedCandle(row, stepMs));
+    }
+
+    async getClosedCandle(symbol, interval, timestamp, { stepMs } = {}) {
+        const rows = await this.getKlines(symbol, interval, { endTime: timestamp, limit: 2 });
+        const row = rows.find(candidate => Number(candidate[0]) + stepMs === timestamp
+            && Number(candidate[6]) < this.now());
+        return row ? rowToClosedCandle(row, stepMs) : null;
+    }
+
+    createStream({ symbols, interval, stepMs, graceMs, logger }) {
+        return new BinanceKlineStream({
+            symbols, interval, stepMs, graceMs, logger,
+            webSocketImpl: this.webSocketImpl,
+            ...(this.webSocketUrl ? { url: this.webSocketUrl } : {}),
+        });
+    }
+
+    normalizeQuantity(symbol, quantity, price, { reduceOnly = false } = {}) {
         const r = this.symbolRules.get(symbol);
         if (!r) throw new Error(`No Binance Futures exchange rules for ${symbol}`);
         const step = r.stepSize;
@@ -251,17 +324,50 @@ export default class BinanceFutures extends Broker {
     }
 
     async placeMarketOrder({ symbol, side, quantity, reduceOnly = false, clientOrderId }) {
-        if (!['BUY', 'SELL'].includes(side)) throw new TypeError('side must be BUY or SELL');
+        if (!['buy', 'sell'].includes(side)) throw new TypeError('side must be buy or sell');
         return this.request('/fapi/v1/order', {
             method: 'POST',
             signed: true,
             params: {
-                symbol, side, type: 'MARKET', quantity,
+                symbol, side: side === 'buy' ? 'BUY' : 'SELL', type: 'MARKET', quantity,
                 reduceOnly: reduceOnly ? 'true' : undefined,
                 newClientOrderId: clientOrderId,
                 newOrderRespType: 'RESULT',
             },
             retry: false,
         });
+    }
+
+    parseOrderResult(result) {
+        if (!result || typeof result !== 'object') return {};
+        return {
+            exchangeOrderId: result.orderId,
+            status: result.status,
+            executedQty: Number(result.executedQty),
+            avgPrice: Number(result.avgPrice),
+        };
+    }
+
+    async getIncome({ startTime, endTime = this.now() } = {}) {
+        const out = [];
+        let from = startTime;
+        for (let page = 0; page < 100; page++) {
+            const rows = await this.fetchIncome({ startTime: from, endTime, limit: 1000 });
+            out.push(...rows);
+            if (rows.length < 1000) break;
+            const lastTime = Number(rows.at(-1).time);
+            if (!(lastTime > from)) break;
+            from = lastTime;
+        }
+        return out.map(row => ({
+            id: `${row.incomeType}:${row.tranId}:${row.symbol || ''}:${row.asset || ''}`,
+            time: Number(row.time),
+            symbol: row.symbol || null,
+            type: row.incomeType,
+            amount: Number(row.income),
+            asset: row.asset,
+            info: row.info || null,
+            tradeId: row.tradeId || null,
+        }));
     }
 }
