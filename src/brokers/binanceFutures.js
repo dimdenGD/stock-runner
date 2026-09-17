@@ -118,6 +118,10 @@ export default class BinanceFutures extends Broker {
         return `Binance Futures ${this.environment}`;
     }
 
+    get dataSource() {
+        return `binance-futures-${new URL(this.marketDataBaseUrl).host}`;
+    }
+
     get account() {
         const suffix = this.apiKey ? `-${createHash('sha256').update(this.apiKey).digest('hex').slice(0, 10)}` : '';
         return `binance-futures-${this.environment}${suffix}`;

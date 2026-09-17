@@ -14,6 +14,10 @@ export default class Broker {
         return this.label;
     }
 
+    get dataSource() {
+        return this.label;
+    }
+
     calculateFees(quantity, price, side, candle) {
         return 0;
     }

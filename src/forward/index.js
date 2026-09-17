@@ -6,6 +6,7 @@ import { intervalMsMap, markets } from '../backtest/consts.js';
 import { formatSwapLine, formatTradeLine } from '../backtest/logFormat.js';
 import ForwardJournal from './journal.js';
 import TradeLedger from './tradeLedger.js';
+import CandleCache from './candleCache.js';
 
 async function pool(items, limit, fn) {
     const out = new Array(items.length);
@@ -93,6 +94,8 @@ export default class ForwardRunner {
         this.dataDir = join(dataDir, strategy.name);
         this.stateFile = join(this.dataDir, `state-${fileSafe(broker.account)}${dryRun ? '-dry' : ''}.json`);
         this.journal = new ForwardJournal({ file: join(this.dataDir, 'journal.sqlite') });
+        this.cache = new CandleCache({ file: join(dataDir, 'cache', fileSafe(broker.dataSource), `${this.interval}.sqlite`), stepMs: this.stepMs });
+        this.lastPrune = 0;
 
         this.symbols = [];
         this.buffers = new Map();
@@ -279,6 +282,8 @@ export default class ForwardRunner {
         if (execute && timestamp <= Number(this.state.lastProcessedBar || 0)) return { skipped: true, intents: [] };
         const startedAt = Date.now();
         if (execute) {
+            this.cache.append(timestamp, candles);
+            this.pruneCache(timestamp);
             await this.refreshAccount();
             this.snapshot(timestamp, 'pre');
         }
@@ -426,11 +431,46 @@ export default class ForwardRunner {
         }
     }
 
+    pruneCache(latest, force = false) {
+        if (!force && Date.now() - this.lastPrune < 3600000) return;
+        this.lastPrune = Date.now();
+        this.cache.registerConsumer(this.strategy.name, this.warmupBars);
+        const removed = this.cache.prune(latest);
+        if (removed) this.event('info', 'cache-pruned', `${removed} old candles removed`);
+    }
+
+    async loadHistory(symbol, fromTs, latest, endTime, counts) {
+        const coverage = this.cache.coverage(symbol);
+        if (coverage && coverage.from_ts <= fromTs && coverage.to_ts >= fromTs - this.stepMs) {
+            const missingBars = Math.round((latest - coverage.to_ts) / this.stepMs);
+            if (missingBars <= 0) {
+                counts.cached++;
+                return this.cache.load(symbol, fromTs, latest);
+            }
+            if (missingBars < this.warmupBars) {
+                const fetched = (await this.broker.getHistory(symbol, this.interval, missingBars, { endTime, stepMs: this.stepMs }))
+                    .filter(c => c.timestamp > coverage.to_ts && c.timestamp <= latest);
+                this.cache.store(symbol, fetched, { fromTs: coverage.from_ts, toTs: latest });
+                counts.topped++;
+                return this.cache.load(symbol, fromTs, latest);
+            }
+        }
+        const fetched = (await this.broker.getHistory(symbol, this.interval, this.warmupBars, { endTime, stepMs: this.stepMs }))
+            .filter(c => c.timestamp >= fromTs && c.timestamp <= latest);
+        this.cache.store(symbol, fetched, { fromTs, toTs: latest });
+        counts.fetched++;
+        return fetched;
+    }
+
     async preload() {
         this.logger.log(`ForwardRunner: ${this.strategy.name} loading ${this.warmupBars} ${this.interval} bars for ${this.symbols.length} symbols`);
+        const startedAt = Date.now();
         const endTime = this.broker.now();
-        const historiesRaw = await pool(this.symbols, this.concurrency,
-            symbol => this.broker.getHistory(symbol, this.interval, this.warmupBars, { endTime, stepMs: this.stepMs }));
+        const latest = Math.floor(endTime / this.stepMs) * this.stepMs;
+        const fromTs = latest - (this.warmupBars - 1) * this.stepMs;
+        const counts = { cached: 0, topped: 0, fetched: 0 };
+        const historiesRaw = await pool(this.symbols, this.concurrency, symbol => this.loadHistory(symbol, fromTs, latest, endTime, counts));
+        this.pruneCache(latest, true);
         const histories = historiesRaw.map((candles, i) => ({ symbol: this.symbols[i], candles, at: 0 }));
         const times = new Set();
         for (const history of histories) for (const candle of history.candles) times.add(candle.timestamp);
@@ -445,10 +485,11 @@ export default class ForwardRunner {
             }
             if (candles.length) await this.tick(timestamp, candles, { execute: false });
         }
-        const latest = sortedTimes.at(-1) || 0;
-        this.logger.log(`ForwardRunner: warm-up complete through ${latest ? new Date(latest).toISOString() : 'n/a'}`);
-        this.event('info', 'warmup-complete', `${sortedTimes.length} bars, ${this.symbols.length} symbols`, { barTs: latest || null });
-        return latest;
+        const last = sortedTimes.at(-1) || 0;
+        const source = `${counts.cached} cached, ${counts.topped} topped up, ${counts.fetched} fetched`;
+        this.logger.log(`ForwardRunner: warm-up complete through ${last ? new Date(last).toISOString() : 'n/a'} (${source}, ${Math.round((Date.now() - startedAt) / 1000)}s)`);
+        this.event('info', 'warmup-complete', `${sortedTimes.length} bars, ${this.symbols.length} symbols; ${source}`, { barTs: last || null });
+        return last;
     }
 
     async fetchClosedBatch(timestamp, symbols = this.symbols) {
@@ -566,6 +607,7 @@ export default class ForwardRunner {
             if (!fatal) await this.pollIncome(true);
             this.journal.endRun(this.runId, endReason, fatal);
             this.journal.close();
+            this.cache.close();
         }
     }
 }
