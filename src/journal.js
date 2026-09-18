@@ -157,6 +157,15 @@ CREATE TABLE IF NOT EXISTS income (
     run_id INTEGER,
     PRIMARY KEY (account, id)
 );
+CREATE TABLE IF NOT EXISTS commands (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    command TEXT NOT NULL,
+    note TEXT,
+    acted_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS commands_run ON commands (run_id, id);
 CREATE INDEX IF NOT EXISTS runs_mode ON runs (mode, started_at);
 CREATE INDEX IF NOT EXISTS runs_strategy ON runs (strategy, started_at);
 CREATE INDEX IF NOT EXISTS events_run ON events (run_id, at);
@@ -232,6 +241,10 @@ export default class RunJournal {
             orderResult: prepare(`UPDATE orders SET status = ?, updated_at = ?, exchange_order_id = ?, executed_qty = ?, avg_price = ?, response = ? WHERE id = ?`),
             orderFailed: prepare('UPDATE orders SET status = ?, updated_at = ?, error_code = ?, error = ?, response = ? WHERE id = ?'),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
+            insertCommand: prepare('INSERT INTO commands (run_id, at, command, note) VALUES (?, ?, ?, ?)'),
+            nextCommand: prepare('SELECT id, command, note, at FROM commands WHERE run_id = ? AND id > ? ORDER BY id DESC LIMIT 1'),
+            ackCommands: prepare('UPDATE commands SET acted_at = ? WHERE run_id = ? AND id <= ? AND acted_at IS NULL'),
+            pendingCommand: prepare('SELECT id, command, note, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             lastIncome: prepare('SELECT MAX(time) AS time FROM income WHERE account = ?'),
             income: prepare(`INSERT OR IGNORE INTO income (account, id, time, symbol, type, amount, asset, info, trade_id, run_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -399,6 +412,22 @@ export default class RunJournal {
         const symbol = typeof data?.symbol === 'string' ? data.symbol : null;
         const value = typeof data?.value === 'number' && Number.isFinite(data.value) ? data.value : null;
         this.sql.record.run(runId, ts, String(kind), symbol, value, json(data));
+    }
+
+    command(runId, command, note = '') {
+        this.sql.insertCommand.run(Number(runId), Date.now(), String(command), String(note || '').slice(0, 200));
+    }
+
+    nextCommand(runId, afterId = 0) {
+        return this.sql.nextCommand.get(Number(runId), Number(afterId)) ?? null;
+    }
+
+    ackCommands(runId, throughId) {
+        this.sql.ackCommands.run(Date.now(), Number(runId), Number(throughId));
+    }
+
+    pendingCommand(runId) {
+        return this.sql.pendingCommand.get(Number(runId)) ?? null;
     }
 
     lastIncomeTime(account) {

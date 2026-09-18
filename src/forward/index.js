@@ -101,6 +101,9 @@ export default class ForwardRunner {
         this.ownsJournal = !(journal instanceof RunJournal);
         this.haltFile = haltFile;
         this.maxDailyLoss = maxDailyLoss;
+        this.paused = false;
+        this.pauseReason = null;
+        this.lastCommandId = 0;
         this.dayKey = null;
         this.dayOpenEquity = null;
         this.haltReason = null;
@@ -124,9 +127,11 @@ export default class ForwardRunner {
         this.runId = null;
         this.stopped = false;
         this.stream = null;
+        this.pendingBatch = null;
         this.state = this.readState();
         this.ledger = new TradeLedger(this.state.ledger);
         this.realized = Number(this.state.realized) || 0;
+        this.paused = Boolean(this.state.paused);
         this.accountEquity = 0;
         this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
@@ -370,7 +375,7 @@ export default class ForwardRunner {
         };
     }
 
-    async tick(timestamp, candles, { execute = true, info = {} } = {}) {
+    async tick(timestamp, candles, { execute = true, paused = false, info = {} } = {}) {
         if (execute && timestamp <= Number(this.state.lastProcessedBar || 0)) return { skipped: true, intents: [] };
         const startedAt = Date.now();
         if (execute) {
@@ -404,6 +409,18 @@ export default class ForwardRunner {
         const sizingEquity = this.totalValue();
         for (const intent of intents) intent.journalId = this.journal.intent(this.runId, timestamp, { ...intent, sizingEquity });
         const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
+
+        if (paused) {
+            this.journal.tick(this.runId, {
+                ts: timestamp, durationMs: Date.now() - startedAt, ...info,
+                equity: this.equity, sizingEquity, available: this.availableBalance,
+                gross: this.grossExposure(), net: this.netExposure(),
+                positions: Object.keys(this.stockBalances).length, intents: intents.length,
+                ...stats, skipped: intents.length, status: 'paused',
+            });
+            this.writeState({ lastProcessedBar: timestamp, status: 'paused' });
+            return { skipped: true, paused: true, intents };
+        }
 
         const unmanaged = this.unmanagedPositions(intents.map((i) => i.symbol));
         if (unmanaged.length) {
@@ -666,14 +683,16 @@ export default class ForwardRunner {
         await this.stream?.stop();
     }
 
-    waitForHaltSignal(pollMs = 1000) {
+    waitForSignal(pollMs = 1000) {
         let timer = null;
         let cancelled = false;
         const promise = new Promise((resolve) => {
             const check = () => {
                 if (cancelled) return;
-                const reason = this.haltFileReason();
-                if (reason) return resolve(reason);
+                const halt = this.haltFileReason();
+                if (halt) return resolve({ halt });
+                const command = this.readCommand();
+                if (command) return resolve({ command });
                 timer = setTimeout(check, pollMs);
                 timer.unref?.();
             };
@@ -686,6 +705,55 @@ export default class ForwardRunner {
                 if (timer) clearTimeout(timer);
             },
         };
+    }
+
+    readCommand() {
+        if (!this.runId) return null;
+        const row = this.journal.nextCommand(this.runId, this.lastCommandId);
+        if (!row) return null;
+        if (!['pause', 'resume', 'stop'].includes(row.command)) {
+            this.journal.ackCommands(this.runId, row.id);
+            this.lastCommandId = row.id;
+            return null;
+        }
+        return { id: row.id, command: row.command, note: row.note || '' };
+    }
+
+    async applyCommand({ id, command, note }) {
+        this.lastCommandId = id;
+        this.journal.ackCommands(this.runId, id);
+        const detail = note ? `: ${note}` : '';
+        if (command === 'stop') {
+            const now = Date.now();
+            this.event('warn', 'stop', `stop requested${detail}`, { barTs: now });
+            await this.refreshAccount();
+            this.snapshot(now, 'pre');
+            await this.flatten(now, `stop requested${detail}`);
+            await this.stop();
+            return 'stopped';
+        }
+        if (command === 'pause') {
+            if (this.paused) return null;
+            const now = Date.now();
+            this.event('warn', 'pause', `paused${detail}`, { barTs: now });
+            await this.refreshAccount();
+            this.snapshot(now, 'pre');
+            await this.flatten(now, `paused${detail}`);
+            await this.refreshAccount();
+            this.paused = true;
+            this.pauseReason = note || 'paused from terminal';
+            this.journal.record(this.runId, now, 'paused', { paused: true, note: this.pauseReason });
+            this.writeState({ paused: true, ledger: this.ledger.toJSON(), realized: this.realized });
+            return null;
+        }
+        if (!this.paused) return null;
+        const now = Date.now();
+        this.event('info', 'resume', `resumed${detail}`, { barTs: now });
+        this.paused = false;
+        this.pauseReason = null;
+        this.journal.record(this.runId, now, 'paused', { paused: false, note: note || '' });
+        this.writeState({ paused: false });
+        return null;
     }
 
     /** Returns a reason to stop trading, or null. */
@@ -810,6 +878,9 @@ export default class ForwardRunner {
                 symbols: this.fixedSymbols,
             },
         });
+        if (this.paused) {
+            this.journal.record(this.runId, Date.now(), 'paused', { paused: true, note: 'resumed process while paused' });
+        }
         let endReason = 'stopped';
         let fatal = null;
         try {
@@ -822,12 +893,18 @@ export default class ForwardRunner {
             let last = Math.max(latestWarmup, Number(this.state.lastProcessedBar || 0));
             this.logger.log(`ForwardRunner: ${this.strategy.name} on ${this.broker.label}${this.dryRun ? ' (dry-run)' : ''}, $${this.capital.toLocaleString('en-US')} capital; live after ${new Date(last).toISOString()}`);
             while (!this.stopped) {
-                const haltSignal = this.waitForHaltSignal();
-                const next = await Promise.race([
-                    this.stream.nextBatch().then((batch) => ({ batch })),
-                    haltSignal.promise.then((halt) => ({ halt })),
-                ]);
-                haltSignal.cancel();
+                this.pendingBatch ??= this.stream.nextBatch().then((batch) => ({ batch }));
+                const signal = this.waitForSignal();
+                const next = await Promise.race([this.pendingBatch, signal.promise]);
+                signal.cancel();
+                if (next.command) {
+                    const outcome = await this.applyCommand(next.command);
+                    if (outcome === 'stopped') {
+                        endReason = 'stopped';
+                        break;
+                    }
+                    continue;
+                }
                 if (next.halt) {
                     const now = Date.now();
                     this.event('warn', 'halt', next.halt, { barTs: now });
@@ -839,13 +916,16 @@ export default class ForwardRunner {
                     await this.stop();
                     break;
                 }
+                this.pendingBatch = null;
                 const batch = next.batch;
                 if (!batch) break;
                 await this.refreshSymbols();
                 if (batch.timestamp <= last) continue;
                 if (batch.timestamp > last + this.stepMs) await this.recoverGap(last, batch.timestamp);
                 const candles = await this.recoverMissing(batch);
-                const result = await this.tick(batch.timestamp, candles, { execute: true, info: this.lastBatchInfo });
+                const result = await this.tick(batch.timestamp, candles, {
+                    execute: true, paused: this.paused, info: this.lastBatchInfo,
+                });
                 last = batch.timestamp;
                 if (result.halted) endReason = 'halted';
                 if (this.logs.ticks) this.logger.log(`ForwardRunner: ${new Date(last).toISOString()} ${candles.length}/${batch.expected} candles, ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
