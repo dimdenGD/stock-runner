@@ -146,6 +146,21 @@ export default class BinanceFutures extends Broker {
         return fee;
     }
 
+    get tradingMode() {
+        return this.environment === 'demo' ? 'demo' : 'live';
+    }
+
+    executionPrice(quantity, price, side, candle) {
+        const notional = quantity * price;
+        if (!(notional > 0)) return price;
+        let fraction = this.slippage;
+        if (this.impactCoef > 0 && candle && candle.quoteVolume > 0) {
+            const frac = notional / (this.depthRatio * candle.quoteVolume);
+            fraction += this.impactCoef * Math.min(0.05, (0.01 * frac) / 2);
+        }
+        return side === 'buy' ? price * (1 + fraction) : price * (1 - fraction);
+    }
+
     now() {
         return Date.now() + Number(this.timeOffsetMs || 0);
     }

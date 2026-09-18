@@ -163,7 +163,7 @@ bt.logMetrics(result);
 **Single-stock** (`runOnTicker`):
 
 - `stockName`, `candle` (current bar), `stockBalance`, `ctx` (backtest instance)
-- `getCandles(intervalName, count, ts?)` - returns bars newest-first and includes the current bar. Defaults to current timestamp.
+- `getCandles(intervalName, count, ts?)` - Returns Promise of newest-first bars including the current bar, or `null` when fewer than `count` exist.
 - `buy(quantity, price)`, `sell(quantity, price)` - execute at given price (fees applied by broker).
 - `setFeatures(features)` - set features for the trade. Used for calculating profit correlations. You must set `features` in Backtest options. for example: `.setFeatures([0.1, 0.2, 0.3])`
 
@@ -182,7 +182,9 @@ bt.logMetrics(result);
 
 - **`Broker`** (base) - No fees, override `calculateFees(quantity, price, side)` for custom logic.
   - `quantize(symbol, signedQty, price, { reduceOnly })` - Returns the signed quantity the venue would accept, or `0` to reject.
-  - `prepareBacktest()` - Awaited once by `Backtest.runOnAllTickers()`. Base is a no-op; override to load whatever `quantize` needs.
+  - `prepareBacktest()` - Awaited once before a backtest runs.
+  - `executionPrice(quantity, price, side, candle)` - Modelled fill price
+  - `tradingMode` - `'live'` or `'demo'`
 - **`IBKR`** - Interactive Brokers:
   - `new IBKR('tiered')` or `new IBKR('fixed')`
   - Tiered: $0.0035/share, min $0.35, max 1% notional + clearing/regulatory.
@@ -228,12 +230,10 @@ await runner.run();
 - **`maxOrderNotional`** - Max notional of an opening order. Default: none.
 - **`symbols`** - Fixed universe. Default: all tradable symbols from the broker.
 - **`logs.ticks`** - Print a line per bar.
+- **`journalFile`** - Journal path, default `output/journal.sqlite`.
+- **`journal`** - An existing `RunJournal` to write into instead of opening one.
 - **`run()`** - Warms up on `strategy.warmup` bars of history, then trades on each closed bar until `stop()`.
 
-Data is saved to `output/forward/<strategy name>/`:
-
-- `journal.sqlite` - runs, ticks, account snapshots, positions, intents, orders, income, strategy records, events. Views `v_orders` (with `slippage_bps`) and `v_ticks`.
-- `state-<account>.json` - last processed bar and open position entries.
 
 ```bash
 node scripts/forward_report.js --strategy=<name> [--run=N | --runs]

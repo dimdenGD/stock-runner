@@ -1,6 +1,7 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -22,7 +23,31 @@ CREATE TABLE IF NOT EXISTS runs (
     git_dirty INTEGER,
     host TEXT,
     pid INTEGER,
-    node TEXT
+    node TEXT,
+    mode TEXT NOT NULL DEFAULT 'live',
+    strategy_version_id INTEGER,
+    market TEXT,
+    window_start INTEGER,
+    window_end INTEGER,
+    final_equity REAL,
+    metrics TEXT
+);
+CREATE TABLE IF NOT EXISTS strategies (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    market TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    id INTEGER PRIMARY KEY,
+    strategy_id INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    source TEXT,
+    source_path TEXT,
+    params TEXT,
+    message TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (strategy_id, hash)
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
@@ -132,6 +157,8 @@ CREATE TABLE IF NOT EXISTS income (
     run_id INTEGER,
     PRIMARY KEY (account, id)
 );
+CREATE INDEX IF NOT EXISTS runs_mode ON runs (mode, started_at);
+CREATE INDEX IF NOT EXISTS runs_strategy ON runs (strategy, started_at);
 CREATE INDEX IF NOT EXISTS events_run ON events (run_id, at);
 CREATE INDEX IF NOT EXISTS snapshots_run ON snapshots (run_id, ts);
 CREATE INDEX IF NOT EXISTS intents_run ON intents (run_id, ts);
@@ -154,6 +181,16 @@ SELECT t.*, datetime(t.ts / 1000, 'unixepoch') AS bar_time, r.strategy
 FROM ticks t JOIN runs r ON r.id = t.run_id;
 `;
 
+const MIGRATIONS = [
+    ['runs', 'mode', "TEXT NOT NULL DEFAULT 'live'"],
+    ['runs', 'strategy_version_id', 'INTEGER'],
+    ['runs', 'market', 'TEXT'],
+    ['runs', 'window_start', 'INTEGER'],
+    ['runs', 'window_end', 'INTEGER'],
+    ['runs', 'final_equity', 'REAL'],
+    ['runs', 'metrics', 'TEXT'],
+];
+
 const json = (value) => (value === undefined ? null : JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? String(v) : v)));
 const num = (value) => (Number.isFinite(Number(value)) && value !== null && value !== '' ? Number(value) : null);
 
@@ -165,18 +202,25 @@ function git(args) {
     }
 }
 
-export default class ForwardJournal {
+export default class RunJournal {
     constructor({ file = 'output/forward.sqlite' } = {}) {
         if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
         this.file = file;
         this.db = new DatabaseSync(file);
         this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
         this.db.exec(SCHEMA);
+        this.migrate();
         const prepare = (sql) => this.db.prepare(sql);
         this.sql = {
-            startRun: prepare(`INSERT INTO runs (started_at, strategy, broker, account, dry_run, capital, interval, config, git_commit, git_dirty, host, pid, node)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+            startRun: prepare(`INSERT INTO runs (started_at, strategy, broker, account, dry_run, capital, interval, config, git_commit, git_dirty, host, pid, node, mode, strategy_version_id, market, window_start, window_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
             endRun: prepare('UPDATE runs SET ended_at = ?, end_reason = ?, error = ? WHERE id = ? AND ended_at IS NULL'),
+            finishRun: prepare('UPDATE runs SET final_equity = ?, metrics = ? WHERE id = ?'),
+            findStrategy: prepare('SELECT id FROM strategies WHERE name = ?'),
+            insertStrategy: prepare('INSERT INTO strategies (name, market, created_at) VALUES (?, ?, ?)'),
+            findVersion: prepare('SELECT id FROM strategy_versions WHERE strategy_id = ? AND hash = ?'),
+            insertVersion: prepare(`INSERT INTO strategy_versions (strategy_id, hash, source, source_path, params, message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`),
             event: prepare('INSERT INTO events (run_id, at, bar_ts, level, type, message, data) VALUES (?, ?, ?, ?, ?, ?, ?)'),
             tick: prepare(`INSERT OR REPLACE INTO ticks (run_id, ts, processed_at, duration_ms, expected, streamed, recovered, missing, equity, sizing_equity, available, gross, net, positions, intents, orders, fills, skipped, failed, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -194,7 +238,38 @@ export default class ForwardJournal {
         };
     }
 
+    migrate() {
+        for (const [table, column, type] of MIGRATIONS) {
+            const cols = this.db.prepare(`PRAGMA table_info(${table})`).all();
+            if (cols.some(c => c.name === column)) continue;
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        }
+    }
+
+    batchBegin(size = 2000) {
+        if (this._batch != null) return;
+        this._batchSize = size;
+        this._batch = 0;
+        this.db.exec('BEGIN');
+    }
+
+    batchStep(n = 1) {
+        if (this._batch == null) return;
+        this._batch += n;
+        if (this._batch < this._batchSize) return;
+        this.db.exec('COMMIT');
+        this.db.exec('BEGIN');
+        this._batch = 0;
+    }
+
+    batchEnd() {
+        if (this._batch == null) return;
+        this.db.exec('COMMIT');
+        this._batch = null;
+    }
+
     transaction(fn) {
+        if (this._batch != null) return fn();
         this.db.exec('BEGIN');
         try {
             const out = fn();
@@ -206,15 +281,46 @@ export default class ForwardJournal {
         }
     }
 
-    startRun({ strategy, broker, account, dryRun, capital, interval, config }) {
+    strategyVersion({ name, market = null, source = null, sourcePath = null, params = null, message = null }) {
+        if (!name) return null;
+        let text = source;
+        if (text == null && sourcePath) {
+            try { text = readFileSync(sourcePath, 'utf8'); } catch { text = null; }
+        }
+        const hash = createHash('sha256')
+            .update(text ?? `${name} ${json(params) ?? ''}`)
+            .digest('hex');
+        return this.transaction(() => {
+            let strategyId = this.sql.findStrategy.get(name)?.id;
+            if (strategyId == null) {
+                strategyId = Number(this.sql.insertStrategy.run(name, market, Date.now()).lastInsertRowid);
+            }
+            const existing = this.sql.findVersion.get(strategyId, hash);
+            if (existing) return Number(existing.id);
+            return Number(this.sql.insertVersion.run(
+                strategyId, hash, text, sourcePath, json(params), message, Date.now(),
+            ).lastInsertRowid);
+        });
+    }
+
+    startRun({
+        strategy, broker, account, dryRun, capital, interval, config,
+        mode = 'live', strategyVersionId = null, market = null, windowStart = null, windowEnd = null,
+    }) {
         const commit = git(['rev-parse', 'HEAD']);
         const dirty = commit === null ? null : (git(['status', '--porcelain']) ? 1 : 0);
         const result = this.sql.startRun.run(
             Date.now(), strategy, broker ?? null, account ?? null, dryRun ? 1 : 0,
             Number.isFinite(capital) ? capital : null, interval ?? null, json(config),
             commit, dirty, hostname(), process.pid, process.version,
+            mode, strategyVersionId, market, windowStart, windowEnd,
         );
         return Number(result.lastInsertRowid);
+    }
+
+    finishRun(runId, { finalEquity = null, metrics = null } = {}) {
+        if (runId == null) return;
+        this.sql.finishRun.run(num(finalEquity), json(metrics), runId);
     }
 
     endRun(runId, reason, error = null) {

@@ -1,6 +1,7 @@
 import { formatDate } from '../utils.js';
 import Broker from '../brokers/base.js';
 import { splitPositionOrder } from '../brokers/orderLegs.js';
+import RunJournal from '../journal.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadFundingInRange } from './loader.js';
@@ -63,7 +64,8 @@ export default class Backtest {
      * @param {Date}   params.endDate             – Backtest end
      * @param {number} params.capital             – Starting cash balance
      */
-    constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage }) {
+    constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage,
+        journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily', strategySourcePath = null }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -119,12 +121,21 @@ export default class Backtest {
         this.fundingCursor = {};
         this.lastSeen = {};       // crypto: stockName -> timestamp of its last candle
         this.ruined = false;
+        this.journal = journal === false ? null
+            : journal instanceof RunJournal ? journal
+            : new RunJournal({ file: journalFile });
+        this.ownsJournal = this.journal != null && !(journal instanceof RunJournal);
+        this.journalTicks = journalTicks;
+        this.strategySourcePath = strategySourcePath;
+        this.runId = null;
         this._valuationVersion = 0;
         this._totalValueCache = null;
         this._grossExposureCache = null;
     }
 
     async runOnTicker(stockName) {
+        await this.broker.prepareBacktest();
+        this._beginJournal();
         if(!this.buffers[stockName]) {
             this.buffers[stockName] = {};
         }
@@ -198,12 +209,88 @@ export default class Backtest {
             if (!this.isWarmup) this.equityCurve.push([mainCandle.timestamp, this.totalValue(), this.cashBalance]);
         }
 
-        return this.getMetrics();
+        const metrics = this.getMetrics();
+        this._endJournal(metrics);
+        return metrics;
     }
 
     async runOnAllTickers() {
         await this.broker.prepareBacktest();
-        return runAllTickersStream(this);
+        this._beginJournal();
+        try {
+            const metrics = await runAllTickersStream(this);
+            this._endJournal(metrics);
+            return metrics;
+        } catch (err) {
+            this._endJournal(null, err);
+            throw err;
+        }
+    }
+
+    _beginJournal() {
+        if (!this.journal) return;
+        this.runId = this.journal.startRun({
+            strategy: this.strategy.name,
+            broker: this.broker.label,
+            account: this.broker.account,
+            dryRun: 0,
+            mode: 'backtest',
+            strategyVersionId: this.journal.strategyVersion({
+                name: this.strategy.name,
+                market: this.market,
+                sourcePath: this.strategySourcePath ?? this.strategy.sourcePath ?? null,
+                params: this.strategy.params,
+            }),
+            market: this.market,
+            capital: this.capital,
+            interval: this.strategy.mainInterval.name,
+            windowStart: +this.startDate,
+            windowEnd: +this.endDate,
+            config: {
+                params: this.strategy.params,
+                warmup: this.strategy.warmup,
+                allowShort: this.allowShort,
+                maxLeverage: this.maxLeverage,
+            },
+        });
+        this.journal.snapshot(this.runId, +this.startDate, 'start', { cash: this.capital, equity: this.capital, positions: [] });
+        this.journal.batchBegin();
+    }
+
+    _endJournal(metrics, error = null) {
+        if (!this.journal || this.runId == null) return;
+        this._writeJournalTicks();
+        const positions = Object.entries(this.stockBalances)
+            .filter(([, q]) => q)
+            .map(([symbol, quantity]) => ({
+                symbol, quantity,
+                markPrice: this.stockPrices[symbol],
+                entryPrice: this.positions[symbol]?.avgPrice ?? null,
+            }));
+        this.journal.batchEnd();
+        this.journal.snapshot(this.runId, +this.endDate, 'end', {
+            cash: this.cashBalance, equity: this.totalValue(), positions,
+        }, this.stockPrices);
+        this.journal.finishRun(this.runId, { finalEquity: this.totalValue(), metrics });
+        this.journal.endRun(this.runId, error ? 'error' : 'complete', error);
+        if (this.ownsJournal) this.journal.close();
+        this.runId = null;
+    }
+
+    _writeJournalTicks() {
+        if (!this.journal || this.journalTicks === false || !this.equityCurve.length) return;
+        const daily = this.journalTicks !== 'bar';
+        let lastDay = null;
+        for (const [ts, equity, cash] of this.equityCurve) {
+            const t = +ts;
+            if (daily) {
+                const day = Math.floor(t / 86400000);
+                if (day === lastDay) continue;
+                lastDay = day;
+            }
+            this.journal.tick(this.runId, { ts: t, equity, available: cash, status: 'complete' });
+            this.journal.batchStep();
+        }
     }
 
     record() {}
@@ -275,7 +362,39 @@ export default class Backtest {
         this._trade(stockName, -quantity, price, timestamp, null, candle);
     }
 
-    _trade(stockName, signedQty, price, timestamp, features, candle, { settle = false } = {}) {
+    _trade(stockName, signedQty, price, timestamp, features, candle, opts = {}) {
+        try {
+            return this._executeTrade(stockName, signedQty, price, timestamp, features, candle, opts);
+        } catch (err) {
+            this._journalOrder(stockName, signedQty, price, timestamp, this.stockBalances[stockName] || 0, 'failed', err.message, candle);
+            throw err;
+        }
+    }
+
+    _journalOrder(stockName, signedQty, price, timestamp, heldQty, status, error, candle) {
+        if (!this.journal || this.runId == null) return;
+        const ts = +timestamp;
+        const side = signedQty > 0 ? 'buy' : 'sell';
+        const quantity = Math.abs(signedQty);
+        const intentId = this.journal.intent(this.runId, ts, {
+            symbol: stockName, signedQty, price, heldQty, sizingEquity: this.totalValue(),
+        });
+        const orderId = this.journal.insertOrder(this.runId, ts, {
+            intentId, symbol: stockName, side, quantity,
+            reduceOnly: heldQty !== 0 && Math.sign(signedQty) !== Math.sign(heldQty),
+            decisionPrice: price,
+        }, status, error);
+        if (status === 'filled') {
+            this.journal.orderResult(orderId, {
+                status: 'filled',
+                executedQty: quantity,
+                avgPrice: this.broker.executionPrice(quantity, price, side, candle),
+            }, null);
+        }
+        this.journal.batchStep(3);
+    }
+
+    _executeTrade(stockName, signedQty, price, timestamp, features, candle, { settle = false } = {}) {
         if (this.isWarmup && !settle) {
             throw new Error(`Orders are not allowed during warm-up: ${stockName}`);
         }
@@ -294,6 +413,7 @@ export default class Backtest {
             if (!accepted) {
                 this.skippedOrders++;
                 this.skippedNotional += Math.abs(requested) * price;
+                this._journalOrder(stockName, requested, price, timestamp, prev, 'skipped', 'below exchange quantity/notional minimum', candle);
                 return;
             }
             if (accepted !== requested) {
@@ -338,11 +458,12 @@ export default class Backtest {
         this.cashBalance += side === 'buy' ? -(notional + fee) : (notional - fee);
         this._invalidateValuation();
         this.totalFees += fee;
+        this._journalOrder(stockName, signedQty, price, timestamp, prev, 'filled', null, candle);
         this.swaps.push({ type: side, quantity, price, timestamp, fee, stockName });
         if (this.market === 'crypto' && this.lastSeen[stockName] == null) this.lastSeen[stockName] = +timestamp;
 
         if (this.logs.swaps) {
-            console.log(formatSwapLine({ timestamp, stockName, side, quantity, price, fee, cash: this.cashBalance, equity: this.totalValue() }));
+            console.log(formatSwapLine({ timestamp, stockName, market: this.market, side, quantity, price, fee, cash: this.cashBalance, equity: this.totalValue() }));
         }
 
         const pos = this.positions[stockName] ?? { avgPrice: 0, entryFees: 0 };

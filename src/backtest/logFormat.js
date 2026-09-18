@@ -2,10 +2,10 @@ import chalk from 'chalk';
 import ms from 'ms';
 import { formatDate } from '../utils.js';
 
-export function formatSwapLine({ timestamp, stockName, side, quantity, price, fee, cash, equity }) {
+export function formatSwapLine({ timestamp, stockName, market, side, quantity, price, fee, cash, equity }) {
     const notional = quantity * price;
     return chalk.gray(`${formatDate(new Date(+timestamp))} `) +
-        chalk.bold(`${stockName.padEnd(7)} `) +
+        chalk.bold(`${stockName.padEnd(market === 'crypto' ? 15 : 7)} `) +
         (side === 'buy' ? chalk.greenBright(`BUY  `) : chalk.redBright(`SELL `)) +
         chalk.white(`${quantity.toLocaleString('en-US')} `.padEnd(8)) +
         chalk.white(`@ $${price.toLocaleString('en-US')} `.padEnd(10)) +

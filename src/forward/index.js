@@ -5,7 +5,7 @@ import Broker from '../brokers/base.js';
 import { splitPositionOrder } from '../brokers/orderLegs.js';
 import { intervalMsMap, markets } from '../backtest/consts.js';
 import { formatSwapLine, formatTradeLine } from '../backtest/logFormat.js';
-import ForwardJournal from './journal.js';
+import RunJournal from '../journal.js';
 import TradeLedger from './tradeLedger.js';
 import CandleCache from './candleCache.js';
 
@@ -39,6 +39,10 @@ export default class ForwardRunner {
         symbols = null,
         dryRun = false,
         dataDir = 'output/forward',
+        journal = null,
+        journalFile = 'output/journal.sqlite',
+        haltFile = 'output/HALT',
+        maxDailyLoss = Infinity,
         logger = console,
         concurrency = 16,
         symbolRefreshMs = 3600000,
@@ -84,7 +88,13 @@ export default class ForwardRunner {
         this.warmupBars = Math.max(strategy.warmup, strategy.mainInterval.count);
         this.dataDir = join(dataDir, strategy.name);
         this.stateFile = join(this.dataDir, `state-${fileSafe(broker.account)}${dryRun ? '-dry' : ''}.json`);
-        this.journal = new ForwardJournal({ file: join(this.dataDir, 'journal.sqlite') });
+        this.journal = journal instanceof RunJournal ? journal : new RunJournal({ file: journalFile });
+        this.ownsJournal = !(journal instanceof RunJournal);
+        this.haltFile = haltFile;
+        this.maxDailyLoss = maxDailyLoss;
+        this.dayKey = null;
+        this.dayOpenEquity = null;
+        this.haltReason = null;
         this.cache = new CandleCache({ file: join(dataDir, 'cache', fileSafe(broker.dataSource), `${this.interval}.sqlite`), stepMs: this.stepMs });
         this.lastPrune = 0;
 
@@ -277,6 +287,14 @@ export default class ForwardRunner {
             this.pruneCache(timestamp);
             await this.refreshAccount();
             this.snapshot(timestamp, 'pre');
+            const halt = this.checkHalt(timestamp);
+            if (halt) {
+                this.event('warn', 'halt', halt, { barTs: timestamp });
+                await this.flatten(timestamp, halt);
+                this.haltReason = halt;
+                await this.stop();
+                return { skipped: true, halted: halt, intents: [] };
+            }
         }
         this.intents = [];
         for (const { symbol, candle } of candles) this.addCandle(symbol, candle);
@@ -295,6 +313,14 @@ export default class ForwardRunner {
         const sizingEquity = this.totalValue();
         for (const intent of intents) intent.journalId = this.journal.intent(this.runId, timestamp, { ...intent, sizingEquity });
         const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
+
+        const unmanaged = this.unmanagedPositions(intents.map((i) => i.symbol));
+        if (unmanaged.length) {
+            this.journal.record(this.runId, timestamp, 'unmanaged', {
+                value: unmanaged.reduce((s, p) => s + Math.abs(p.quantity * p.price), 0),
+                symbols: unmanaged.map((p) => p.symbol),
+            });
+        }
         const finish = (status) => this.journal.tick(this.runId, {
             ts: timestamp, durationMs: Date.now() - startedAt, ...info,
             equity: this.equity, sizingEquity: this.totalValue(), available: this.availableBalance,
@@ -360,13 +386,14 @@ export default class ForwardRunner {
         }
     }
 
-    async executeBatch(timestamp, intents, stats) {
+    async executeBatch(timestamp, intents, stats, { forceReduceOnly = false } = {}) {
         const fills = [];
         const projected = { ...this.stockBalances };
         let sequence = 0;
         for (const intent of intents) {
             const current = projected[intent.symbol] || 0;
-            for (const leg of splitPositionOrder(current, intent.signedQty)) {
+            for (const leg of splitPositionOrder(current, intent.signedQty).map(
+                (l) => (forceReduceOnly ? { ...l, reduceOnly: true } : l))) {
                 const quantity = this.broker.normalizeQuantity(intent.symbol, leg.signedQty, intent.price, { reduceOnly: leg.reduceOnly });
                 const side = leg.signedQty > 0 ? 'buy' : 'sell';
                 const orderInfo = {
@@ -514,6 +541,92 @@ export default class ForwardRunner {
         await this.stream?.stop();
     }
 
+    waitForHaltSignal(pollMs = 1000) {
+        let timer = null;
+        let cancelled = false;
+        const promise = new Promise((resolve) => {
+            const check = () => {
+                if (cancelled) return;
+                const reason = this.haltFileReason();
+                if (reason) return resolve(reason);
+                timer = setTimeout(check, pollMs);
+                timer.unref?.();
+            };
+            check();
+        });
+        return {
+            promise,
+            cancel: () => {
+                cancelled = true;
+                if (timer) clearTimeout(timer);
+            },
+        };
+    }
+
+    /** Returns a reason to stop trading, or null. */
+    haltFileReason() {
+        if (this.haltFile && existsSync(this.haltFile)) {
+            let note = '';
+            try { note = readFileSync(this.haltFile, 'utf8').trim().slice(0, 200); } catch { /* empty is fine */ }
+            return `halt file present${note ? `: ${note}` : ''}`;
+        }
+        return null;
+    }
+
+    /** Returns a reason to stop trading, or null. */
+    checkHalt(timestamp) {
+        const fileHalt = this.haltFileReason();
+        if (fileHalt) return fileHalt;
+        if (!Number.isFinite(this.maxDailyLoss)) return null;
+
+        const day = new Date(timestamp).toISOString().slice(0, 10);
+        const equity = this.totalValue();
+        if (day !== this.dayKey) {
+            this.dayKey = day;
+            this.dayOpenEquity = equity;
+            return null;
+        }
+        if (!(this.dayOpenEquity > 0)) return null;
+        const loss = 1 - equity / this.dayOpenEquity;
+        if (loss >= this.maxDailyLoss) {
+            return `daily loss ${(loss * 100).toFixed(2)}% reached the ${(this.maxDailyLoss * 100).toFixed(2)}% limit`;
+        }
+        return null;
+    }
+
+    /** Closes every open position with reduce-only market orders. */
+    async flatten(timestamp, reason) {
+        const open = Object.entries(this.stockBalances).filter(([, qty]) => Number(qty));
+        if (!open.length) return [];
+        this.event('warn', 'flatten', `closing ${open.length} positions: ${reason}`, { barTs: timestamp });
+        const intents = open.map(([symbol, qty]) => ({
+            symbol,
+            signedQty: -Number(qty),
+            price: this.stockPrices[symbol] || 0,
+            heldQty: Number(qty),
+        }));
+        for (const intent of intents) {
+            intent.journalId = this.journal.intent(this.runId, timestamp, { ...intent, sizingEquity: this.totalValue() });
+        }
+        const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
+        try {
+            const fills = await this.executeBatch(timestamp, intents, stats, { forceReduceOnly: true });
+            await this.refreshAccount();
+            this.snapshot(timestamp, 'flat');
+            return fills;
+        } catch (err) {
+            this.event('error', 'flatten-failed', err.message, { barTs: timestamp });
+            return [];
+        }
+    }
+
+    unmanagedPositions(targets) {
+        const wanted = new Set(targets);
+        return Object.entries(this.stockBalances)
+            .filter(([symbol, qty]) => Number(qty) && !wanted.has(symbol))
+            .map(([symbol, qty]) => ({ symbol, quantity: Number(qty), price: this.stockPrices[symbol] || 0 }));
+    }
+
     async recoverMissing(batch) {
         this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, recovered: 0, missing: 0 };
         if (!batch.missing.length) return batch.candles;
@@ -550,6 +663,14 @@ export default class ForwardRunner {
             broker: this.broker.label,
             account: this.broker.account,
             dryRun: this.dryRun,
+            mode: this.dryRun ? 'paper' : this.broker.tradingMode,
+            strategyVersionId: this.journal.strategyVersion({
+                name: this.strategy.name,
+                market: this.market,
+                sourcePath: this.strategy.sourcePath ?? null,
+                params: this.strategy.params,
+            }),
+            market: this.market,
             capital: this.capital,
             interval: this.interval,
             config: {
@@ -576,7 +697,24 @@ export default class ForwardRunner {
             let last = Math.max(latestWarmup, Number(this.state.lastProcessedBar || 0));
             this.logger.log(`ForwardRunner: ${this.strategy.name} on ${this.broker.label}${this.dryRun ? ' (dry-run)' : ''}, $${this.capital.toLocaleString('en-US')} capital; live after ${new Date(last).toISOString()}`);
             while (!this.stopped) {
-                const batch = await this.stream.nextBatch();
+                const haltSignal = this.waitForHaltSignal();
+                const next = await Promise.race([
+                    this.stream.nextBatch().then((batch) => ({ batch })),
+                    haltSignal.promise.then((halt) => ({ halt })),
+                ]);
+                haltSignal.cancel();
+                if (next.halt) {
+                    const now = Date.now();
+                    this.event('warn', 'halt', next.halt, { barTs: now });
+                    await this.refreshAccount();
+                    this.snapshot(now, 'pre');
+                    await this.flatten(now, next.halt);
+                    this.haltReason = next.halt;
+                    endReason = 'halted';
+                    await this.stop();
+                    break;
+                }
+                const batch = next.batch;
                 if (!batch) break;
                 await this.refreshSymbols();
                 if (batch.timestamp <= last) continue;
@@ -584,6 +722,7 @@ export default class ForwardRunner {
                 const candles = await this.recoverMissing(batch);
                 const result = await this.tick(batch.timestamp, candles, { execute: true, info: this.lastBatchInfo });
                 last = batch.timestamp;
+                if (result.halted) endReason = 'halted';
                 if (this.logs.ticks) this.logger.log(`ForwardRunner: ${new Date(last).toISOString()} ${candles.length}/${batch.expected} candles, ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
                 await this.pollIncome();
             }
@@ -597,7 +736,8 @@ export default class ForwardRunner {
             await this.stream?.stop();
             if (!fatal) await this.pollIncome(true);
             this.journal.endRun(this.runId, endReason, fatal);
-            this.journal.close();
+            this.journal.finishRun(this.runId, { finalEquity: this.equity });
+            if (this.ownsJournal) this.journal.close();
             this.cache.close();
         }
     }

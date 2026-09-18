@@ -6,3 +6,5 @@ strategies/private/
 scripts/private/
 output/
 .DS_Store
+strategies/.terminal/
+output/HALT

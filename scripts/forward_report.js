@@ -1,34 +1,39 @@
-import { existsSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
 const args = Object.fromEntries(process.argv.slice(2).filter(x => x.startsWith('--')).map(x => {
     const [key, value = 'true'] = x.slice(2).split('=');
     return [key, value];
 }));
-const dataDir = args.dir || 'output/forward';
-const strategies = existsSync(dataDir)
-    ? readdirSync(dataDir, { withFileTypes: true }).filter(d => d.isDirectory() && existsSync(join(dataDir, d.name, 'journal.sqlite'))).map(d => d.name)
-    : [];
-const strategyName = args.strategy || (strategies.length === 1 ? strategies[0] : null);
-if (!args.db && !strategyName) {
-    console.log(strategies.length ? `Choose --strategy=<name>: ${strategies.join(', ')}` : `No forward journals under ${dataDir}`);
+const dbFile = args.db || 'output/journal.sqlite';
+if (!existsSync(dbFile)) {
+    console.log(`No journal at ${dbFile}`);
     process.exit(1);
 }
-const db = new DatabaseSync(args.db || join(dataDir, strategyName, 'journal.sqlite'), { readOnly: true });
+const db = new DatabaseSync(dbFile, { readOnly: true });
+const strategyName = args.strategy || null;
+const modeFilter = args.mode || null;
 const iso = (ms) => (ms == null ? '-' : new Date(ms).toISOString().replace('.000Z', 'Z'));
 const usd = (x) => (x == null ? '-' : `$${Number(x).toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
 
+const where = [];
+const params = [];
+if (strategyName) { where.push('strategy = ?'); params.push(strategyName); }
+if (modeFilter) { where.push('mode = ?'); params.push(modeFilter); }
+const filter = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+
 if (args.runs) {
-    for (const r of db.prepare('SELECT id, strategy, account, dry_run, started_at, ended_at, end_reason FROM runs ORDER BY id DESC LIMIT 50').all()) {
-        console.log(`#${r.id} ${r.strategy} ${r.account}${r.dry_run ? ' dry-run' : ''} ${iso(r.started_at)} -> ${iso(r.ended_at)} ${r.end_reason || 'running'}`);
+    const rows = db.prepare(`SELECT id, strategy, mode, account, dry_run, started_at, ended_at, end_reason, final_equity FROM runs${filter} ORDER BY id DESC LIMIT 50`).all(...params);
+    if (!rows.length) console.log('No runs match');
+    for (const r of rows) {
+        console.log(`#${r.id} [${r.mode}] ${r.strategy} ${r.account || '-'}${r.dry_run ? ' dry-run' : ''} ${iso(r.started_at)} -> ${iso(r.ended_at)} ${r.end_reason || 'running'}${r.final_equity ? ` ${usd(r.final_equity)}` : ''}`);
     }
     process.exit(0);
 }
 
 const run = args.run
     ? db.prepare('SELECT * FROM runs WHERE id = ?').get(Number(args.run))
-    : db.prepare('SELECT * FROM runs ORDER BY id DESC LIMIT 1').get();
+    : db.prepare(`SELECT * FROM runs${filter} ORDER BY id DESC LIMIT 1`).get(...params);
 if (!run) {
     console.log('No matching run');
     process.exit(1);

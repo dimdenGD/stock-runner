@@ -22,6 +22,14 @@ export default class Broker {
         return 0;
     }
 
+    get tradingMode() {
+        return 'live';
+    }
+
+    executionPrice(quantity, price, side, candle) {
+        return price;
+    }
+
     async prepareBacktest() {
     }
 
