@@ -15,15 +15,15 @@ if (!intervalMsMap[interval] || !fs.existsSync(klineDir)) {
     process.exit(1);
 }
 const stepMs = intervalMsMap[interval];
+const DAY_MS = 86400000;
 const toMs = (x) => (x > 1e14 ? Math.floor(x / 1000) : x);
 const isDataLine = (line) => line.charCodeAt(0) >= 48 && line.charCodeAt(0) <= 57; // skips headers
-const yyyymm = (ms) => {
-    const d = new Date(ms);
-    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-};
-const lastMonthOf = async (table) => Object.fromEntries(
-    (await sql.unsafe(`SELECT ticker, timestamp FROM ${table} LATEST ON timestamp PARTITION BY ticker`))
-        .map(r => [r.ticker, yyyymm(new Date(r.timestamp).getTime())])
+const fileEnd = (f) => (f.length === 14
+    ? Date.parse(f.slice(0, 10)) + DAY_MS
+    : Date.UTC(+f.slice(0, 4), +f.slice(5, 7), 1));
+const lastTimestampOf = async (table) => Object.fromEntries(
+    (await sql.unsafe(`SELECT ticker, cast(timestamp as long) AS ts FROM ${table} LATEST ON timestamp PARTITION BY ticker`))
+        .map(r => [r.ticker, Math.round(Number(r.ts) / 1000)])
 );
 
 function csvLines(zipPath) {
@@ -31,17 +31,17 @@ function csvLines(zipPath) {
 }
 const zipsIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.zip')).sort() : [];
 
-const lastCandleMonth = await lastMonthOf(`crypto_candles_${interval}`);
-const lastFundingMonth = await lastMonthOf('crypto_funding');
-console.log(`Resuming from last month: ${Object.keys(lastCandleMonth).length} tickers with candles, ${Object.keys(lastFundingMonth).length} with funding`);
+const lastCandleTs = await lastTimestampOf(`crypto_candles_${interval}`);
+const lastFundingTs = await lastTimestampOf('crypto_funding');
+console.log(`Resuming: ${Object.keys(lastCandleTs).length} tickers with candles, ${Object.keys(lastFundingTs).length} with funding`);
 
 const symbols = fs.readdirSync(klineDir).sort();
 let candles = 0, funding = 0;
 const started = Date.now();
 for (const [i, sym] of symbols.entries()) {
-    const fromCandle = lastCandleMonth[sym];
+    const fromCandle = lastCandleTs[sym];
     for (const f of zipsIn(`${klineDir}/${sym}`)) {
-        if (fromCandle && f.slice(0, 7) < fromCandle) continue;
+        if (fromCandle && fileEnd(f) <= fromCandle) continue;
         // open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore
         for (const line of csvLines(`${klineDir}/${sym}/${f}`)) {
             const c = line.split(',');
@@ -58,10 +58,10 @@ for (const [i, sym] of symbols.entries()) {
             candles++;
         }
     }
-    const fromFunding = lastFundingMonth[sym];
+    const fromFunding = lastFundingTs[sym];
     const fundingDir = `data/binance/funding/${sym}`;
     for (const f of zipsIn(fundingDir)) {
-        if (fromFunding && f.slice(0, 7) < fromFunding) continue;
+        if (fromFunding && fileEnd(f) <= fromFunding) continue;
         // calc_time,funding_interval_hours,last_funding_rate
         for (const line of csvLines(`${fundingDir}/${f}`)) {
             const c = line.split(',');

@@ -33,7 +33,7 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
 
 1. Download klines and funding rates into `data/binance/`:
    ```bash
-   node scripts/binance_download.js <interval> [startMonth] [endMonth]
+   node scripts/binance_download.js <interval> [startMonth] [endMonth] [--no-daily] [--tail-only]
    ```
    - Example: `node scripts/binance_download.js 15m 2023-09`
    - `interval` can be `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
