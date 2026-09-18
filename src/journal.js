@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS runs (
     window_start INTEGER,
     window_end INTEGER,
     final_equity REAL,
-    metrics TEXT
+    metrics TEXT,
+    baseline_equity REAL
 );
 CREATE TABLE IF NOT EXISTS strategies (
     id INTEGER PRIMARY KEY,
@@ -198,6 +199,7 @@ const MIGRATIONS = [
     ['runs', 'window_end', 'INTEGER'],
     ['runs', 'final_equity', 'REAL'],
     ['runs', 'metrics', 'TEXT'],
+    ['runs', 'baseline_equity', 'REAL'],
 ];
 
 const json = (value) => (value === undefined ? null : JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? String(v) : v)));
@@ -225,6 +227,7 @@ export default class RunJournal {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
             endRun: prepare('UPDATE runs SET ended_at = ?, end_reason = ?, error = ? WHERE id = ? AND ended_at IS NULL'),
             finishRun: prepare('UPDATE runs SET final_equity = ?, metrics = ? WHERE id = ?'),
+            baselineEquity: prepare('UPDATE runs SET baseline_equity = ? WHERE id = ? AND baseline_equity IS NULL'),
             findStrategy: prepare('SELECT id FROM strategies WHERE name = ?'),
             insertStrategy: prepare('INSERT INTO strategies (name, market, created_at) VALUES (?, ?, ?)'),
             findVersion: prepare('SELECT id FROM strategy_versions WHERE strategy_id = ? AND hash = ?'),
@@ -329,6 +332,11 @@ export default class RunJournal {
             mode, strategyVersionId, market, windowStart, windowEnd,
         );
         return Number(result.lastInsertRowid);
+    }
+
+    baselineEquity(runId, equity) {
+        if (runId == null) return;
+        this.sql.baselineEquity.run(num(equity), runId);
     }
 
     finishRun(runId, { finalEquity = null, metrics = null } = {}) {

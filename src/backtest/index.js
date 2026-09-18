@@ -332,12 +332,12 @@ export default class Backtest {
             let cursor = this.fundingCursor[stockName];
             if (cursor == null) {
                 let lo = 0, hi = ev.time.length;
-                while (lo < hi) { const mid = (lo + hi) >> 1; if (ev.time[mid] < fromTs) lo = mid + 1; else hi = mid; }
+                while (lo < hi) { const mid = (lo + hi) >> 1; if (ev.time[mid] <= fromTs) lo = mid + 1; else hi = mid; }
                 cursor = lo;
             } else {
-                while (cursor < ev.time.length && ev.time[cursor] < fromTs) cursor++;
+                while (cursor < ev.time.length && ev.time[cursor] <= fromTs) cursor++;
             }
-            for (; cursor < ev.time.length && ev.time[cursor] < toTs; cursor++) {
+            for (; cursor < ev.time.length && ev.time[cursor] <= toTs; cursor++) {
                 const pay = this.stockBalances[stockName] * this.stockPrices[stockName] * ev.rate[cursor];
                 this.cashBalance -= pay;
                 this.totalFunding += pay;

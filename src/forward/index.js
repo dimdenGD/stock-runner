@@ -135,6 +135,7 @@ export default class ForwardRunner {
         this.traded = new Set(this.state.traded || Object.keys(this.ledger.positions));
         this.disowned = new Set(this.state.disowned || []);
         this.accountEquity = 0;
+        this.baseline = null;
         this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
         this.ctx = this;
@@ -902,6 +903,8 @@ export default class ForwardRunner {
         let fatal = null;
         try {
             const latestWarmup = await this.initialize();
+            this.baseline = this.totalValue();
+            this.journal.baselineEquity(this.runId, this.baseline);
             if (this.state.status === 'executing') {
                 this.logger.warn(`ForwardRunner: previous process stopped during bar ${this.state.lastProcessedBar}; it will not be replayed`);
                 this.event('warn', 'previous-incomplete', 'previous process stopped mid-batch; bar not replayed', { barTs: Number(this.state.lastProcessedBar) || null });
