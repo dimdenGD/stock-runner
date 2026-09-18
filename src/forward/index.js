@@ -132,6 +132,8 @@ export default class ForwardRunner {
         this.ledger = new TradeLedger(this.state.ledger);
         this.realized = Number(this.state.realized) || 0;
         this.paused = Boolean(this.state.paused);
+        this.traded = new Set(this.state.traded || Object.keys(this.ledger.positions));
+        this.disowned = new Set(this.state.disowned || []);
         this.accountEquity = 0;
         this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
@@ -422,7 +424,7 @@ export default class ForwardRunner {
             return { skipped: true, paused: true, intents };
         }
 
-        const unmanaged = this.unmanagedPositions(intents.map((i) => i.symbol));
+        const unmanaged = this.unmanagedPositions();
         if (unmanaged.length) {
             this.journal.record(this.runId, timestamp, 'unmanaged', {
                 value: unmanaged.reduce((s, p) => s + Math.abs(p.quantity * p.price), 0),
@@ -450,7 +452,7 @@ export default class ForwardRunner {
             } catch (err) {
                 this.snapshot(timestamp, 'post');
                 this.flushTradeLogs();
-                this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized });
+                this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
                 finish('failed');
                 throw err;
             }
@@ -458,7 +460,7 @@ export default class ForwardRunner {
             this.snapshot(timestamp, 'post');
             this.flushTradeLogs();
         }
-        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized });
+        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
         finish(this.dryRun ? 'dry-run' : 'complete');
         return { skipped: false, intents, fills };
     }
@@ -548,6 +550,7 @@ export default class ForwardRunner {
         const quantity = parsed.executedQty > 0 ? Number(parsed.executedQty) : requestedQty;
         const price = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : intent.price;
         if (!(quantity > 0) || !(price > 0)) return;
+        this.traded.add(intent.symbol);
         const fee = this.fee(intent.symbol, quantity, price, side);
         this.pendingLogs.push({ kind: 'swap', timestamp, stockName: intent.symbol, side, quantity, price, fee });
         const closed = this.ledger.apply({ symbol: intent.symbol, signedQty: side === 'buy' ? quantity : -quantity, price, fee, timestamp });
@@ -659,13 +662,16 @@ export default class ForwardRunner {
             for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
                 if (pos.quantity) this.stockBalances[symbol] = pos.quantity;
             }
-            this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized });
+            for (const p of held) this.traded.add(p.symbol);
+            this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
             this.event('warn', 'adopted-positions', `adopted ${held.length} existing positions`, {
                 data: held.map((p) => p.symbol),
             });
             return;
         }
         if (this.ignoreExisting) {
+            for (const p of held) this.disowned.add(p.symbol);
+            this.writeState({ disowned: [...this.disowned] });
             this.event('info', 'ignored-positions', `${held.length} positions on the account belong to someone else`, {
                 data: held.map((p) => p.symbol),
             });
@@ -743,7 +749,7 @@ export default class ForwardRunner {
             this.paused = true;
             this.pauseReason = note || 'paused from terminal';
             this.journal.record(this.runId, now, 'paused', { paused: true, note: this.pauseReason });
-            this.writeState({ paused: true, ledger: this.ledger.toJSON(), realized: this.realized });
+            this.writeState({ paused: true, ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
             return null;
         }
         if (!this.paused) return null;
@@ -813,11 +819,15 @@ export default class ForwardRunner {
         }
     }
 
-    unmanagedPositions(targets) {
-        const wanted = new Set(targets);
-        return Object.entries(this.stockBalances)
-            .filter(([symbol, qty]) => Number(qty) && !wanted.has(symbol))
-            .map(([symbol, qty]) => ({ symbol, quantity: Number(qty), price: this.stockPrices[symbol] || 0 }));
+    unmanagedPositions() {
+        return (this.lastPortfolio?.positions || [])
+            .filter((p) => Number(p.quantity))
+            .filter((p) => !this.traded.has(p.symbol) && !this.disowned.has(p.symbol))
+            .map((p) => ({
+                symbol: p.symbol,
+                quantity: Number(p.quantity),
+                price: Number(p.markPrice) || this.stockPrices[p.symbol] || 0,
+            }));
     }
 
     async recoverMissing(batch) {
