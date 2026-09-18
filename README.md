@@ -223,11 +223,14 @@ process.on('SIGINT', () => runner.stop());
 await runner.run();
 ```
 
-- **`capital`** - Sizing cap. `ctx.totalValue()` is `min(account equity, capital)`.
+- **`capital`** - The strategy's allocation.
+- **`accountIsolation`** - `'shared'` (default) tracks only the positions this runner opened, so several strategies can trade one account. `'exclusive'` takes over everything the account holds.
+- **`adoptExisting`** / **`ignoreExisting`** - Required. Controls whether strategy takes over existing trades.
 - **`maxLeverage`** - Max gross exposure / equity per batch. Default: `3` for crypto, `1` for stocks.
 - **`dryRun`** - Run the strategy on live data without sending orders.
 - **`maxNetExposure`** - Max `|net| / equity` per batch. Default: none.
 - **`maxOrderNotional`** - Max notional of an opening order. Default: none.
+- **`maxDailyLoss`** - Fraction of the strategy's own equity.
 - **`symbols`** - Fixed universe. Default: all tradable symbols from the broker.
 - **`logs.ticks`** - Print a line per bar.
 - **`journalFile`** - Journal path, default `output/journal.sqlite`.

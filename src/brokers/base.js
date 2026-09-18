@@ -45,9 +45,9 @@ export default class Broker {
         return Date.now();
     }
 
-    createClientOrderId({ timestamp, symbol, sequence }) {
-        const tag = symbol.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'sym';
-        return `fw-${timestamp.toString(36)}-${tag}-${sequence}`.slice(0, 36);
+    createClientOrderId({ timestamp, symbol, sequence, owner = 'fw' }) {
+        const tag = symbol.replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'sym';
+        return `${owner}-${timestamp.toString(36)}-${tag}-${sequence}`.slice(0, 36);
     }
 
     parseOrderResult(result) {

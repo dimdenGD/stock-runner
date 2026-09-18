@@ -43,6 +43,9 @@ export default class ForwardRunner {
         journalFile = 'output/journal.sqlite',
         haltFile = 'output/HALT',
         maxDailyLoss = Infinity,
+        accountIsolation = 'shared',
+        adoptExisting = false,
+        ignoreExisting = false,
         logger = console,
         concurrency = 16,
         symbolRefreshMs = 3600000,
@@ -63,9 +66,15 @@ export default class ForwardRunner {
         market = market ?? broker.market ?? 'stocks';
         if (!markets.includes(market)) throw new TypeError(`market must be one of: ${markets.join(', ')}`);
 
+        if (!['shared', 'exclusive'].includes(accountIsolation)) {
+            throw new TypeError("accountIsolation must be 'shared' or 'exclusive'");
+        }
         this.strategy = strategy;
         this.broker = broker;
         this.capital = capital;
+        this.accountIsolation = accountIsolation;
+        this.adoptExisting = adoptExisting;
+        this.ignoreExisting = ignoreExisting;
         this.logs = { swaps: false, trades: false, ticks: false, ...logs };
         this.market = market;
         this.allowShort = allowShort ?? market === 'crypto';
@@ -117,6 +126,9 @@ export default class ForwardRunner {
         this.stream = null;
         this.state = this.readState();
         this.ledger = new TradeLedger(this.state.ledger);
+        this.realized = Number(this.state.realized) || 0;
+        this.accountEquity = 0;
+        this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
         this.ctx = this;
     }
@@ -138,8 +150,26 @@ export default class ForwardRunner {
         renameSync(tmp, this.stateFile);
     }
 
+    static ownerTag(name) {
+        const slug = String(name).replace(/[^A-Za-z0-9]/g, '').toLowerCase().slice(0, 6) || 'fw';
+        let hash = 0;
+        for (const ch of String(name)) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+        return `${slug}${(hash % 1296).toString(36).padStart(2, '0')}`;
+    }
+
     totalValue() {
-        return Math.min(this.equity, this.capital);
+        if (this.accountIsolation === 'exclusive') return Math.max(0, this.accountEquity);
+        return Math.max(0, this.capital + this.realized + this.unrealized());
+    }
+
+    unrealized() {
+        let open = 0;
+        for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
+            const px = this.stockPrices[symbol];
+            if (!(px > 0) || !(pos.avgPrice > 0)) continue;
+            open += pos.quantity * (px - pos.avgPrice) - (Number(pos.entryFees) || 0);
+        }
+        return open;
     }
 
     grossExposure() {
@@ -203,25 +233,86 @@ export default class ForwardRunner {
             if (!rows) return;
             const inserted = this.journal.income(this.broker.account, this.runId, rows);
             if (inserted) this.event('info', 'income', `${inserted} income rows`);
+            this.attributeFunding(rows);
         } catch (err) {
             this.logger.warn(`ForwardRunner: income poll failed: ${err.message}`);
             this.event('warn', 'income-failed', err.message);
         }
     }
 
+    attributeFunding(rows) {
+        if (this.accountIsolation !== 'shared') return;
+        const account = new Map();
+        for (const p of this.lastPortfolio?.positions || []) {
+            const qty = Number(p.quantity);
+            if (qty) account.set(p.symbol, Math.abs(qty));
+        }
+        let mine = 0;
+        for (const row of rows) {
+            if (row.incomeType && row.incomeType !== 'FUNDING_FEE') continue;
+            const amount = Number(row.income);
+            const symbol = row.symbol;
+            if (!Number.isFinite(amount) || !symbol) continue;
+            const own = Math.abs(Number(this.ledger.positions[symbol]?.quantity) || 0);
+            if (!own) continue;
+            const total = account.get(symbol) || own;
+            mine += amount * Math.min(1, own / total);
+        }
+        if (mine) {
+            this.realized += mine;
+            this.writeState({ realized: this.realized });
+        }
+    }
+
     async refreshAccount() {
         const portfolio = await this.broker.getPortfolio();
         this.lastPortfolio = portfolio;
-        this.ledger.reconcile(portfolio.positions, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
         this.cashBalance = Number(portfolio.cash ?? 0);
         this.availableBalance = Number(portfolio.available ?? 0);
-        this.equity = Number(portfolio.equity ?? 0);
-        for (const key of Object.keys(this.stockBalances)) delete this.stockBalances[key];
+        this.accountEquity = Number(portfolio.equity ?? 0);
+        this.equity = this.accountEquity;
+
         for (const p of portfolio.positions || []) {
-            const qty = Number(p.quantity);
-            if (qty) this.stockBalances[p.symbol] = qty;
             const mark = Number(p.markPrice);
             if (mark > 0) this.stockPrices[p.symbol] = mark;
+        }
+
+        if (this.accountIsolation === 'exclusive') {
+            this.ledger.reconcile(portfolio.positions, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
+        } else {
+            this.reconcileShared(portfolio.positions || []);
+        }
+
+        for (const key of Object.keys(this.stockBalances)) delete this.stockBalances[key];
+        for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
+            if (pos.quantity) this.stockBalances[symbol] = pos.quantity;
+        }
+    }
+
+    reconcileShared(positions) {
+        const account = new Map();
+        for (const p of positions) {
+            const qty = Number(p.quantity);
+            if (qty) account.set(p.symbol, qty);
+        }
+        const lost = [];
+        for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
+            const own = Number(pos.quantity);
+            if (!own) continue;
+            const held = account.get(symbol) || 0;
+            if (Math.sign(held) === Math.sign(own) && Math.abs(held) >= Math.abs(own) - 1e-9) continue;
+            const remaining = Math.sign(held) === Math.sign(own) ? held : 0;
+            lost.push({ symbol, expected: own, found: remaining });
+            const price = this.stockPrices[symbol] || pos.avgPrice || 0;
+            this.realized += (own - remaining) * (price - pos.avgPrice);
+            if (remaining) this.ledger.positions[symbol] = { ...pos, quantity: remaining };
+            else delete this.ledger.positions[symbol];
+        }
+        if (lost.length) {
+            this.logger.warn(`ForwardRunner: ${lost.length} position(s) smaller than this strategy's book; adopting the venue`);
+            this.event('warn', 'position-divergence',
+                `${lost.length} position(s) closed outside this strategy`,
+                { data: lost });
         }
     }
 
@@ -342,7 +433,7 @@ export default class ForwardRunner {
             } catch (err) {
                 this.snapshot(timestamp, 'post');
                 this.flushTradeLogs();
-                this.writeState({ ledger: this.ledger.toJSON() });
+                this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized });
                 finish('failed');
                 throw err;
             }
@@ -350,7 +441,7 @@ export default class ForwardRunner {
             this.snapshot(timestamp, 'post');
             this.flushTradeLogs();
         }
-        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON() });
+        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized });
         finish(this.dryRun ? 'dry-run' : 'complete');
         return { skipped: false, intents, fills };
     }
@@ -407,7 +498,9 @@ export default class ForwardRunner {
                     continue;
                 }
                 const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
-                const clientOrderId = this.broker.createClientOrderId({ timestamp, symbol: intent.symbol, sequence: sequence++ });
+                const clientOrderId = this.broker.createClientOrderId({
+                    timestamp, symbol: intent.symbol, sequence: sequence++, owner: this.ownTag,
+                });
                 const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity: Number(quantity), clientOrderId });
                 stats.orders++;
                 try {
@@ -442,6 +535,7 @@ export default class ForwardRunner {
         this.pendingLogs.push({ kind: 'swap', timestamp, stockName: intent.symbol, side, quantity, price, fee });
         const closed = this.ledger.apply({ symbol: intent.symbol, signedQty: side === 'buy' ? quantity : -quantity, price, fee, timestamp });
         if (closed) {
+            this.realized += closed.profit;
             this.pendingLogs.push({
                 kind: 'trade', timestamp, stockName: intent.symbol, dir: closed.dir,
                 profit: closed.profit, profitPercent: closed.profitPercent, holdMs: closed.holdMs,
@@ -522,6 +616,7 @@ export default class ForwardRunner {
         await this.broker.initialize();
         await this.refreshSymbols(true);
         await this.refreshAccount();
+        this.claimExistingPositions();
         this.stream = this.broker.createStream({
             symbols: this.symbols,
             interval: this.interval,
@@ -534,6 +629,36 @@ export default class ForwardRunner {
             await this.stream.waitForData(this.streamHealthTimeoutMs);
         }
         return this.warmUp();
+    }
+
+    claimExistingPositions() {
+        if (this.accountIsolation !== 'shared') return;
+        if (Object.keys(this.ledger.positions).length) return;
+        const held = (this.lastPortfolio?.positions || []).filter((p) => Number(p.quantity));
+        if (!held.length) return;
+
+        if (this.adoptExisting) {
+            this.ledger.reconcile(held, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
+            for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
+                if (pos.quantity) this.stockBalances[symbol] = pos.quantity;
+            }
+            this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized });
+            this.event('warn', 'adopted-positions', `adopted ${held.length} existing positions`, {
+                data: held.map((p) => p.symbol),
+            });
+            return;
+        }
+        if (this.ignoreExisting) {
+            this.event('info', 'ignored-positions', `${held.length} positions on the account belong to someone else`, {
+                data: held.map((p) => p.symbol),
+            });
+            return;
+        }
+        throw new Error(
+            `${this.broker.account} already holds ${held.length} position(s) (${held.slice(0, 5).map((p) => p.symbol).join(', ')}`
+            + `${held.length > 5 ? ', …' : ''}) and this strategy has no book of its own. `
+            + 'Start with adoptExisting to take them over, or ignoreExisting if another strategy owns them.',
+        );
     }
 
     async stop() {
