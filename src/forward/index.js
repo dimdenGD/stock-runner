@@ -561,6 +561,13 @@ export default class ForwardRunner {
                 profit: closed.profit, profitPercent: closed.profitPercent, holdMs: closed.holdMs,
             });
         }
+        this.writeState({
+            status: 'executing',
+            ledger: this.ledger.toJSON(),
+            realized: this.realized,
+            traded: [...this.traded],
+            disowned: [...this.disowned],
+        });
     }
 
     pruneCache(latest, force = false) {
