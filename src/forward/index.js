@@ -1037,7 +1037,7 @@ export default class ForwardRunner {
             await this.stream?.stop();
             if (!fatal) await this.pollIncome(true);
             this.journal.endRun(this.runId, endReason, fatal);
-            this.journal.finishRun(this.runId, { finalEquity: this.equity });
+            this.journal.finishRun(this.runId, { finalEquity: this.totalValue() });
             if (this.ownsJournal) this.journal.close();
             this.cache.close();
         }
