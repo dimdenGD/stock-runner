@@ -108,6 +108,12 @@ export async function runAllTickersStream(backtest) {
     const histories = Object.fromEntries(intervalEntries.map(([name]) => [name, new Map()]));
     const advancedThrough = Object.fromEntries(intervalEntries.map(([name]) => [name, -Infinity]));
     const fallbackCache = new Map();
+    const streamRange = backtest.candleSource
+        ? backtest.candleSource.streamAllStocksInRange.bind(backtest.candleSource)
+        : streamAllStocksInRange;
+    const loadBefore = backtest.candleSource
+        ? backtest.candleSource.loadStockBeforeTimestamp.bind(backtest.candleSource)
+        : loadStockBeforeTimestamp;
     const excluded = await backtest.broker.excludedSymbols();
     const started = Date.now();
     let previousMainTimestamp = null;
@@ -119,7 +125,7 @@ export async function runAllTickersStream(backtest) {
     const fallback = (stockName, intervalName, timestamp, count) => {
         const key = `${stockName}\0${intervalName}\0${timestamp}\0${count}`;
         if (fallbackCache.has(key)) return fallbackCache.get(key);
-        const pending = loadStockBeforeTimestamp(
+        const pending = loadBefore(
             stockName,
             intervalName,
             new Date(timestamp),
@@ -226,7 +232,7 @@ export async function runAllTickersStream(backtest) {
         const readers = {};
         for (const [intervalName] of intervalEntries) {
             const queryStart = queryStartFor(chunkStart, intervalName, capacities[intervalName], backtest.market);
-            readers[intervalName] = new GroupedCandleReader(streamAllStocksInRange(
+            readers[intervalName] = new GroupedCandleReader(streamRange(
                 intervalName,
                 queryStart,
                 new Date(chunkEndExclusive - 1),

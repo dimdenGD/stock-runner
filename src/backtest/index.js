@@ -67,7 +67,8 @@ export default class Backtest {
      * @param {number} params.capital             – Starting cash balance
      */
     constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage,
-        journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily', strategySourcePath = null }) {
+        journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily', strategySourcePath = null,
+        candleSource = null }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -132,6 +133,7 @@ export default class Backtest {
         this.ownsJournal = this.journal != null && !(journal instanceof RunJournal);
         this.journalTicks = journalTicks;
         this.strategySourcePath = strategySourcePath;
+        this.candleSource = candleSource;
         this.runId = null;
         this._valuationVersion = 0;
         this._totalValueCache = null;

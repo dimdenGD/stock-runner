@@ -1,7 +1,9 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import Candle from '../backtest/candle.js';
+import Stock from '../backtest/stock.js';
+import { intervalMsMap } from '../backtest/consts.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS candles (
@@ -106,5 +108,54 @@ export default class CandleCache {
 
     close() {
         this.db.close();
+    }
+}
+
+/** Read-only backtest source over the exact candles retained by a forward runner. */
+export class CandleCacheSource {
+    constructor({ directory }) {
+        this.directory = directory;
+        this.databases = new Map();
+    }
+
+    database(interval) {
+        if (this.databases.has(interval)) return this.databases.get(interval);
+        const file = join(this.directory, `${interval}.sqlite`);
+        if (!existsSync(file)) throw new Error(`forward candle cache is unavailable for ${interval}`);
+        const db = new DatabaseSync(file, { readOnly: true });
+        db.exec('PRAGMA busy_timeout = 5000;');
+        this.databases.set(interval, db);
+        return db;
+    }
+
+    async *streamAllStocksInRange(interval, startDate, endDate) {
+        const rows = this.database(interval).prepare(
+            `SELECT symbol, ts, open, high, low, close, volume, quote_volume
+             FROM candles WHERE ts >= ? AND ts <= ? ORDER BY ts ASC, symbol ASC`,
+        ).iterate(startDate.getTime(), endDate.getTime());
+        for (const row of rows) {
+            yield {
+                stockName: row.symbol,
+                candle: new Candle(row.open, row.high, row.low, row.close, row.volume, row.ts, row.quote_volume),
+            };
+        }
+    }
+
+    async loadStockBeforeTimestamp(symbol, interval, date, count) {
+        const stock = new Stock(symbol, intervalMsMap[interval]);
+        const rows = this.database(interval).prepare(
+            `SELECT ts, open, high, low, close, volume, quote_volume
+             FROM candles WHERE symbol = ? AND ts <= ? ORDER BY ts DESC LIMIT ?`,
+        ).all(symbol, date.getTime(), count);
+        for (const row of rows) {
+            stock.pushValues(row.open, row.high, row.low, row.close, row.volume, row.ts, row.quote_volume);
+        }
+        stock.finish();
+        return stock;
+    }
+
+    close() {
+        for (const db of this.databases.values()) db.close();
+        this.databases.clear();
     }
 }
