@@ -43,7 +43,6 @@ export default class ForwardRunner {
         journalFile = 'output/journal.sqlite',
         haltFile = 'output/HALT',
         maxDailyLoss = Infinity,
-        accountIsolation = 'shared',
         adoptExisting = false,
         ignoreExisting = false,
         logger = console,
@@ -54,6 +53,7 @@ export default class ForwardRunner {
         maxMissingFraction = 0.02,
         incomePollMs = 3600000,
         incomeLookbackMs = 7 * 86400000,
+        driftWarnFraction = 0.05,
     }) {
         if (!(strategy instanceof Strategy)) throw new TypeError('strategy must be an instance of Strategy');
         if (!(broker instanceof Broker)) throw new TypeError('broker must be an instance of Broker');
@@ -66,13 +66,10 @@ export default class ForwardRunner {
         market = market ?? broker.market ?? 'stocks';
         if (!markets.includes(market)) throw new TypeError(`market must be one of: ${markets.join(', ')}`);
 
-        if (!['shared', 'exclusive'].includes(accountIsolation)) {
-            throw new TypeError("accountIsolation must be 'shared' or 'exclusive'");
-        }
         this.strategy = strategy;
         this.broker = broker;
         this.capital = capital;
-        this.accountIsolation = accountIsolation;
+        this.driftWarnFraction = driftWarnFraction;
         this.adoptExisting = adoptExisting;
         this.ignoreExisting = ignoreExisting;
         this.logs = { swaps: false, trades: false, ticks: false, ...logs };
@@ -136,6 +133,9 @@ export default class ForwardRunner {
         this.disowned = new Set(this.state.disowned || []);
         this.accountEquity = 0;
         this.baseline = null;
+        this.unpricedFills = 0;
+        this.driftWarned = false;
+        this.adjustments = Number(this.state.adjustments) || 0;
         this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
         this.ctx = this;
@@ -166,7 +166,6 @@ export default class ForwardRunner {
     }
 
     totalValue() {
-        if (this.accountIsolation === 'exclusive') return Math.max(0, this.accountEquity);
         return Math.max(0, this.capital + this.realized + this.unrealized());
     }
 
@@ -249,7 +248,6 @@ export default class ForwardRunner {
     }
 
     attributeFunding(rows) {
-        if (this.accountIsolation !== 'shared') return;
         const account = new Map();
         for (const p of this.lastPortfolio?.positions || []) {
             const qty = Number(p.quantity);
@@ -285,16 +283,44 @@ export default class ForwardRunner {
             if (mark > 0) this.stockPrices[p.symbol] = mark;
         }
 
-        if (this.accountIsolation === 'exclusive') {
-            this.ledger.reconcile(portfolio.positions, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
-        } else {
-            this.reconcileShared(portfolio.positions || []);
-        }
+        this.reconcileShared(portfolio.positions || []);
 
         for (const key of Object.keys(this.stockBalances)) delete this.stockBalances[key];
         for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
             if (pos.quantity) this.stockBalances[symbol] = pos.quantity;
         }
+        this.reconcileAccount();
+    }
+
+    reconcileAccount() {
+        if (!(this.accountEquity > 0)) return;
+        const mine = this.totalValue();
+        const claimed = this.claimedShare();
+        if (!(claimed > 0)) return;
+        const drift = mine - claimed;
+        const ratio = Math.abs(drift) / claimed;
+        const over = ratio >= this.driftWarnFraction;
+        if (over && !this.driftWarned) {
+            this.driftWarned = true;
+            this.event('warn', 'equity-drift',
+                `sizing equity ${mine.toFixed(2)} is ${(ratio * 100).toFixed(1)}% `
+                + `${drift > 0 ? 'above' : 'below'} the ${claimed.toFixed(2)} this strategy can account for `
+                + 'on the venue; modelled fees or funding attribution have drifted');
+        } else if (!over && this.driftWarned) {
+            this.driftWarned = false;
+            this.event('info', 'equity-drift-cleared',
+                `sizing equity is back within ${(this.driftWarnFraction * 100).toFixed(0)}% of the account`);
+        }
+    }
+
+    claimedShare() {
+        let others = 0;
+        for (const p of this.lastPortfolio?.positions || []) {
+            const qty = Number(p.quantity);
+            if (!qty || this.ledger.positions[p.symbol]) continue;
+            others += Math.abs(qty * (Number(p.markPrice) || 0));
+        }
+        return this.accountEquity - others;
     }
 
     reconcileShared(positions) {
@@ -445,7 +471,7 @@ export default class ForwardRunner {
             this.event('error', 'batch-blocked', err.message, { barTs: timestamp });
             throw err;
         }
-        this.writeState({ lastProcessedBar: timestamp, status: 'executing', intentCount: intents.length });
+        this.writeState({ lastProcessedBar: timestamp, status: 'executing', runId: this.runId, intentCount: intents.length });
         let fills = [];
         if (!this.dryRun) {
             try {
@@ -461,7 +487,7 @@ export default class ForwardRunner {
             this.snapshot(timestamp, 'post');
             this.flushTradeLogs();
         }
-        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
+        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', runId: this.runId, intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
         finish(this.dryRun ? 'dry-run' : 'complete');
         return { skipped: false, intents, fills };
     }
@@ -499,6 +525,7 @@ export default class ForwardRunner {
 
     async executeBatch(timestamp, intents, stats, { forceReduceOnly = false } = {}) {
         const fills = [];
+        this.unpricedFills = 0;
         const projected = { ...this.stockBalances };
         let sequence = 0;
         for (const intent of intents) {
@@ -544,12 +571,20 @@ export default class ForwardRunner {
                 }
             }
         }
+        if (this.unpricedFills) {
+            this.event('warn', 'fill-price-missing',
+                `${this.unpricedFills} of ${fills.length} fills came back without a price, `
+                + 'those are booked at the decision price and their slippage is unmeasured',
+                { barTs: timestamp });
+        }
         return fills;
     }
 
     recordFill(timestamp, intent, side, requestedQty, parsed) {
         const quantity = parsed.executedQty > 0 ? Number(parsed.executedQty) : requestedQty;
-        const price = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : intent.price;
+        const filled = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : null;
+        const price = filled ?? intent.price;
+        if (filled == null) this.unpricedFills++;
         if (!(quantity > 0) || !(price > 0)) return;
         this.traded.add(intent.symbol);
         const fee = this.fee(intent.symbol, quantity, price, side);
@@ -660,7 +695,6 @@ export default class ForwardRunner {
     }
 
     claimExistingPositions() {
-        if (this.accountIsolation !== 'shared') return;
         if (Object.keys(this.ledger.positions).length) return;
         const held = (this.lastPortfolio?.positions || []).filter((p) => Number(p.quantity));
         if (!held.length) return;
@@ -733,7 +767,30 @@ export default class ForwardRunner {
         return { id: row.id, command: row.command, note: row.note || '' };
     }
 
-    async applyCommand({ id, command, note }) {
+    resetAllocation() {
+        const previous = this.journal.previousRun({
+            strategy: this.strategy.name,
+            account: this.broker.account,
+            dryRun: this.dryRun,
+            before: this.runId,
+        });
+        if (previous && previous.endReason === 'stopped') {
+            if (this.realized || this.adjustments) {
+                this.event('info', 'allocation-reset',
+                    `run ${previous.id} was stopped holding ${this.realized.toFixed(2)} realized `
+                    + `and ${this.adjustments.toFixed(2)} of adjustments; starting from the `
+                    + `${this.capital} allocation`);
+            }
+            this.realized = 0;
+            this.adjustments = 0;
+            this.writeState({ realized: 0, adjustments: 0, runId: this.runId });
+            return;
+        }
+        if (this.adjustments) this.capital = Math.max(0, this.capital + this.adjustments);
+        this.writeState({ runId: this.runId });
+    }
+
+    async applyCommand({ id, command, note, amount }) {
         this.lastCommandId = id;
         this.journal.ackCommands(this.runId, id);
         const detail = note ? `: ${note}` : '';
@@ -745,6 +802,24 @@ export default class ForwardRunner {
             await this.flatten(now, `stop requested${detail}`);
             await this.stop();
             return 'stopped';
+        }
+        if (command === 'adjust') {
+            const delta = Number(amount);
+            if (!Number.isFinite(delta) || !delta) return null;
+            const now = Date.now();
+            const before = this.capital;
+            this.capital = Math.max(0, this.capital + delta);
+            const applied = this.capital - before;
+            this.adjustments += applied;
+            this.journal.adjustCapital(this.runId, applied);
+            this.journal.record(this.runId, now, 'allocation', {
+                value: applied, from: before, to: this.capital, note: note || '',
+            });
+            this.event('info', 'allocation',
+                `allocation ${applied >= 0 ? '+' : ''}${applied.toFixed(2)} to ${this.capital.toFixed(2)}${detail}`,
+                { barTs: now });
+            this.writeState({ adjustments: this.adjustments });
+            return null;
         }
         if (command === 'pause') {
             if (this.paused) return null;
@@ -902,6 +977,7 @@ export default class ForwardRunner {
         let endReason = 'stopped';
         let fatal = null;
         try {
+            this.resetAllocation();
             const latestWarmup = await this.initialize();
             this.baseline = this.totalValue();
             this.journal.baselineEquity(this.runId, this.baseline);

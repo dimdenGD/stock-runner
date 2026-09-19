@@ -187,9 +187,11 @@ bt.logMetrics(result);
   - `tradingMode` - `'live'` or `'demo'`
 - **`IBKR`** - Interactive Brokers:
   - `new IBKR('tiered')` or `new IBKR('fixed')`
-  - Tiered: $0.0035/share, min $0.35, max 1% notional + clearing/regulatory.
-  - Fixed: $0.005/share, min $1, max 1% notional.
+  - Tiered: $0.0035/share, min $0.35, max 1% notional, plus a modelled $0.003/share liquidity-removal fee, $0.00020/share clearing, and commission pass-through assessments.
+  - Fixed: $0.005/share, min $1, max 1% notional
+  - Both: SEC $20.60/million sold, FINRA TAF $0.000195/sold share capped at $9.79, CAT $0.000003/share on buys and sells.
   - Optional second argument: slippage (decimal, e.g. `0.001` = 0.1%).
+  - Optional third argument: `{ exchangeFeePerShare }`. default `0.003`
 - **`Alpaca`** - Commission-free U.S. equity; regulatory fees only:
   - `new Alpaca(slippage?)`
   - Commission: $0. Sells: FINRA TAF $0.000195/share (max $9.79, qty cap 50,205). All: CAT $0.0000265/share. Rounded up to nearest penny.
@@ -224,7 +226,6 @@ await runner.run();
 ```
 
 - **`capital`** - The strategy's allocation.
-- **`accountIsolation`** - `'shared'` (default) tracks only the positions this runner opened, so several strategies can trade one account. `'exclusive'` takes over everything the account holds.
 - **`adoptExisting`** / **`ignoreExisting`** - Required. Controls whether strategy takes over existing trades.
 - **`maxLeverage`** - Max gross exposure / equity per batch. Default: `3` for crypto, `1` for stocks.
 - **`dryRun`** - Run the strategy on live data without sending orders.

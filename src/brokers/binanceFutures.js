@@ -416,11 +416,15 @@ export default class BinanceFutures extends Broker {
 
     parseOrderResult(result) {
         if (!result || typeof result !== 'object') return {};
+        const executedQty = Number(result.executedQty);
+        const quote = Number(result.cumQuote ?? result.cummulativeQuoteQty);
+        const average = Number(result.avgPrice);
         return {
             exchangeOrderId: result.orderId,
             status: result.status,
-            executedQty: Number(result.executedQty),
-            avgPrice: Number(result.avgPrice),
+            executedQty,
+            avgPrice: average > 0 ? average
+                : (quote > 0 && executedQty > 0 ? quote / executedQty : NaN),
         };
     }
 

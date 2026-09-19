@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS runs (
     window_end INTEGER,
     final_equity REAL,
     metrics TEXT,
-    baseline_equity REAL
+    baseline_equity REAL,
+    adjustments REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS strategies (
     id INTEGER PRIMARY KEY,
@@ -164,6 +165,7 @@ CREATE TABLE IF NOT EXISTS commands (
     at INTEGER NOT NULL,
     command TEXT NOT NULL,
     note TEXT,
+    amount REAL,
     acted_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS commands_run ON commands (run_id, id);
@@ -200,6 +202,8 @@ const MIGRATIONS = [
     ['runs', 'final_equity', 'REAL'],
     ['runs', 'metrics', 'TEXT'],
     ['runs', 'baseline_equity', 'REAL'],
+    ['runs', 'adjustments', 'REAL NOT NULL DEFAULT 0'],
+    ['commands', 'amount', 'REAL'],
 ];
 
 const json = (value) => (value === undefined ? null : JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? String(v) : v)));
@@ -228,6 +232,10 @@ export default class RunJournal {
             endRun: prepare('UPDATE runs SET ended_at = ?, end_reason = ?, error = ? WHERE id = ? AND ended_at IS NULL'),
             finishRun: prepare('UPDATE runs SET final_equity = ?, metrics = ? WHERE id = ?'),
             baselineEquity: prepare('UPDATE runs SET baseline_equity = ? WHERE id = ? AND baseline_equity IS NULL'),
+            adjustCapital: prepare('UPDATE runs SET adjustments = COALESCE(adjustments, 0) + ? WHERE id = ?'),
+            previousRun: prepare(`SELECT id, end_reason, ended_at FROM runs
+                WHERE strategy = ? AND account = ? AND dry_run = ? AND id < ? AND mode != 'backtest'
+                ORDER BY id DESC LIMIT 1`),
             findStrategy: prepare('SELECT id FROM strategies WHERE name = ?'),
             insertStrategy: prepare('INSERT INTO strategies (name, market, created_at) VALUES (?, ?, ?)'),
             findVersion: prepare('SELECT id FROM strategy_versions WHERE strategy_id = ? AND hash = ?'),
@@ -244,10 +252,10 @@ export default class RunJournal {
             orderResult: prepare(`UPDATE orders SET status = ?, updated_at = ?, exchange_order_id = ?, executed_qty = ?, avg_price = ?, response = ? WHERE id = ?`),
             orderFailed: prepare('UPDATE orders SET status = ?, updated_at = ?, error_code = ?, error = ?, response = ? WHERE id = ?'),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
-            insertCommand: prepare('INSERT INTO commands (run_id, at, command, note) VALUES (?, ?, ?, ?)'),
-            nextCommand: prepare('SELECT id, command, note, at FROM commands WHERE run_id = ? AND id > ? ORDER BY id DESC LIMIT 1'),
+            insertCommand: prepare('INSERT INTO commands (run_id, at, command, note, amount) VALUES (?, ?, ?, ?, ?)'),
+            nextCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND id > ? ORDER BY id DESC LIMIT 1'),
             ackCommands: prepare('UPDATE commands SET acted_at = ? WHERE run_id = ? AND id <= ? AND acted_at IS NULL'),
-            pendingCommand: prepare('SELECT id, command, note, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
+            pendingCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             lastIncome: prepare('SELECT MAX(time) AS time FROM income WHERE account = ?'),
             income: prepare(`INSERT OR IGNORE INTO income (account, id, time, symbol, type, amount, asset, info, trade_id, run_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -339,6 +347,18 @@ export default class RunJournal {
         this.sql.baselineEquity.run(num(equity), runId);
     }
 
+    /** Money added to or taken out of a run's allocation, which is not P&L. */
+    adjustCapital(runId, amount) {
+        if (runId == null || !Number.isFinite(Number(amount))) return;
+        this.sql.adjustCapital.run(Number(amount), runId);
+    }
+
+    previousRun({ strategy, account, dryRun = false, before }) {
+        const row = this.sql.previousRun.get(
+            String(strategy), account ?? null, dryRun ? 1 : 0, Number(before));
+        return row ? { id: row.id, endReason: row.end_reason, endedAt: row.ended_at } : null;
+    }
+
     finishRun(runId, { finalEquity = null, metrics = null } = {}) {
         if (runId == null) return;
         this.sql.finishRun.run(num(finalEquity), json(metrics), runId);
@@ -422,8 +442,9 @@ export default class RunJournal {
         this.sql.record.run(runId, ts, String(kind), symbol, value, json(data));
     }
 
-    command(runId, command, note = '') {
-        this.sql.insertCommand.run(Number(runId), Date.now(), String(command), String(note || '').slice(0, 200));
+    command(runId, command, note = '', amount = null) {
+        this.sql.insertCommand.run(
+            Number(runId), Date.now(), String(command), String(note || '').slice(0, 200), num(amount));
     }
 
     nextCommand(runId, afterId = 0) {
