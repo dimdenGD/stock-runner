@@ -229,6 +229,13 @@ export default class RunJournal {
         this.sql = {
             startRun: prepare(`INSERT INTO runs (started_at, strategy, broker, account, dry_run, capital, interval, config, git_commit, git_dirty, host, pid, node, mode, strategy_version_id, market, window_start, window_end)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+            resumeTarget: prepare(`SELECT id, strategy, account, dry_run, mode, git_commit, git_dirty,
+                    strategy_version_id, ended_at, end_reason
+                FROM runs WHERE id = ?`),
+            resumeRun: prepare(`UPDATE runs SET ended_at = NULL, end_reason = NULL, error = NULL,
+                    final_equity = NULL, config = ?, git_commit = ?, git_dirty = ?, host = ?, pid = ?, node = ?,
+                    strategy_version_id = ?
+                WHERE id = ?`),
             endRun: prepare('UPDATE runs SET ended_at = ?, end_reason = ?, error = ? WHERE id = ? AND ended_at IS NULL'),
             finishRun: prepare('UPDATE runs SET final_equity = ?, metrics = ? WHERE id = ?'),
             baselineEquity: prepare('UPDATE runs SET baseline_equity = ? WHERE id = ? AND baseline_equity IS NULL'),
@@ -347,6 +354,35 @@ export default class RunJournal {
             mode, strategyVersionId, market, windowStart, windowEnd,
         );
         return Number(result.lastInsertRowid);
+    }
+
+    resumeRun({ runId, strategy, account, dryRun, mode, strategyVersionId = null, config = null }) {
+        const id = Number(runId);
+        const target = this.sql.resumeTarget.get(id);
+        if (!target) throw new Error(`Cannot resume missing run ${runId}`);
+        if (target.strategy !== strategy || target.account !== account
+            || Boolean(target.dry_run) !== Boolean(dryRun) || target.mode !== mode) {
+            throw new Error(`Cannot resume run ${runId}: strategy, account or mode does not match`);
+        }
+        const commit = git(['rev-parse', 'HEAD']);
+        const dirty = commit === null ? null : (git(['status', '--porcelain']) ? 1 : 0);
+        this.sql.resumeRun.run(
+            json(config), commit, dirty, hostname(), process.pid, process.version,
+            strategyVersionId, id,
+        );
+        this.event(id, 'info', 'process-updated', 'runner process replaced without ending the run', {
+            data: {
+                previous: {
+                    gitCommit: target.git_commit,
+                    gitDirty: target.git_dirty,
+                    strategyVersionId: target.strategy_version_id,
+                    endedAt: target.ended_at,
+                    endReason: target.end_reason,
+                },
+                current: { gitCommit: commit, gitDirty: dirty, strategyVersionId, pid: process.pid },
+            },
+        });
+        return id;
     }
 
     baselineEquity(runId, equity) {

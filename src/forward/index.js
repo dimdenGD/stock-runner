@@ -54,6 +54,7 @@ export default class ForwardRunner {
         incomePollMs = 3600000,
         incomeLookbackMs = 7 * 86400000,
         driftWarnFraction = 0.05,
+        resumeRunId = null,
     }) {
         if (!(strategy instanceof Strategy)) throw new TypeError('strategy must be an instance of Strategy');
         if (!(broker instanceof Broker)) throw new TypeError('broker must be an instance of Broker');
@@ -136,6 +137,9 @@ export default class ForwardRunner {
         this.unpricedFills = 0;
         this.driftWarned = false;
         this.adjustments = Number(this.state.adjustments) || 0;
+        this.resumeRunId = Number.isInteger(Number(resumeRunId)) && Number(resumeRunId) > 0
+            ? Number(resumeRunId)
+            : null;
         this.ownTag = ForwardRunner.ownerTag(strategy.name);
         this.isWarmup = false;
         this.ctx = this;
@@ -790,6 +794,14 @@ export default class ForwardRunner {
         this.writeState({ runId: this.runId });
     }
 
+    resumeAllocation() {
+        if (Number(this.state.runId) !== this.runId) {
+            throw new Error(`Saved runner state belongs to run ${this.state.runId ?? 'unknown'}, not ${this.runId}`);
+        }
+        if (this.adjustments) this.capital = Math.max(0, this.capital + this.adjustments);
+        this.writeState({ runId: this.runId, status: 'resuming' });
+    }
+
     async applyCommand({ id, command, note, amount }) {
         this.lastCommandId = id;
         this.journal.ackCommands(this.runId, id);
@@ -944,43 +956,51 @@ export default class ForwardRunner {
     }
 
     async run() {
-        this.runId = this.journal.startRun({
+        const strategyVersionId = this.journal.strategyVersion({
+            name: this.strategy.name,
+            market: this.market,
+            sourcePath: this.strategy.sourcePath ?? null,
+            params: this.strategy.params,
+        });
+        const config = {
+            params: this.strategy.params,
+            warmupBars: this.warmupBars,
+            market: this.market,
+            allowShort: this.allowShort,
+            maxLeverage: this.maxLeverage,
+            maxNetExposure: Number.isFinite(this.maxNetExposure) ? this.maxNetExposure : null,
+            maxOrderNotional: Number.isFinite(this.maxOrderNotional) ? this.maxOrderNotional : null,
+            maxMissingFraction: this.maxMissingFraction,
+            symbols: this.fixedSymbols,
+        };
+        const runIdentity = {
             strategy: this.strategy.name,
             broker: this.broker.label,
             account: this.broker.account,
             dryRun: this.dryRun,
             mode: this.dryRun ? 'paper' : this.broker.tradingMode,
-            strategyVersionId: this.journal.strategyVersion({
-                name: this.strategy.name,
-                market: this.market,
-                sourcePath: this.strategy.sourcePath ?? null,
-                params: this.strategy.params,
-            }),
+            strategyVersionId,
             market: this.market,
             capital: this.capital,
             interval: this.interval,
-            config: {
-                params: this.strategy.params,
-                warmupBars: this.warmupBars,
-                market: this.market,
-                allowShort: this.allowShort,
-                maxLeverage: this.maxLeverage,
-                maxNetExposure: Number.isFinite(this.maxNetExposure) ? this.maxNetExposure : null,
-                maxOrderNotional: Number.isFinite(this.maxOrderNotional) ? this.maxOrderNotional : null,
-                maxMissingFraction: this.maxMissingFraction,
-                symbols: this.fixedSymbols,
-            },
-        });
+            config,
+        };
+        this.runId = this.resumeRunId == null
+            ? this.journal.startRun(runIdentity)
+            : this.journal.resumeRun({ runId: this.resumeRunId, ...runIdentity });
         if (this.paused) {
             this.journal.record(this.runId, Date.now(), 'paused', { paused: true, note: 'resumed process while paused' });
         }
         let endReason = 'stopped';
         let fatal = null;
         try {
-            this.resetAllocation();
+            if (this.resumeRunId == null) this.resetAllocation();
+            else this.resumeAllocation();
             const latestWarmup = await this.initialize();
-            this.baseline = this.totalValue();
-            this.journal.baselineEquity(this.runId, this.baseline);
+            if (this.resumeRunId == null) {
+                this.baseline = this.totalValue();
+                this.journal.baselineEquity(this.runId, this.baseline);
+            }
             if (this.state.status === 'executing') {
                 this.logger.warn(`ForwardRunner: previous process stopped during bar ${this.state.lastProcessedBar}; it will not be replayed`);
                 this.event('warn', 'previous-incomplete', 'previous process stopped mid-batch; bar not replayed', { barTs: Number(this.state.lastProcessedBar) || null });
