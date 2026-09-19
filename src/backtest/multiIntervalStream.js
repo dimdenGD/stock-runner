@@ -199,7 +199,7 @@ export async function runAllTickersStream(backtest) {
             if (backtest.totalValue() <= 0) {
                 backtest.ruined = true;
                 console.log(chalk.red(`ACCOUNT LIQUIDATED ON ${formatDate(currentDate)}`));
-                if (!backtest.isWarmup) backtest.equityCurve.push([currentDate, backtest.totalValue(), backtest.cashBalance]);
+                if (!backtest.isWarmup) backtest.recordEquity(currentDate, backtest.totalValue(), backtest.cashBalance);
                 return;
             }
         } else if (Object.keys(backtest.stockBalances).length) {
@@ -217,7 +217,7 @@ export async function runAllTickersStream(backtest) {
         }
 
         await backtest.strategy.onTick({ currentDate, ctx: backtest, stocks });
-        if (!backtest.isWarmup) backtest.equityCurve.push([currentDate, backtest.totalValue(), backtest.cashBalance]);
+        if (!backtest.isWarmup) backtest.recordEquity(currentDate, backtest.totalValue(), backtest.cashBalance);
     };
 
     let chunkIndex = 0;

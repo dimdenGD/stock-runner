@@ -10,6 +10,8 @@ import chalk from 'chalk';
 import { formatSwapLine, formatTradeLine } from './logFormat.js';
 import { runAllTickersStream } from './multiIntervalStream.js';
 
+const TICK_FLUSH_MS = 1000;
+
 const sharpePeriods = {
     '1d': 252,
     '4h': 252 * 1.625, // 6.5 trading hours per day
@@ -94,6 +96,9 @@ export default class Backtest {
         this.swaps = [];
         this.trades = [];
         this.equityCurve = [];
+        this._journalledTicks = 0;
+        this._lastJournalDay = null;
+        this._lastTickFlush = 0;
         this.delistCounter = {};
         this.stockFeatures = {};  // features set at buy, cleared when position closed
 
@@ -206,7 +211,7 @@ export default class Backtest {
             };
             await this.strategy.onTick(tickObj);
 
-            if (!this.isWarmup) this.equityCurve.push([mainCandle.timestamp, this.totalValue(), this.cashBalance]);
+            if (!this.isWarmup) this.recordEquity(mainCandle.timestamp, this.totalValue(), this.cashBalance);
         }
 
         const metrics = this.getMetrics();
@@ -254,6 +259,9 @@ export default class Backtest {
             },
         });
         this.journal.snapshot(this.runId, +this.startDate, 'start', { cash: this.capital, equity: this.capital, positions: [] });
+        this._journalledTicks = 0;
+        this._lastJournalDay = null;
+        this._lastTickFlush = Date.now();
         this.journal.batchBegin();
     }
 
@@ -277,20 +285,31 @@ export default class Backtest {
         this.runId = null;
     }
 
+    recordEquity(ts, equity, cash) {
+        this.equityCurve.push([ts, equity, cash]);
+        if (!this.journal || this.runId == null || this.journalTicks === false) return;
+        const now = Date.now();
+        if (now - this._lastTickFlush < TICK_FLUSH_MS) return;
+        this._lastTickFlush = now;
+        this._writeJournalTicks();
+        this.journal.batchFlush();
+    }
+
     _writeJournalTicks() {
-        if (!this.journal || this.journalTicks === false || !this.equityCurve.length) return;
+        if (!this.journal || this.journalTicks === false) return;
         const daily = this.journalTicks !== 'bar';
-        let lastDay = null;
-        for (const [ts, equity, cash] of this.equityCurve) {
+        for (let i = this._journalledTicks; i < this.equityCurve.length; i++) {
+            const [ts, equity, cash] = this.equityCurve[i];
             const t = +ts;
             if (daily) {
                 const day = Math.floor(t / 86400000);
-                if (day === lastDay) continue;
-                lastDay = day;
+                if (day === this._lastJournalDay) continue;
+                this._lastJournalDay = day;
             }
             this.journal.tick(this.runId, { ts: t, equity, available: cash, status: 'complete' });
             this.journal.batchStep();
         }
+        this._journalledTicks = this.equityCurve.length;
     }
 
     record() {}

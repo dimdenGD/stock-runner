@@ -286,6 +286,13 @@ export default class RunJournal {
         this._batch = 0;
     }
 
+    batchFlush() {
+        if (this._batch == null) return;
+        this.db.exec('COMMIT');
+        this.db.exec('BEGIN');
+        this._batch = 0;
+    }
+
     batchEnd() {
         if (this._batch == null) return;
         this.db.exec('COMMIT');
