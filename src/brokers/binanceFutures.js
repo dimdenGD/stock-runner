@@ -401,7 +401,7 @@ export default class BinanceFutures extends Broker {
 
     async placeMarketOrder({ symbol, side, quantity, reduceOnly = false, clientOrderId }) {
         if (!['buy', 'sell'].includes(side)) throw new TypeError('side must be buy or sell');
-        return this.request('/fapi/v1/order', {
+        const placed = await this.request('/fapi/v1/order', {
             method: 'POST',
             signed: true,
             params: {
@@ -411,6 +411,28 @@ export default class BinanceFutures extends Broker {
                 newOrderRespType: 'RESULT',
             },
             retry: false,
+        });
+        return this.withFillPrice(placed);
+    }
+
+    async withFillPrice(order) {
+        if (!order || typeof order !== 'object') return order;
+        if (Number(order.avgPrice) > 0 || Number(order.cumQuote) > 0) return order;
+        if (String(order.status).toUpperCase() !== 'FILLED') return order;
+        try {
+            const found = await this.fetchOrder({ symbol: order.symbol, clientOrderId: order.clientOrderId });
+            if (Number(found?.avgPrice) > 0 || Number(found?.cumQuote) > 0) return { ...order, ...found };
+        } catch {
+            // fall through to the unpriced body
+        }
+        return order;
+    }
+
+    async fetchOrder({ symbol, clientOrderId, orderId }) {
+        return this.request('/fapi/v1/order', {
+            method: 'GET',
+            signed: true,
+            params: { symbol, origClientOrderId: clientOrderId, orderId },
         });
     }
 
