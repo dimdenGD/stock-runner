@@ -454,13 +454,13 @@ export default class BinanceFutures extends Broker {
         return this.withFillPrice(placed);
     }
 
-    async withFillPrice(order) {
+    async withFillPrice(order, { retryDelaysMs = this.fillPriceRetryDelaysMs } = {}) {
         if (!order || typeof order !== 'object') return order;
         if (hasFillPrice(order)) return order;
         if (String(order.status).toUpperCase() !== 'FILLED') return order;
 
-        const delays = this.fillPriceRetryDelaysMs?.length
-            ? this.fillPriceRetryDelaysMs
+        const delays = retryDelaysMs?.length
+            ? retryDelaysMs
             : DEFAULT_FILL_PRICE_RETRY_DELAYS_MS;
         let orderLastError = null;
         let orderAttempts = 0;
@@ -469,6 +469,7 @@ export default class BinanceFutures extends Broker {
         for (const delay of delays) {
             if (delay > 0) await sleep(delay);
             orderAttempts++;
+            let lookupOrder = order;
             try {
                 const found = await this.fetchOrder({
                     symbol: order.symbol,
@@ -477,6 +478,7 @@ export default class BinanceFutures extends Broker {
                 if (hasFillPrice(found)) {
                     return { ...order, ...found, fillPriceSource: 'order' };
                 }
+                lookupOrder = { ...order, ...found };
                 orderLastError = { status: null, code: null, message: 'order lookup returned no fill price' };
             } catch (err) {
                 orderLastError = fillPriceLookupError(err);
@@ -485,13 +487,13 @@ export default class BinanceFutures extends Broker {
             try {
                 tradeAttempts++;
                 const trades = await this.fetchOrderTrades({
-                    symbol: order.symbol,
-                    orderId: order.orderId,
-                    updateTime: order.updateTime,
+                    symbol: lookupOrder.symbol,
+                    orderId: lookupOrder.orderId,
+                    updateTime: lookupOrder.updateTime,
                 });
-                const price = fillPriceFromTrades(trades, order.orderId);
+                const price = fillPriceFromTrades(trades, lookupOrder.orderId);
                 if (price) {
-                    return { ...order, ...price, fillPriceSource: 'userTrades' };
+                    return { ...lookupOrder, ...price, fillPriceSource: 'userTrades' };
                 }
                 tradeLastError = {
                     status: null,
@@ -549,6 +551,24 @@ export default class BinanceFutures extends Broker {
             avgPrice: average > 0 ? average
                 : (quote > 0 && executedQty > 0 ? quote / executedQty : NaN),
         };
+    }
+
+    async backfillOrderResult(row) {
+        const original = row?.response && typeof row.response === 'object' ? row.response : {};
+        return this.withFillPrice({
+            ...original,
+            symbol: row.symbol,
+            status: 'FILLED',
+            clientOrderId: row.client_order_id || original.clientOrderId,
+            orderId: row.exchange_order_id || original.orderId,
+            updateTime: original.updateTime || row.ts,
+            executedQty: original.executedQty || row.executed_qty || row.quantity,
+        }, { retryDelaysMs: [0] });
+    }
+
+    async getTradingStatus() {
+        const permissions = await this.request('/fapi/v1/apiTradingStatus', { signed: true });
+        return permissions?.status ?? null;
     }
 
     async getIncome({ startTime, endTime = this.now() } = {}) {
