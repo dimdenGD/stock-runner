@@ -7,8 +7,45 @@ import BinanceKlineStream from './binanceKlineStream.js';
 
 const PROD_REST = 'https://fapi.binance.com';
 const DEMO_REST = 'https://demo-fapi.binance.com';
+const DEFAULT_FILL_PRICE_RETRY_DELAYS_MS = Object.freeze([0, 50, 150, 400, 1000]);
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const hasFillPrice = (order) => Number(order?.avgPrice) > 0 || Number(order?.cumQuote) > 0;
+
+function parseBinanceJson(raw) {
+    const preciseOrderIds = raw.replace(
+        /(\"orderId\"\s*:\s*)(-?\d{16,})(?=\s*[,}])/g,
+        '$1"$2"',
+    );
+    return JSON.parse(preciseOrderIds);
+}
+
+function fillPriceLookupError(err) {
+    return {
+        status: err?.status ?? null,
+        code: err?.code ?? null,
+        message: err?.message || String(err),
+    };
+}
+
+function fillPriceFromTrades(trades, orderId) {
+    const wanted = orderId == null ? null : String(orderId);
+    let quantity = 0;
+    let quote = 0;
+    let count = 0;
+    for (const trade of Array.isArray(trades) ? trades : []) {
+        if (wanted != null && String(trade?.orderId) !== wanted) continue;
+        const qty = Number(trade?.qty);
+        const price = Number(trade?.price);
+        const quoted = Number(trade?.quoteQty);
+        if (!(qty > 0) || !(price > 0)) continue;
+        quantity += qty;
+        quote += quoted > 0 ? quoted : qty * price;
+        count++;
+    }
+    if (!(quantity > 0) || !(quote > 0)) return null;
+    return { avgPrice: String(quote / quantity), cumQuote: String(quote), fillCount: count };
+}
 
 export class BinanceFuturesError extends Error {
     constructor(message, { status = null, code = null, body = null } = {}) {
@@ -89,6 +126,7 @@ export default class BinanceFutures extends Broker {
         strictQuantization = false,
         exchangeInfoCachePath = 'data/binance/exchangeInfo.json',
         exchangeInfoMaxAgeMs = 7 * 86400000,
+        fillPriceRetryDelaysMs = DEFAULT_FILL_PRICE_RETRY_DELAYS_MS,
     } = {}) {
         super();
         if (!['demo', 'live'].includes(environment)) {
@@ -118,6 +156,7 @@ export default class BinanceFutures extends Broker {
         this.strictQuantization = strictQuantization;
         this.exchangeInfoCachePath = exchangeInfoCachePath;
         this.exchangeInfoMaxAgeMs = exchangeInfoMaxAgeMs;
+        this.fillPriceRetryDelaysMs = [...fillPriceRetryDelaysMs];
         this.limiter = new MinuteWeightLimiter(maxRequestWeightPerMinute);
     }
 
@@ -196,7 +235,7 @@ export default class BinanceFutures extends Broker {
                 const res = await this.fetchImpl(url, { method, headers, signal: controller.signal });
                 const raw = await res.text();
                 let body;
-                try { body = raw ? JSON.parse(raw) : {}; } catch { body = raw; }
+                try { body = raw ? parseBinanceJson(raw) : {}; } catch { body = raw; }
                 if (res.ok) return body;
                 const err = new BinanceFuturesError(
                     `Binance Futures ${method} ${path} failed: HTTP ${res.status}${body?.msg ? ` ${body.msg}` : ''}`,
@@ -417,15 +456,57 @@ export default class BinanceFutures extends Broker {
 
     async withFillPrice(order) {
         if (!order || typeof order !== 'object') return order;
-        if (Number(order.avgPrice) > 0 || Number(order.cumQuote) > 0) return order;
+        if (hasFillPrice(order)) return order;
         if (String(order.status).toUpperCase() !== 'FILLED') return order;
-        try {
-            const found = await this.fetchOrder({ symbol: order.symbol, clientOrderId: order.clientOrderId });
-            if (Number(found?.avgPrice) > 0 || Number(found?.cumQuote) > 0) return { ...order, ...found };
-        } catch {
-            // fall through to the unpriced body
+
+        const delays = this.fillPriceRetryDelaysMs?.length
+            ? this.fillPriceRetryDelaysMs
+            : DEFAULT_FILL_PRICE_RETRY_DELAYS_MS;
+        let orderLastError = null;
+        let orderAttempts = 0;
+        let tradeLastError = null;
+        let tradeAttempts = 0;
+        for (const delay of delays) {
+            if (delay > 0) await sleep(delay);
+            orderAttempts++;
+            try {
+                const found = await this.fetchOrder({
+                    symbol: order.symbol,
+                    clientOrderId: order.clientOrderId,
+                });
+                if (hasFillPrice(found)) {
+                    return { ...order, ...found, fillPriceSource: 'order' };
+                }
+                orderLastError = { status: null, code: null, message: 'order lookup returned no fill price' };
+            } catch (err) {
+                orderLastError = fillPriceLookupError(err);
+            }
+
+            try {
+                tradeAttempts++;
+                const trades = await this.fetchOrderTrades({
+                    symbol: order.symbol,
+                    orderId: order.orderId,
+                    updateTime: order.updateTime,
+                });
+                const price = fillPriceFromTrades(trades, order.orderId);
+                if (price) {
+                    return { ...order, ...price, fillPriceSource: 'userTrades' };
+                }
+                tradeLastError = {
+                    status: null,
+                    code: null,
+                    message: 'account trade lookup returned no matching fills',
+                };
+            } catch (err) {
+                tradeLastError = fillPriceLookupError(err);
+            }
         }
-        return order;
+
+        return {
+            ...order,
+            fillPriceLookup: { orderAttempts, tradeAttempts, orderLastError, tradeLastError },
+        };
     }
 
     async fetchOrder({ symbol, clientOrderId, orderId }) {
@@ -433,6 +514,26 @@ export default class BinanceFutures extends Broker {
             method: 'GET',
             signed: true,
             params: { symbol, origClientOrderId: clientOrderId, orderId },
+        });
+    }
+
+    async fetchOrderTrades({ symbol, orderId, updateTime }) {
+        const exactOrderId = typeof orderId === 'string' || Number.isSafeInteger(orderId)
+            ? orderId
+            : undefined;
+        const time = Number(updateTime);
+        const params = exactOrderId != null
+            ? { symbol, orderId: exactOrderId, limit: 1000 }
+            : {
+                symbol,
+                startTime: Number.isFinite(time) ? Math.max(0, time - 60000) : undefined,
+                endTime: Number.isFinite(time) ? Math.min(this.now(), time + 60000) : undefined,
+                limit: 1000,
+            };
+        return this.request('/fapi/v1/userTrades', {
+            signed: true,
+            params,
+            weight: 5,
         });
     }
 
