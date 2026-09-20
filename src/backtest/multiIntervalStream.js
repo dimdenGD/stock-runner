@@ -155,6 +155,7 @@ export async function runAllTickersStream(backtest) {
     const processMainGroup = async (timestamp, records, symbolOrder) => {
         const currentDate = new Date(timestamp);
         backtest.isWarmup = backtest.strategy.warmup > 0 && timestamp < backtest.startDate.getTime();
+        backtest.currentTimestamp = timestamp;
         const ordered = [];
         for (const record of records) {
             if (!excluded.has(record.stockName)) ordered[symbolOrder.get(record.stockName)] = record;

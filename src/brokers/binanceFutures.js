@@ -7,7 +7,7 @@ import BinanceKlineStream from './binanceKlineStream.js';
 
 const PROD_REST = 'https://fapi.binance.com';
 const DEMO_REST = 'https://demo-fapi.binance.com';
-const DEFAULT_FILL_PRICE_RETRY_DELAYS_MS = Object.freeze([0, 50, 150, 400, 1000]);
+const DEFAULT_FILL_PRICE_RETRY_DELAYS_MS = Object.freeze([0, 50, 150, 400, 1000, 2500, 5000]);
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const hasFillPrice = (order) => Number(order?.avgPrice) > 0 || Number(order?.cumQuote) > 0;
@@ -27,6 +27,10 @@ function fillPriceLookupError(err) {
         message: err?.message || String(err),
     };
 }
+
+const usableOrderId = (orderId) => (
+    typeof orderId === 'string' && orderId !== '' ? orderId
+        : Number.isSafeInteger(orderId) ? orderId : null);
 
 function fillPriceFromTrades(trades, orderId) {
     const wanted = orderId == null ? null : String(orderId);
@@ -471,10 +475,9 @@ export default class BinanceFutures extends Broker {
             orderAttempts++;
             let lookupOrder = order;
             try {
-                const found = await this.fetchOrder({
-                    symbol: order.symbol,
-                    clientOrderId: order.clientOrderId,
-                });
+                const found = await this.fetchOrder(usableOrderId(order.orderId) != null
+                    ? { symbol: order.symbol, orderId: usableOrderId(order.orderId) }
+                    : { symbol: order.symbol, clientOrderId: order.clientOrderId });
                 if (hasFillPrice(found)) {
                     return { ...order, ...found, fillPriceSource: 'order' };
                 }
@@ -490,6 +493,7 @@ export default class BinanceFutures extends Broker {
                     symbol: lookupOrder.symbol,
                     orderId: lookupOrder.orderId,
                     updateTime: lookupOrder.updateTime,
+                    widenIfEmpty: true,
                 });
                 const price = fillPriceFromTrades(trades, lookupOrder.orderId);
                 if (price) {
@@ -507,7 +511,13 @@ export default class BinanceFutures extends Broker {
 
         return {
             ...order,
-            fillPriceLookup: { orderAttempts, tradeAttempts, orderLastError, tradeLastError },
+            fillPriceLookup: {
+                orderAttempts,
+                tradeAttempts,
+                lookupKey: usableOrderId(order.orderId) != null ? 'orderId' : 'origClientOrderId',
+                orderLastError,
+                tradeLastError,
+            },
         };
     }
 
@@ -519,24 +529,21 @@ export default class BinanceFutures extends Broker {
         });
     }
 
-    async fetchOrderTrades({ symbol, orderId, updateTime }) {
-        const exactOrderId = typeof orderId === 'string' || Number.isSafeInteger(orderId)
-            ? orderId
-            : undefined;
+    async fetchOrderTrades({ symbol, orderId, updateTime, widenIfEmpty = false }) {
+        const exactOrderId = usableOrderId(orderId);
         const time = Number(updateTime);
-        const params = exactOrderId != null
-            ? { symbol, orderId: exactOrderId, limit: 1000 }
-            : {
-                symbol,
-                startTime: Number.isFinite(time) ? Math.max(0, time - 60000) : undefined,
-                endTime: Number.isFinite(time) ? Math.min(this.now(), time + 60000) : undefined,
-                limit: 1000,
-            };
-        return this.request('/fapi/v1/userTrades', {
-            signed: true,
-            params,
-            weight: 5,
+        const byTime = () => ({
+            symbol,
+            startTime: Number.isFinite(time) ? Math.max(0, time - 60000) : undefined,
+            endTime: Number.isFinite(time) ? Math.min(this.now(), time + 60000) : undefined,
+            limit: 1000,
         });
+        const ask = (params) => this.request('/fapi/v1/userTrades', { signed: true, params, weight: 5 });
+
+        if (exactOrderId == null) return ask(byTime());
+        const found = await ask({ symbol, orderId: exactOrderId, limit: 1000 });
+        if (!widenIfEmpty || (Array.isArray(found) && found.length)) return found;
+        return ask(byTime());
     }
 
     parseOrderResult(result) {

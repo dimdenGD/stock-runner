@@ -67,7 +67,8 @@ export default class Backtest {
      * @param {number} params.capital             – Starting cash balance
      */
     constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage,
-        journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily', strategySourcePath = null,
+        journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily',
+        journalRecords = 'summary', strategySourcePath = null,
         candleSource = null }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
@@ -132,6 +133,8 @@ export default class Backtest {
             : new RunJournal({ file: journalFile });
         this.ownsJournal = this.journal != null && !(journal instanceof RunJournal);
         this.journalTicks = journalTicks;
+        this.journalRecords = journalRecords;
+        this.currentTimestamp = null;
         this.strategySourcePath = strategySourcePath;
         this.candleSource = candleSource;
         this.runId = null;
@@ -181,6 +184,7 @@ export default class Backtest {
             const ts = mainCandle.timestamp;
             if (ts >= this.endDate) break;
             this.isWarmup = this.strategy.warmup > 0 && ts < this.startDate.getTime();
+            this.currentTimestamp = ts;
 
             // top up all buffers as we advance
             const fetches = Object.values(buffers)
@@ -314,7 +318,13 @@ export default class Backtest {
         this._journalledTicks = this.equityCurve.length;
     }
 
-    record() {}
+    record(kind, data = {}) {
+        if (!this.journal || this.runId == null || this.journalRecords === false) return;
+        if (this.isWarmup || this.currentTimestamp == null) return;
+        if (this.journalRecords === 'summary' && typeof data?.symbol === 'string') return;
+        this.journal.record(this.runId, +this.currentTimestamp, kind, data);
+        this.journal.batchStep();
+    }
 
     _invalidateValuation() {
         this._valuationVersion++;
