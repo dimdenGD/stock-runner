@@ -573,6 +573,73 @@ export default class BinanceFutures extends Broker {
         }, { retryDelaysMs: [0] });
     }
 
+    async resolvePendingOrder(row) {
+        const symbol = row?.symbol;
+        const orderId = usableOrderId(row?.exchange_order_id);
+        const clientOrderId = row?.client_order_id || null;
+        if (!symbol || (orderId == null && !clientOrderId)) {
+            return { outcome: 'unknown', reason: 'the order was journalled without a venue key' };
+        }
+
+        let found = null;
+        let lookupError = null;
+        try {
+            found = await this.fetchOrder(orderId != null
+                ? { symbol, orderId }
+                : { symbol, clientOrderId });
+        } catch (err) {
+            lookupError = fillPriceLookupError(err);
+            if (err?.code !== -2013) return { outcome: 'unknown', reason: lookupError.message };
+        }
+
+        if (found) {
+            const status = String(found.status || '').toUpperCase();
+            if (Number(found.executedQty) > 0) {
+                const priced = await this.withFillPrice({ ...found, status: 'FILLED' });
+                const parsed = this.parseOrderResult(priced);
+                if (!(parsed.avgPrice > 0)) {
+                    return { outcome: 'unknown', reason: `${symbol} filled but no price could be read back` };
+                }
+                return { outcome: 'filled', response: priced, parsed };
+            }
+            return {
+                outcome: 'rejected',
+                response: found,
+                reason: `the venue reports this order as ${status || 'unfilled'}`,
+            };
+        }
+
+        if (orderId != null) {
+            let trades = [];
+            try {
+                trades = await this.fetchOrderTrades({
+                    symbol, orderId, updateTime: row.ts, widenIfEmpty: true,
+                });
+            } catch (err) {
+                return { outcome: 'unknown', reason: fillPriceLookupError(err).message };
+            }
+            const price = fillPriceFromTrades(trades, orderId);
+            if (price) {
+                const filledQty = Number(price.cumQuote) / Number(price.avgPrice);
+                const response = {
+                    symbol,
+                    orderId,
+                    clientOrderId,
+                    status: 'FILLED',
+                    ...price,
+                    executedQty: String(filledQty),
+                    fillPriceSource: 'userTrades',
+                };
+                return { outcome: 'filled', response, parsed: this.parseOrderResult(response) };
+            }
+        }
+
+        return {
+            outcome: 'rejected',
+            reason: lookupError?.message || 'the venue has no record of this order',
+        };
+    }
+
     async getTradingStatus() {
         const permissions = await this.request('/fapi/v1/apiTradingStatus', { signed: true });
         return permissions?.status ?? null;
