@@ -8,6 +8,9 @@ import { formatSwapLine, formatTradeLine } from '../backtest/logFormat.js';
 import RunJournal from '../journal.js';
 import TradeLedger from './tradeLedger.js';
 import CandleCache from './candleCache.js';
+import { inspectPendingOrder, remainingBatchIntents } from './recovery.js';
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function pool(items, limit, fn) {
     const out = new Array(items.length);
@@ -63,6 +66,7 @@ export default class ForwardRunner {
         incomeLookbackMs = 7 * 86400000,
         driftWarnFraction = 0.05,
         maxOrderFailures = 5,
+        maxOrderAttempts = 3,
         maxConsecutiveBarErrors = 3,
         resumeRunId = null,
     }) {
@@ -116,6 +120,7 @@ export default class ForwardRunner {
         this.dayOpenEquity = null;
         this.haltReason = null;
         this.maxOrderFailures = maxOrderFailures;
+        this.maxOrderAttempts = Math.min(3, Math.max(1, Math.trunc(Number(maxOrderAttempts) || 1)));
         this.maxConsecutiveBarErrors = maxConsecutiveBarErrors;
         this.consecutiveBarErrors = 0;
         this.cache = new CandleCache({ file: join(dataDir, 'cache', fileSafe(broker.dataSource), `${this.interval}.sqlite`), stepMs: this.stepMs });
@@ -488,7 +493,13 @@ export default class ForwardRunner {
             this.event('error', 'batch-blocked', err.message, { barTs: timestamp });
             throw err;
         }
-        this.writeState({ lastProcessedBar: timestamp, status: 'executing', runId: this.runId, intentCount: intents.length });
+        this.writeState({
+            lastProcessedBar: timestamp,
+            status: 'executing',
+            runId: this.runId,
+            intentCount: intents.length,
+            appliedOrderIds: [],
+        });
         let fills = [];
         if (!this.dryRun) {
             try {
@@ -504,7 +515,17 @@ export default class ForwardRunner {
             this.snapshot(timestamp, 'post');
             this.flushTradeLogs();
         }
-        this.writeState({ lastProcessedBar: timestamp, status: this.dryRun ? 'dry-run' : 'complete', runId: this.runId, intentCount: intents.length, ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
+        this.writeState({
+            lastProcessedBar: timestamp,
+            status: this.dryRun ? 'dry-run' : 'complete',
+            runId: this.runId,
+            intentCount: intents.length,
+            ledger: this.ledger.toJSON(),
+            realized: this.realized,
+            traded: [...this.traded],
+            disowned: [...this.disowned],
+            appliedOrderIds: [],
+        });
         finish(this.dryRun ? 'dry-run' : stats.failed ? 'partial' : 'complete');
         return { skipped: false, intents, fills };
     }
@@ -544,6 +565,7 @@ export default class ForwardRunner {
         const fills = [];
         this.unpricedFills = 0;
         const projected = { ...this.stockBalances };
+        const maxAttempts = Math.min(3, Math.max(1, Math.trunc(Number(this.maxOrderAttempts) || 1)));
         let sequence = 0;
         for (const intent of intents) {
             const current = projected[intent.symbol] || 0;
@@ -568,11 +590,49 @@ export default class ForwardRunner {
                 const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity: Number(quantity), clientOrderId });
                 stats.orders++;
                 let fill;
-                try {
-                    fill = await this.broker.placeMarketOrder({
-                        symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
-                    });
-                } catch (err) {
+                let placed = false;
+                let placementError = null;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                        fill = await this.broker.placeMarketOrder({
+                            symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
+                        });
+                        placed = true;
+                        break;
+                    } catch (err) {
+                        placementError = err;
+                        const disposition = typeof this.broker.orderFailureDisposition === 'function'
+                            ? this.broker.orderFailureDisposition(err, {
+                                attempt,
+                                maxAttempts,
+                                symbol: intent.symbol,
+                                side,
+                                clientOrderId,
+                            }) || { action: 'ambiguous' }
+                            : { action: 'reject' };
+                        if (disposition.action === 'retry' && attempt < maxAttempts) {
+                            const delayMs = Math.max(0, Number(disposition.delayMs) || 0);
+                            stats.retries = (stats.retries || 0) + 1;
+                            this.event('warn', 'order-retry',
+                                `${intent.symbol} ${side} ${quantity}: attempt ${attempt} failed; `
+                                    + `retrying in ${delayMs}ms`,
+                                { barTs: timestamp, data: { clientOrderId, attempt, delayMs, code: err.code ?? null } });
+                            if (delayMs) await sleep(delayMs);
+                            continue;
+                        }
+                        if (disposition.action === 'ambiguous') {
+                            this.event('error', 'order-unanswered',
+                                `${intent.symbol} ${side} ${quantity}: venue outcome is ambiguous; restarting into reconciliation`,
+                                { barTs: timestamp, data: { clientOrderId, attempt, code: err.code ?? null } });
+                            err.fatal = true;
+                            err.restartRunner = true;
+                            throw err;
+                        }
+                        break;
+                    }
+                }
+                if (!placed) {
+                    const err = placementError || new Error('order placement failed without an error');
                     this.journal.orderFailed(orderId, err);
                     stats.failed++;
                     this.event('error', 'order-failed', `${intent.symbol} ${side} ${quantity}: ${err.message}`, {
@@ -594,7 +654,7 @@ export default class ForwardRunner {
                 }
                 const parsed = this.broker.parseOrderResult(fill) || {};
                 this.journal.orderResult(orderId, parsed, fill);
-                this.recordFill(timestamp, intent, side, Number(quantity), parsed);
+                this.recordFill(timestamp, intent, side, Number(quantity), parsed, orderId);
                 fills.push(fill);
                 stats.fills++;
                 projected[intent.symbol] = (projected[intent.symbol] || 0) + signedRounded;
@@ -609,7 +669,122 @@ export default class ForwardRunner {
         return fills;
     }
 
-    recordFill(timestamp, intent, side, requestedQty, parsed) {
+    /**
+     * Finish a batch whose process died after its strategy intents were
+     * journalled but before every venue response was durably recorded.
+     */
+    async recoverInterruptedBatch(timestamp) {
+        const answeredRows = this.journal.answeredOrdersAt(this.runId, timestamp);
+        if (answeredRows.length && !Array.isArray(this.state.appliedOrderIds)) {
+            this.event('error', 'recovery-blocked',
+                'interrupted state predates exact fill-application tracking; refusing to guess which answered orders are already in the owned book',
+                { barTs: timestamp, data: { answeredOrderIds: answeredRows.map((row) => row.id) } });
+            throw new Error('Interrupted state has answered orders but no exact fill-application markers');
+        }
+        const applied = new Set((this.state.appliedOrderIds || []).map(Number));
+        let journalledFills = 0;
+        for (const row of answeredRows) {
+            if (applied.has(Number(row.id))) continue;
+            this.recordFill(timestamp, {
+                symbol: row.symbol,
+                price: Number(row.decision_price) || Number(row.avg_price),
+            }, row.side, Number(row.quantity), {
+                status: row.status,
+                exchangeOrderId: row.exchange_order_id,
+                executedQty: Number(row.executed_qty),
+                avgPrice: Number(row.avg_price),
+            }, row.id);
+            journalledFills++;
+        }
+
+        const rows = this.journal.pendingOrdersAt(this.runId, timestamp);
+        const inspected = await Promise.all(rows.map((row) => inspectPendingOrder(this.broker, row)));
+        let recoveredFills = 0;
+        let neverPlaced = 0;
+        const unresolved = [];
+
+        for (let i = 0; i < inspected.length; i++) {
+            const result = inspected[i];
+            const row = rows[i];
+            if (result.outcome === 'filled') {
+                this.journal.orderResult(row.id, result.parsed, result.response);
+                this.recordFill(
+                    timestamp,
+                    { symbol: row.symbol, price: Number(row.decision_price) || result.avgPrice },
+                    row.side,
+                    Number(row.quantity),
+                    result.parsed,
+                    row.id,
+                );
+                recoveredFills++;
+            } else if (result.outcome === 'rejected') {
+                const error = new Error(result.reason || 'the venue has no record of this order');
+                error.code = 'unanswered';
+                error.body = result.response;
+                this.journal.orderFailed(row.id, error);
+                neverPlaced++;
+            } else {
+                unresolved.push(result);
+            }
+        }
+
+        if (unresolved.length) {
+            const detail = unresolved.slice(0, 3).map((row) => `${row.symbol}: ${row.error}`).join('; ');
+            this.event('error', 'recovery-blocked',
+                `cannot safely finish interrupted bar while ${unresolved.length} order(s) remain ambiguous: ${detail}`,
+                { barTs: timestamp, data: unresolved });
+            throw new Error(`Interrupted-order reconciliation failed: ${detail}`);
+        }
+
+        await this.refreshAccount();
+        const sourceIntents = this.journal.intentsAt(this.runId, timestamp);
+        const intents = remainingBatchIntents(sourceIntents, this.stockBalances, this.stockPrices);
+        const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
+        const fills = this.dryRun ? [] : await this.executeBatch(timestamp, intents, stats);
+        await this.refreshAccount();
+        this.snapshot(timestamp, 'recovered');
+        this.flushTradeLogs();
+
+        if (stats.failed) {
+            this.event('error', 'recovery-partial',
+                `interrupted bar catch-up still has ${stats.failed} failed order(s)`,
+                { barTs: timestamp, data: stats });
+            throw new Error(`Interrupted bar catch-up left ${stats.failed} failed order(s)`);
+        }
+
+        this.writeState({
+            lastProcessedBar: timestamp,
+            status: this.dryRun ? 'dry-run' : 'complete',
+            runId: this.runId,
+            intentCount: sourceIntents.length,
+            ledger: this.ledger.toJSON(),
+            realized: this.realized,
+            traded: [...this.traded],
+            disowned: [...this.disowned],
+            appliedOrderIds: [],
+        });
+        this.journal.tick(this.runId, {
+            ts: timestamp,
+            durationMs: 0,
+            ...this.lastBatchInfo,
+            equity: this.equity,
+            sizingEquity: this.totalValue(),
+            available: this.availableBalance,
+            gross: this.grossExposure(),
+            net: this.netExposure(),
+            positions: Object.keys(this.stockBalances).length,
+            intents: sourceIntents.length,
+            ...stats,
+            status: 'recovered',
+        });
+        this.event('info', 'batch-recovered',
+            `finished interrupted bar: ${journalledFills + recoveredFills} prior fill(s), ${neverPlaced} never placed, `
+                + `${stats.fills} catch-up fill(s)`,
+            { barTs: timestamp, data: { journalledFills, recoveredFills, neverPlaced, catchup: stats, fills: fills.length } });
+        return { journalledFills, recoveredFills, neverPlaced, intents: intents.length, ...stats };
+    }
+
+    recordFill(timestamp, intent, side, requestedQty, parsed, orderId = null) {
         const quantity = parsed.executedQty > 0 ? Number(parsed.executedQty) : requestedQty;
         const filled = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : null;
         const price = filled ?? intent.price;
@@ -626,12 +801,16 @@ export default class ForwardRunner {
                 profit: closed.profit, profitPercent: closed.profitPercent, holdMs: closed.holdMs,
             });
         }
+        const appliedOrderIds = this.state?.appliedOrderIds || [];
         this.writeState({
             status: 'executing',
             ledger: this.ledger.toJSON(),
             realized: this.realized,
             traded: [...this.traded],
             disowned: [...this.disowned],
+            appliedOrderIds: orderId == null
+                ? appliedOrderIds
+                : [...new Set([...appliedOrderIds.map(Number), Number(orderId)])],
         });
     }
 
@@ -704,11 +883,12 @@ export default class ForwardRunner {
         return got.filter(Boolean);
     }
 
-    async initialize() {
+    async initialize({ interruptedBar = null } = {}) {
         await this.broker.initialize();
         await this.refreshSymbols(true);
         await this.refreshAccount();
-        this.claimExistingPositions();
+        if (interruptedBar != null) await this.recoverInterruptedBatch(interruptedBar);
+        else this.claimExistingPositions();
         this.stream = this.broker.createStream({
             symbols: this.symbols,
             interval: this.interval,
@@ -995,6 +1175,7 @@ export default class ForwardRunner {
             maxLeverage: this.maxLeverage,
             maxNetExposure: Number.isFinite(this.maxNetExposure) ? this.maxNetExposure : null,
             maxOrderNotional: Number.isFinite(this.maxOrderNotional) ? this.maxOrderNotional : null,
+            maxOrderAttempts: this.maxOrderAttempts,
             maxMissingFraction: this.maxMissingFraction,
             symbols: this.fixedSymbols,
         };
@@ -1021,14 +1202,17 @@ export default class ForwardRunner {
         try {
             if (this.resumeRunId == null) this.resetAllocation();
             else this.resumeAllocation();
-            const latestWarmup = await this.initialize();
+            const interruptedBar = this.resumeRunId != null && this.state.status === 'executing'
+                ? Number(this.state.lastProcessedBar) || null
+                : null;
+            const latestWarmup = await this.initialize({ interruptedBar });
             if (this.resumeRunId == null) {
                 this.baseline = this.totalValue();
                 this.journal.baselineEquity(this.runId, this.baseline);
             }
-            if (this.state.status === 'executing') {
-                this.logger.warn(`ForwardRunner: previous process stopped during bar ${this.state.lastProcessedBar}; it will not be replayed`);
-                this.event('warn', 'previous-incomplete', 'previous process stopped mid-batch; bar not replayed', { barTs: Number(this.state.lastProcessedBar) || null });
+            if (interruptedBar != null) {
+                this.logger.warn(`ForwardRunner: recovered interrupted bar ${interruptedBar} against actual venue positions`);
+                this.event('info', 'previous-incomplete', 'previous process stopped mid-batch; reconciled and completed from its journalled intents', { barTs: interruptedBar });
             }
             await this.pollIncome(true);
             let last = Math.max(latestWarmup, Number(this.state.lastProcessedBar || 0));
@@ -1103,8 +1287,13 @@ export default class ForwardRunner {
         } finally {
             await this.stream?.stop();
             if (!fatal) await this.pollIncome(true);
-            this.journal.endRun(this.runId, endReason, fatal);
-            this.journal.finishRun(this.runId, { finalEquity: this.totalValue() });
+            // An ambiguous placement deliberately leaves the run open. The
+            // supervisor sees the non-zero exit, reattaches the same run, and
+            // resolves its pending venue key before completing the batch.
+            if (!fatal?.restartRunner) {
+                this.journal.endRun(this.runId, endReason, fatal);
+                this.journal.finishRun(this.runId, { finalEquity: this.totalValue() });
+            }
             if (this.ownsJournal) this.journal.close();
             this.cache.close();
         }

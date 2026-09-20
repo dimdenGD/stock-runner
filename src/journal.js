@@ -258,6 +258,17 @@ export default class RunJournal {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
             orderResult: prepare(`UPDATE orders SET status = ?, updated_at = ?, exchange_order_id = ?, executed_qty = ?, avg_price = ?, response = ? WHERE id = ?`),
             orderFailed: prepare('UPDATE orders SET status = ?, updated_at = ?, error_code = ?, error = ?, response = ? WHERE id = ?'),
+            pendingOrdersAt: prepare(`SELECT id, ts, symbol, side, quantity, reduce_only,
+                    client_order_id, exchange_order_id, decision_price, created_at, updated_at
+                FROM orders WHERE run_id = ? AND ts = ? AND status = 'pending'
+                ORDER BY id ASC`),
+            answeredOrdersAt: prepare(`SELECT id, ts, symbol, side, quantity, decision_price,
+                    exchange_order_id, executed_qty, avg_price, status
+                FROM orders
+                WHERE run_id = ? AND ts = ? AND status NOT IN ('pending', 'failed', 'skipped')
+                ORDER BY id ASC`),
+            intentsAt: prepare(`SELECT id, symbol, signed_qty, price, held_qty
+                FROM intents WHERE run_id = ? AND ts = ? ORDER BY id ASC`),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
             insertCommand: prepare('INSERT INTO commands (run_id, at, command, note, amount) VALUES (?, ?, ?, ?, ?)'),
             nextCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND id > ? ORDER BY id DESC LIMIT 1'),
@@ -477,6 +488,18 @@ export default class RunJournal {
         const code = err?.code ?? err?.cause?.code;
         const body = err?.body ?? err?.cause?.body;
         this.sql.orderFailed.run('failed', Date.now(), code != null ? String(code) : null, String(err?.message || err), json(body), orderId);
+    }
+
+    pendingOrdersAt(runId, timestamp) {
+        return this.sql.pendingOrdersAt.all(Number(runId), Number(timestamp));
+    }
+
+    answeredOrdersAt(runId, timestamp) {
+        return this.sql.answeredOrdersAt.all(Number(runId), Number(timestamp));
+    }
+
+    intentsAt(runId, timestamp) {
+        return this.sql.intentsAt.all(Number(runId), Number(timestamp));
     }
 
     record(runId, ts, kind, data = {}) {

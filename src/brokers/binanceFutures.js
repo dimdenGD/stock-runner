@@ -458,6 +458,16 @@ export default class BinanceFutures extends Broker {
         return this.withFillPrice(placed);
     }
 
+    orderFailureDisposition(error, { attempt = 1 } = {}) {
+        if (error instanceof BinanceFuturesError) {
+            if (error.status === 429) {
+                return { action: 'retry', delayMs: attempt === 1 ? 500 : 1500 };
+            }
+            if (error.status >= 400 && error.status < 500) return { action: 'reject' };
+        }
+        return { action: 'ambiguous' };
+    }
+
     async withFillPrice(order, { retryDelaysMs = this.fillPriceRetryDelaysMs } = {}) {
         if (!order || typeof order !== 'object') return order;
         if (hasFillPrice(order)) return order;

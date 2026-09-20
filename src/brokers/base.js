@@ -54,6 +54,28 @@ export default class Broker {
         return {};
     }
 
+    /**
+     * Look up an order by the stable venue key created before submission.
+     * Live brokers should return { outcome: 'filled', response, parsed },
+     * { outcome: 'rejected', reason, response }, or { outcome: 'unknown', reason }.
+     */
+    async resolvePendingOrder() {
+        return {
+            outcome: 'unknown',
+            reason: `${this.label} does not support interrupted-order reconciliation`,
+        };
+    }
+
+    /**
+     * Classify a failed placement without embedding venue rules in the runner.
+     * - `retry` means the venue definitely rejected the attempt and that the same client order id may be reused.
+     * - `ambiguous` means it may have traded, so the runner must reconcile.
+     * - `reject` is terminal.
+     */
+    orderFailureDisposition() {
+        return { action: 'ambiguous' };
+    }
+
     async getIncome() {
         return null;
     }
