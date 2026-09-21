@@ -29,6 +29,7 @@ export { splitPositionOrder };
 const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
 
 const UNRECOVERABLE_CODES = new Set([-1022, -2014, -2015]);
+const LEVERAGE_HEADROOM = 3;
 
 function unrecoverable(err) {
     if (err?.fatal) return true;
@@ -139,6 +140,8 @@ export default class ForwardRunner {
         this.lastIncomePoll = 0;
         this.lastPortfolio = null;
         this.lastBatchInfo = {};
+        this.venueLeverage = {};
+        this.leverageChecked = new Set();
         this.currentTimestamp = null;
         this.runId = null;
         this.stopped = false;
@@ -303,6 +306,7 @@ export default class ForwardRunner {
         for (const p of portfolio.positions || []) {
             const mark = Number(p.markPrice);
             if (mark > 0) this.stockPrices[p.symbol] = mark;
+            if (p.leverage > 0) this.venueLeverage[p.symbol] = Number(p.leverage);
         }
 
         this.reconcileShared(portfolio.positions || []);
@@ -584,6 +588,7 @@ export default class ForwardRunner {
                     stats.skipped++;
                     continue;
                 }
+                await this.ensureLeverage(intent.symbol);
                 const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
                 const clientOrderId = this.broker.createClientOrderId({
                     timestamp, symbol: intent.symbol, sequence: sequence++, owner: this.ownTag,
@@ -784,10 +789,10 @@ export default class ForwardRunner {
         this.flushTradeLogs();
 
         if (stats.failed) {
-            this.event('error', 'recovery-partial',
-                `interrupted bar catch-up still has ${stats.failed} failed order(s)`,
+            this.event('warn', 'recovery-partial',
+                `interrupted bar catch-up had ${stats.failed} order(s) the venue rejected; `
+                + 'they are recorded as failed and the bar is closed, as a rejection on any other bar would be',
                 { barTs: timestamp, data: stats });
-            throw new Error(`Interrupted bar catch-up left ${stats.failed} failed order(s)`);
         }
 
         this.writeState({
@@ -1227,6 +1232,40 @@ export default class ForwardRunner {
         } catch (err) {
             this.event('error', 'flatten-failed', err.message, { barTs: timestamp });
             return [];
+        }
+    }
+
+    targetLeverage() {
+        const cap = Number(this.maxLeverage);
+        if (!Number.isFinite(cap) || cap <= 0) return null;
+        return Math.max(1, Math.round(cap * LEVERAGE_HEADROOM));
+    }
+
+    async ensureLeverage(symbol) {
+        if (typeof this.broker.setLeverage !== 'function') return;
+        const target = this.targetLeverage();
+        if (target == null) return;
+        if (this.leverageChecked.has(symbol)) return;
+        this.leverageChecked.add(symbol);
+        const foreign = (this.lastPortfolio?.positions || []).some(
+            (p) => p.symbol === symbol && Number(p.quantity) && !this.ledger.positions[symbol]);
+        if (foreign) return;
+        try {
+            const ceiling = typeof this.broker.maxLeverageFor === 'function'
+                ? await this.broker.maxLeverageFor(symbol)
+                : null;
+            const wanted = Math.max(1, ceiling > 0 ? Math.min(target, ceiling) : target);
+            const current = this.venueLeverage[symbol] ?? null;
+            if (current === wanted) return;
+            await this.broker.setLeverage(symbol, wanted);
+            this.venueLeverage[symbol] = wanted;
+            this.event('info', 'leverage-set',
+                `${symbol} venue leverage ${current ?? 'unknown'}x -> ${wanted}x`,
+                { data: { symbol, from: current, to: wanted, target, ceiling } });
+        } catch (error) {
+            this.logger.warn(`ForwardRunner: could not set ${symbol} leverage: ${error.message}`);
+            this.event('warn', 'leverage-failed', `${symbol} leverage stays as it is: ${error.message}`,
+                { data: { symbol, target, code: error.code ?? null } });
         }
     }
 

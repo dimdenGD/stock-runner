@@ -314,6 +314,29 @@ export default class BinanceFutures extends Broker {
         return this.request('/fapi/v1/positionSide/dual', { signed: true });
     }
 
+    async getLeverageBrackets() {
+        if (this.leverageBrackets) return this.leverageBrackets;
+        const rows = await this.request('/fapi/v1/leverageBracket', { signed: true, weight: 40 });
+        this.leverageBrackets = new Map((rows || []).map((row) => [
+            row.symbol,
+            Math.max(...(row.brackets || []).map((b) => Number(b.initialLeverage) || 1), 1),
+        ]));
+        return this.leverageBrackets;
+    }
+
+    async maxLeverageFor(symbol) {
+        const brackets = await this.getLeverageBrackets();
+        return brackets.get(symbol) ?? null;
+    }
+
+    async setLeverage(symbol, leverage) {
+        const result = await this.request('/fapi/v1/leverage', {
+            method: 'POST', signed: true,
+            params: { symbol, leverage: Math.trunc(leverage) },
+        });
+        return Number(result?.leverage) || Math.trunc(leverage);
+    }
+
     async fetchIncome({ startTime, endTime, limit = 1000 } = {}) {
         return this.request('/fapi/v1/income', { signed: true, params: { startTime, endTime, limit }, weight: 30 });
     }
@@ -358,6 +381,10 @@ export default class BinanceFutures extends Broker {
                 markPrice: Number(position.markPrice),
                 entryPrice: Number(position.entryPrice),
                 unrealizedPnl: Number(position.unRealizedProfit),
+                leverage: Number(position.leverage) || null,
+                marginType: position.marginType ?? null,
+                maxNotionalValue: Number(position.maxNotionalValue) || null,
+                liquidationPrice: Number(position.liquidationPrice) || null,
             })),
         };
     }
