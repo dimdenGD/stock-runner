@@ -111,11 +111,27 @@ export default class CandleCache {
     }
 }
 
-/** Read-only backtest source over the exact candles retained by a forward runner. */
 export class CandleCacheSource {
-    constructor({ directory }) {
+    constructor({ directory, archive = null, logger = null }) {
         this.directory = directory;
+        this.archive = archive;
+        this.logger = logger;
         this.databases = new Map();
+        this.retention = new Map();
+        this.announced = new Set();
+    }
+
+    retained(interval) {
+        if (this.retention.has(interval)) return this.retention.get(interval);
+        const rows = this.database(interval)
+            .prepare('SELECT symbol, MIN(ts) AS first FROM candles GROUP BY symbol').all();
+        const firsts = rows.map((row) => Number(row.first)).filter(Number.isFinite);
+        const retained = {
+            from: firsts.length ? Math.min(...firsts) : null,
+            symbols: new Set(rows.map((row) => row.symbol)),
+        };
+        this.retention.set(interval, retained);
+        return retained;
     }
 
     database(interval) {
@@ -128,11 +144,38 @@ export class CandleCacheSource {
         return db;
     }
 
-    async *streamAllStocksInRange(interval, startDate, endDate) {
+    async *streamAllStocksInRange(interval, startDate, endDate, market = 'crypto') {
+        const start = startDate.getTime();
+        const end = endDate.getTime();
+        const { from, symbols } = this.retained(interval);
+        let cacheStart = start;
+        if (this.archive && from != null && start < from) {
+            const archiveEnd = Math.min(end, from - 1);
+            let yielded = 0;
+            try {
+                const older = this.archive.streamAllStocksInRange(interval, startDate, new Date(archiveEnd), market);
+                for await (const record of older) {
+                    if (!symbols.has(record.stockName)) continue;
+                    yielded++;
+                    yield record;
+                }
+            } catch (error) {
+                if (yielded) throw error;
+                this.logger?.warn?.(`candle cache: archive unavailable before ${new Date(from).toISOString()}; `
+                    + `those bars are replayed without history the runner had: ${error.message}`);
+            }
+            if (yielded && !this.announced.has(interval)) {
+                this.announced.add(interval);
+                this.logger?.log?.(`candle cache: bars before ${new Date(from).toISOString()} were pruned; `
+                    + 'taking them from the archive');
+            }
+            cacheStart = from;
+        }
+        if (end < cacheStart) return;
         const rows = this.database(interval).prepare(
             `SELECT symbol, ts, open, high, low, close, volume, quote_volume
              FROM candles WHERE ts >= ? AND ts <= ? ORDER BY ts ASC, symbol ASC`,
-        ).iterate(startDate.getTime(), endDate.getTime());
+        ).iterate(Math.max(start, cacheStart), end);
         for (const row of rows) {
             yield {
                 stockName: row.symbol,
@@ -141,7 +184,11 @@ export class CandleCacheSource {
         }
     }
 
-    async loadStockBeforeTimestamp(symbol, interval, date, count) {
+    async loadStockBeforeTimestamp(symbol, interval, date, count, market = 'crypto') {
+        const { from } = this.retained(interval);
+        if (this.archive && from != null && date.getTime() < from) {
+            return this.archive.loadStockBeforeTimestamp(symbol, interval, date, count, market);
+        }
         const stock = new Stock(symbol, intervalMsMap[interval]);
         const rows = this.database(interval).prepare(
             `SELECT ts, open, high, low, close, volume, quote_volume

@@ -1260,7 +1260,7 @@ export default class ForwardRunner {
             await this.broker.setLeverage(symbol, wanted);
             this.venueLeverage[symbol] = wanted;
             this.event('info', 'leverage-set',
-                `${symbol} venue leverage ${current ?? 'unknown'}x -> ${wanted}x`,
+                `${symbol} venue leverage ${current == null ? 'not reported' : `${current}x`} -> ${wanted}x`,
                 { data: { symbol, from: current, to: wanted, target, ceiling } });
         } catch (error) {
             this.logger.warn(`ForwardRunner: could not set ${symbol} leverage: ${error.message}`);
