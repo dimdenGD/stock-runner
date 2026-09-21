@@ -566,6 +566,7 @@ export default class ForwardRunner {
         this.unpricedFills = 0;
         const projected = { ...this.stockBalances };
         const maxAttempts = Math.min(3, Math.max(1, Math.trunc(Number(this.maxOrderAttempts) || 1)));
+        const skippedSymbols = [];
         let sequence = 0;
         for (const intent of intents) {
             const current = projected[intent.symbol] || 0;
@@ -578,7 +579,7 @@ export default class ForwardRunner {
                     reduceOnly: leg.reduceOnly, decisionPrice: intent.price,
                 };
                 if (!quantity) {
-                    this.logger.warn(`ForwardRunner: skipped sub-minimum order ${intent.symbol}`);
+                    skippedSymbols.push(intent.symbol);
                     this.journal.orderSkipped(this.runId, timestamp, { ...orderInfo, quantity: Math.abs(leg.signedQty) }, 'below exchange quantity/notional minimum');
                     stats.skipped++;
                     continue;
@@ -691,6 +692,11 @@ export default class ForwardRunner {
                     throw error;
                 }
             }
+        }
+        if (skippedSymbols.length) {
+            const shown = skippedSymbols.slice(0, 12).join(', ');
+            const rest = skippedSymbols.length - 12;
+            this.logger.warn(`ForwardRunner: ${skippedSymbols.length} order(s) below exchange minimum: ${shown}${rest > 0 ? `, +${rest} more` : ''}`);
         }
         if (this.unpricedFills) {
             this.event('warn', 'fill-price-missing',
