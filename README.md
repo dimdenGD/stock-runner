@@ -62,6 +62,24 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
    - Example: `node scripts/massive_ingest.js 1d`
    - `period` can be `1d`, `1h`, `5m`, `1m`
 
+### Alpaca (free with an account, history from 2016)
+
+1. Get API keys from [alpaca.markets](https://alpaca.markets/)
+2. Set `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` in `.env`
+   - Optional: `ALPACA_FEED` (`sip` or `iex`, default `sip`), `ALPACA_RPM` (requests per minute, default `200`), `ALPACA_TRADING_URL` (default paper API)
+3. Run:
+   ```bash
+   node scripts/alpaca_download.js <period> <startDate> <skip downloaded tickers> <adjustment>
+   ```
+   - Example: `node scripts/alpaca_download.js 15m 2023-01-01 true all`
+   - `period` can be `1d`, `1h`, `15m`, `5m`, `1m`
+   - `startDate` defaults to the last timestamp in the table, or `2016-01-01`
+   - `adjustment` can be `raw`, `split`, `dividend`, `all` (default `all`)
+4. Ingest into QuestDB:
+   ```bash
+   node scripts/alpaca_ingest.js <period>
+   ```
+
 ---
 
 ## Running a backtest
@@ -194,7 +212,7 @@ bt.logMetrics(result);
   - Optional third argument: `{ exchangeFeePerShare }`. default `0.003`
 - **`Alpaca`** - Commission-free U.S. equity; regulatory fees only:
   - `new Alpaca(slippage?)`
-  - Commission: $0. Sells: FINRA TAF $0.000195/share (max $9.79, qty cap 50,205). All: CAT $0.0000265/share. Rounded up to nearest penny.
+  - Commission: $0. Sells: SEC $20.60 per $1M, FINRA TAF $0.000195/share (max $9.79). All: CAT $0.000003/share.
   - `slippage` - fraction (e.g. `0.001` = 0.1%), default `0`.
 - **`BinanceFutures`** - USD-M futures. Supports forward testing:
   - `new BinanceFutures({ feeBps, slippage, impactCoef, depthRatio, environment, apiKey, apiSecret })`

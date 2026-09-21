@@ -68,6 +68,19 @@ export async function createTables() {
         DEDUP UPSERT KEYS(timestamp, ticker)
     `;
 
+    await sql`
+        CREATE TABLE IF NOT EXISTS candles_15m (
+            ticker SYMBOL CAPACITY 30000,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume LONG,
+            timestamp TIMESTAMP
+        ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY DAY
+        DEDUP UPSERT KEYS(timestamp, ticker)
+    `;
+
     for (const iv of ['1m', '5m', '15m', '1h', '4h', '1d']) {
         await sql.unsafe(`
             CREATE TABLE IF NOT EXISTS crypto_candles_${iv} (
