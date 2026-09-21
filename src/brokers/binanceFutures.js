@@ -8,6 +8,8 @@ import BinanceKlineStream from './binanceKlineStream.js';
 const PROD_REST = 'https://fapi.binance.com';
 const DEMO_REST = 'https://demo-fapi.binance.com';
 const DEFAULT_FILL_PRICE_RETRY_DELAYS_MS = Object.freeze([0, 50, 150, 400, 1000, 2500, 5000]);
+const DEFAULT_ORDER_FINALIZE_RETRY_DELAYS_MS = Object.freeze([0, 50, 150, 400, 1000, 2500]);
+const OPEN_ORDER_STATUSES = new Set(['NEW', 'PENDING_NEW', 'PARTIALLY_FILLED']);
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const hasFillPrice = (order) => Number(order?.avgPrice) > 0 || Number(order?.cumQuote) > 0;
@@ -458,6 +460,35 @@ export default class BinanceFutures extends Broker {
         return this.withFillPrice(placed);
     }
 
+    async finalizeOrderResult(order, { retryDelaysMs = DEFAULT_ORDER_FINALIZE_RETRY_DELAYS_MS } = {}) {
+        if (!order || typeof order !== 'object') return order;
+        let latest = order;
+        let lastError = null;
+        for (const delay of retryDelaysMs) {
+            const status = String(latest.status || '').toUpperCase();
+            if (!OPEN_ORDER_STATUSES.has(status)) return this.withFillPrice(latest);
+            if (delay > 0) await sleep(delay);
+            try {
+                const found = await this.fetchOrder(usableOrderId(latest.orderId) != null
+                    ? { symbol: latest.symbol, orderId: usableOrderId(latest.orderId) }
+                    : { symbol: latest.symbol, clientOrderId: latest.clientOrderId });
+                latest = { ...latest, ...found };
+                lastError = null;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        const status = String(latest.status || '').toUpperCase() || 'UNKNOWN';
+        if (!OPEN_ORDER_STATUSES.has(status)) return this.withFillPrice(latest);
+        const error = new Error(lastError
+            ? `accepted order did not reach a terminal state: ${lastError.message}`
+            : `accepted order is still ${status}`);
+        error.code = 'ORDER_NOT_FINAL';
+        error.cause = lastError;
+        throw error;
+    }
+
     orderFailureDisposition(error, { attempt = 1 } = {}) {
         if (error instanceof BinanceFuturesError) {
             if (error.status === 429) {
@@ -603,9 +634,21 @@ export default class BinanceFutures extends Broker {
         }
 
         if (found) {
-            const status = String(found.status || '').toUpperCase();
+            let status = String(found.status || '').toUpperCase();
+            if (OPEN_ORDER_STATUSES.has(status)) {
+                try {
+                    found = await this.finalizeOrderResult(found);
+                    status = String(found.status || '').toUpperCase();
+                } catch (error) {
+                    return { outcome: 'unknown', reason: error.message };
+                }
+            }
             if (Number(found.executedQty) > 0) {
-                const priced = await this.withFillPrice({ ...found, status: 'FILLED' });
+                const priced = await this.withFillPrice({
+                    ...found,
+                    venueStatus: status,
+                    status: 'FILLED',
+                });
                 const parsed = this.parseOrderResult(priced);
                 if (!(parsed.avgPrice > 0)) {
                     return { outcome: 'unknown', reason: `${symbol} filled but no price could be read back` };

@@ -591,17 +591,30 @@ export default class ForwardRunner {
                 stats.orders++;
                 let fill;
                 let placed = false;
+                let accepted = false;
                 let placementError = null;
                 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                     try {
                         fill = await this.broker.placeMarketOrder({
                             symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
                         });
+                        accepted = true;
+                        if (typeof this.broker.finalizeOrderResult === 'function') {
+                            fill = await this.broker.finalizeOrderResult(fill, {
+                                symbol: intent.symbol,
+                                side,
+                                quantity: Number(quantity),
+                                reduceOnly: leg.reduceOnly,
+                                clientOrderId,
+                            });
+                        }
                         placed = true;
                         break;
                     } catch (err) {
                         placementError = err;
-                        const disposition = typeof this.broker.orderFailureDisposition === 'function'
+                        const disposition = accepted
+                            ? { action: 'ambiguous' }
+                            : typeof this.broker.orderFailureDisposition === 'function'
                             ? this.broker.orderFailureDisposition(err, {
                                 attempt,
                                 maxAttempts,
@@ -653,11 +666,30 @@ export default class ForwardRunner {
                     continue;
                 }
                 const parsed = this.broker.parseOrderResult(fill) || {};
-                this.journal.orderResult(orderId, parsed, fill);
-                this.recordFill(timestamp, intent, side, Number(quantity), parsed, orderId);
+                const executedQty = Number(parsed.executedQty) > 0
+                    ? Number(parsed.executedQty)
+                    : Number(quantity);
+                const completionTolerance = Math.max(1e-12, Number(quantity) * 1e-9);
+                const partiallyFilled = executedQty + completionTolerance < Number(quantity);
+                const booked = partiallyFilled ? { ...parsed, status: 'filled' } : parsed;
+                this.journal.orderResult(orderId, booked, fill);
+                this.recordFill(timestamp, intent, side, Number(quantity), booked, orderId);
                 fills.push(fill);
                 stats.fills++;
-                projected[intent.symbol] = (projected[intent.symbol] || 0) + signedRounded;
+                projected[intent.symbol] = (projected[intent.symbol] || 0)
+                    + Math.sign(signedRounded) * executedQty;
+                if (partiallyFilled) {
+                    this.event('warn', 'order-partial',
+                        `${intent.symbol} ${side} filled ${executedQty} of ${quantity}; restarting into target reconciliation`,
+                        { barTs: timestamp, data: { clientOrderId, requestedQty: Number(quantity), executedQty } });
+                    const error = new Error(
+                        `${intent.symbol} order only filled ${executedQty} of ${quantity}`,
+                    );
+                    error.code = 'PARTIAL_FILL';
+                    error.fatal = true;
+                    error.restartRunner = true;
+                    throw error;
+                }
             }
         }
         if (this.unpricedFills) {
@@ -784,7 +816,75 @@ export default class ForwardRunner {
         return { journalledFills, recoveredFills, neverPlaced, intents: intents.length, ...stats };
     }
 
-    recordFill(timestamp, intent, side, requestedQty, parsed, orderId = null) {
+    async reconcileUnfinalizedOrders({ interruptedBar = null } = {}) {
+        const rows = this.journal.unfinalizedOrders(this.runId);
+        if (!rows.length) return { repaired: 0, addedQuantity: 0 };
+
+        let repaired = 0;
+        let addedQuantity = 0;
+        for (const row of rows) {
+            const result = await inspectPendingOrder(this.broker, row);
+            if (result.outcome !== 'filled') {
+                const reason = result.error || result.reason || 'the venue result is still ambiguous';
+                this.event('error', 'recovery-blocked',
+                    `cannot safely finalize ${row.symbol} order ${row.id}: ${reason}`,
+                    { barTs: row.ts, data: result });
+                throw new Error(`Unfinalized order ${row.id} could not be reconciled: ${reason}`);
+            }
+
+            const finalQty = Number(result.executedQty);
+            const journalQty = Math.max(0, Number(row.executed_qty) || 0);
+            const markerQty = Number(this.state.reconciledOrderQty?.[row.id]);
+            const wasApplied = (this.state.appliedOrderIds || []).map(Number).includes(Number(row.id));
+            const interrupted = interruptedBar != null && Number(row.ts) === Number(interruptedBar);
+            const previouslyBooked = Number.isFinite(markerQty)
+                ? markerQty
+                : (interrupted && !wasApplied ? 0 : journalQty);
+            const tolerance = 1e-9 * Math.max(1, finalQty, previouslyBooked);
+            if (finalQty + tolerance < previouslyBooked) {
+                throw new Error(
+                    `Venue quantity for order ${row.id} went backwards (${previouslyBooked} to ${finalQty})`,
+                );
+            }
+
+            const delta = Math.max(0, finalQty - previouslyBooked);
+            const reconciledOrderQty = {
+                ...(this.state.reconciledOrderQty || {}),
+                [row.id]: finalQty,
+            };
+            if (delta > tolerance) {
+                const finalPrice = Number(result.avgPrice);
+                const priorPrice = Number(row.avg_price);
+                const deltaPrice = finalQty > journalQty && priorPrice > 0
+                    ? (finalQty * finalPrice - journalQty * priorPrice) / (finalQty - journalQty)
+                    : finalPrice;
+                this.recordFill(
+                    Number(row.ts),
+                    { symbol: row.symbol, price: Number(row.decision_price) || finalPrice },
+                    row.side,
+                    delta,
+                    { executedQty: delta, avgPrice: deltaPrice > 0 ? deltaPrice : finalPrice, status: 'filled' },
+                    row.id,
+                    { reconciledOrderQty, status: this.state.status },
+                );
+                addedQuantity += delta;
+            } else {
+                this.writeState({ reconciledOrderQty });
+            }
+
+            this.journal.orderResult(row.id, { ...result.parsed, status: 'filled' }, result.response);
+            this.event('info', 'order-reconciled',
+                `${row.symbol} order finalized at ${finalQty} of ${row.quantity}; added ${delta} to the owned book`,
+                { barTs: row.ts, data: { orderId: row.id, previousQty: journalQty, finalQty, addedQty: delta } });
+            repaired++;
+        }
+
+        await this.refreshAccount();
+        this.flushTradeLogs();
+        return { repaired, addedQuantity };
+    }
+
+    recordFill(timestamp, intent, side, requestedQty, parsed, orderId = null, statePatch = {}) {
         const quantity = parsed.executedQty > 0 ? Number(parsed.executedQty) : requestedQty;
         const filled = parsed.avgPrice > 0 ? Number(parsed.avgPrice) : null;
         const price = filled ?? intent.price;
@@ -811,6 +911,7 @@ export default class ForwardRunner {
             appliedOrderIds: orderId == null
                 ? appliedOrderIds
                 : [...new Set([...appliedOrderIds.map(Number), Number(orderId)])],
+            ...statePatch,
         });
     }
 
@@ -887,6 +988,7 @@ export default class ForwardRunner {
         await this.broker.initialize();
         await this.refreshSymbols(true);
         await this.refreshAccount();
+        await this.reconcileUnfinalizedOrders({ interruptedBar });
         if (interruptedBar != null) await this.recoverInterruptedBatch(interruptedBar);
         else this.claimExistingPositions();
         this.stream = this.broker.createStream({
@@ -1004,7 +1106,10 @@ export default class ForwardRunner {
             throw new Error(`Saved runner state belongs to run ${this.state.runId ?? 'unknown'}, not ${this.runId}`);
         }
         if (this.adjustments) this.capital = Math.max(0, this.capital + this.adjustments);
-        this.writeState({ runId: this.runId, status: 'resuming' });
+        this.writeState({
+            runId: this.runId,
+            status: this.state.status === 'executing' ? 'executing' : 'resuming',
+        });
     }
 
     async applyCommand({ id, command, note, amount }) {
@@ -1200,11 +1305,11 @@ export default class ForwardRunner {
         let endReason = 'stopped';
         let fatal = null;
         try {
-            if (this.resumeRunId == null) this.resetAllocation();
-            else this.resumeAllocation();
             const interruptedBar = this.resumeRunId != null && this.state.status === 'executing'
                 ? Number(this.state.lastProcessedBar) || null
                 : null;
+            if (this.resumeRunId == null) this.resetAllocation();
+            else this.resumeAllocation();
             const latestWarmup = await this.initialize({ interruptedBar });
             if (this.resumeRunId == null) {
                 this.baseline = this.totalValue();

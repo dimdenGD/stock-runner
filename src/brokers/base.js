@@ -55,6 +55,22 @@ export default class Broker {
     }
 
     /**
+     * Turn the venue's immediate placement response into a terminal result.
+     * Some venues acknowledge a market order while it is still NEW or
+     * PARTIALLY_FILLED. Implementations must either return a result that will
+     * no longer change or throw.
+     */
+    async finalizeOrderResult(result) {
+        const status = String(result?.status || '').toUpperCase();
+        if (['NEW', 'PENDING', 'PENDING_NEW', 'PARTIALLY_FILLED'].includes(status)) {
+            const error = new Error(`${this.label} returned a non-terminal ${status} order result`);
+            error.code = 'ORDER_NOT_FINAL';
+            throw error;
+        }
+        return result;
+    }
+
+    /**
      * Look up an order by the stable venue key created before submission.
      * Live brokers should return { outcome: 'filled', response, parsed },
      * { outcome: 'rejected', reason, response }, or { outcome: 'unknown', reason }.

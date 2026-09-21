@@ -267,6 +267,11 @@ export default class RunJournal {
                 FROM orders
                 WHERE run_id = ? AND ts = ? AND status NOT IN ('pending', 'failed', 'skipped')
                 ORDER BY id ASC`),
+            unfinalizedOrders: prepare(`SELECT id, ts, symbol, side, quantity, decision_price,
+                    client_order_id, exchange_order_id, executed_qty, avg_price, status
+                FROM orders
+                WHERE run_id = ? AND status IN ('accepted', 'new', 'pending_new', 'partially_filled')
+                ORDER BY id ASC`),
             intentsAt: prepare(`SELECT id, symbol, signed_qty, price, held_qty
                 FROM intents WHERE run_id = ? AND ts = ? ORDER BY id ASC`),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -496,6 +501,10 @@ export default class RunJournal {
 
     answeredOrdersAt(runId, timestamp) {
         return this.sql.answeredOrdersAt.all(Number(runId), Number(timestamp));
+    }
+
+    unfinalizedOrders(runId) {
+        return this.sql.unfinalizedOrders.all(Number(runId));
     }
 
     intentsAt(runId, timestamp) {
