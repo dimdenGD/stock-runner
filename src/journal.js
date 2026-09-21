@@ -237,6 +237,7 @@ export default class RunJournal {
                     strategy_version_id = ?
                 WHERE id = ?`),
             endRun: prepare('UPDATE runs SET ended_at = ?, end_reason = ?, error = ? WHERE id = ? AND ended_at IS NULL'),
+            setWindowEnd: prepare('UPDATE runs SET window_end = ? WHERE id = ?'),
             finishRun: prepare('UPDATE runs SET final_equity = ?, metrics = ? WHERE id = ?'),
             baselineEquity: prepare('UPDATE runs SET baseline_equity = ? WHERE id = ? AND baseline_equity IS NULL'),
             adjustCapital: prepare('UPDATE runs SET adjustments = COALESCE(adjustments, 0) + ? WHERE id = ?'),
@@ -421,6 +422,11 @@ export default class RunJournal {
     finishRun(runId, { finalEquity = null, metrics = null } = {}) {
         if (runId == null) return;
         this.sql.finishRun.run(num(finalEquity), json(metrics), runId);
+    }
+
+    setWindowEnd(runId, ts) {
+        if (runId == null || !Number.isFinite(Number(ts))) return;
+        this.sql.setWindowEnd.run(Number(ts), Number(runId));
     }
 
     endRun(runId, reason, error = null) {

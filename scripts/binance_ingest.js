@@ -39,6 +39,8 @@ const symbols = fs.readdirSync(klineDir).sort();
 let candles = 0, funding = 0;
 const started = Date.now();
 for (const [i, sym] of symbols.entries()) {
+    const wasCandles = candles;
+    const wasFunding = funding;
     const fromCandle = lastCandleTs[sym];
     for (const f of zipsIn(`${klineDir}/${sym}`)) {
         if (fromCandle && fileEnd(f) <= fromCandle) continue;
@@ -74,8 +76,16 @@ for (const [i, sym] of symbols.entries()) {
             funding++;
         }
     }
-    console.log(`${sym.padEnd(18)} ${i + 1}/${symbols.length}  ${candles.toLocaleString('en-US')} candles, ${funding.toLocaleString('en-US')} funding rows  (${Math.round((Date.now() - started) / 1000)}s)`);
+    const added = candles - wasCandles;
+    const addedFunding = funding - wasFunding;
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    if (added || addedFunding) {
+        console.log(`${sym.padEnd(18)} ${i + 1}/${symbols.length}  +${added.toLocaleString('en-US')} candles, +${addedFunding.toLocaleString('en-US')} funding  (${elapsed}s)`);
+    } else if ((i + 1) % 200 === 0 || i + 1 === symbols.length) {
+        console.log(`${(`${i + 1}/${symbols.length}`).padEnd(18)} nothing new so far; ${candles.toLocaleString('en-US')} candles, ${funding.toLocaleString('en-US')} funding rows  (${elapsed}s)`);
+    }
 }
+console.log(`Ingested ${candles.toLocaleString('en-US')} candles and ${funding.toLocaleString('en-US')} funding rows from ${symbols.length} symbols`);
 await sender.flush();
 
 const tables = [`crypto_candles_${interval}`, 'crypto_funding'];

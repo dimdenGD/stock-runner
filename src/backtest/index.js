@@ -282,9 +282,20 @@ export default class Backtest {
                 entryPrice: this.positions[symbol]?.avgPrice ?? null,
             }));
         this.journal.batchEnd();
-        this.journal.snapshot(this.runId, +this.endDate, 'end', {
+        const requestedEnd = +this.endDate;
+        const coveredEnd = Number(this.equityCurve.at(-1)?.[0] ?? requestedEnd);
+        const stepMs = intervalMsMap[this.strategy.mainInterval.name] || 0;
+        this.journal.snapshot(this.runId, coveredEnd, 'end', {
             cash: this.cashBalance, equity: this.totalValue(), positions,
         }, this.stockPrices);
+        if (coveredEnd + stepMs < requestedEnd) {
+            this.journal.setWindowEnd(this.runId, coveredEnd);
+            this.journal.event(this.runId, 'warn', 'window-short',
+                `market data ran out at ${new Date(coveredEnd).toISOString()}, `
+                + `${((requestedEnd - coveredEnd) / 3600000).toFixed(1)}h short of the requested `
+                + `${new Date(requestedEnd).toISOString()}`,
+                { data: { requestedEnd, coveredEnd, shortMs: requestedEnd - coveredEnd } });
+        }
         this.journal.finishRun(this.runId, { finalEquity: this.totalValue(), metrics });
         this.journal.endRun(this.runId, error ? 'error' : 'complete', error);
         if (this.ownsJournal) this.journal.close();
