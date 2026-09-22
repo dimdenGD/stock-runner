@@ -144,7 +144,7 @@ export class CandleCacheSource {
         return db;
     }
 
-    async *streamAllStocksInRange(interval, startDate, endDate, market = 'crypto') {
+    async *streamAllStocksInRange(interval, startDate, endDate, market = 'crypto', venue = 'binance') {
         const start = startDate.getTime();
         const end = endDate.getTime();
         const { from, symbols } = this.retained(interval);
@@ -153,7 +153,7 @@ export class CandleCacheSource {
             const archiveEnd = Math.min(end, from - 1);
             let yielded = 0;
             try {
-                const older = this.archive.streamAllStocksInRange(interval, startDate, new Date(archiveEnd), market);
+                const older = this.archive.streamAllStocksInRange(interval, startDate, new Date(archiveEnd), market, venue);
                 for await (const record of older) {
                     if (!symbols.has(record.stockName)) continue;
                     yielded++;
@@ -184,10 +184,10 @@ export class CandleCacheSource {
         }
     }
 
-    async loadStockBeforeTimestamp(symbol, interval, date, count, market = 'crypto') {
+    async loadStockBeforeTimestamp(symbol, interval, date, count, market = 'crypto', venue = 'binance') {
         const { from } = this.retained(interval);
         if (this.archive && from != null && date.getTime() < from) {
-            return this.archive.loadStockBeforeTimestamp(symbol, interval, date, count, market);
+            return this.archive.loadStockBeforeTimestamp(symbol, interval, date, count, market, venue);
         }
         const stock = new Stock(symbol, intervalMsMap[interval]);
         const rows = this.database(interval).prepare(

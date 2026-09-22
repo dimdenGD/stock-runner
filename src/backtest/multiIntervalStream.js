@@ -119,7 +119,7 @@ export async function runAllTickersStream(backtest) {
     let previousMainTimestamp = null;
 
     if (backtest.market === 'crypto') {
-        backtest.fundingEvents = await loadFundingInRange(new Date(rangeStart - 86400000), backtest.endDate);
+        backtest.fundingEvents = await loadFundingInRange(new Date(rangeStart - 86400000), backtest.endDate, backtest.venue);
     }
 
     const fallback = (stockName, intervalName, timestamp, count) => {
@@ -131,6 +131,7 @@ export async function runAllTickersStream(backtest) {
             new Date(timestamp),
             count * 2,
             backtest.market,
+            backtest.venue,
         ).then(stock => stock.size < count ? null : [...stock].slice(0, count));
         fallbackCache.set(key, pending);
         if (fallbackCache.size > 10000) fallbackCache.delete(fallbackCache.keys().next().value);
@@ -238,6 +239,7 @@ export async function runAllTickersStream(backtest) {
                 queryStart,
                 new Date(chunkEndExclusive - 1),
                 backtest.market,
+                backtest.venue,
             ));
         }
         await Promise.all(Object.values(readers).map(reader => reader.prime()));

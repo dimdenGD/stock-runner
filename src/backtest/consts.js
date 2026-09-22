@@ -11,6 +11,21 @@ export const prefetchFactor = 10;
 
 export const markets = ['stocks', 'crypto'];
 
-export function candleTable(market, interval) {
-    return market === 'crypto' ? `crypto_candles_${interval}` : `candles_${interval}`;
+export const venues = {
+    binance: { candles: 'crypto_candles', funding: 'crypto_funding' },
+    hyperliquid: { candles: 'hl_candles', funding: 'hl_funding' },
+};
+
+export function venueTables(venue = 'binance') {
+    const v = venues[venue];
+    if (!v) throw new TypeError(`venue must be one of: ${Object.keys(venues).join(', ')}`);
+    return v;
+}
+
+export function candleTable(market, interval, venue = 'binance') {
+    return market === 'crypto' ? `${venueTables(venue).candles}_${interval}` : `candles_${interval}`;
+}
+
+export function fundingTable(venue = 'binance') {
+    return venueTables(venue).funding;
 }

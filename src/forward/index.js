@@ -280,8 +280,9 @@ export default class ForwardRunner {
         }
         let mine = 0;
         for (const row of rows) {
-            if (row.incomeType && row.incomeType !== 'FUNDING_FEE') continue;
-            const amount = Number(row.income);
+            const type = row.type ?? row.incomeType;
+            if (type && type !== 'FUNDING_FEE') continue;
+            const amount = Number(row.amount ?? row.income);
             const symbol = row.symbol;
             if (!Number.isFinite(amount) || !symbol) continue;
             const own = Math.abs(Number(this.ledger.positions[symbol]?.quantity) || 0);

@@ -1,15 +1,16 @@
 import { intervalMsMap, prefetchFactor } from './consts.js';
 import { loadStockAfterTimestamp } from './loader.js';
 
-async function fetchCandlesAfter(stockName, interval, startDate, count, market) {
-    const stock = await loadStockAfterTimestamp(stockName, interval, startDate, count, market);
+async function fetchCandlesAfter(stockName, interval, startDate, count, market, venue) {
+    const stock = await loadStockAfterTimestamp(stockName, interval, startDate, count, market, venue);
     return [...stock];
 }
 
 export default class CandleBuffer {
-    constructor(stockName, interval, startDate, endDate, lookback, prefetch, market = 'stocks') {
+    constructor(stockName, interval, startDate, endDate, lookback, prefetch, market = 'stocks', venue = 'binance') {
         this.stockName = stockName;
         this.market = market;
+        this.venue = venue;
         this.interval = interval;
         this.startDate = startDate;
         this.endDate = endDate;
@@ -33,6 +34,7 @@ export default class CandleBuffer {
             this.nextTs,
             this.prefetch,
             this.market,
+            this.venue,
         );
         if (chunk.length === 0) {
             this.done = true;

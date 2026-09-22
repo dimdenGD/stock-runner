@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Sender } from "@questdb/nodejs-client";
+import { venues } from './backtest/consts.js';
 import postgres from 'postgres';
 
 const USERNAME = process.env.QUESTDB_USERNAME || 'admin';
@@ -81,9 +82,9 @@ export async function createTables() {
         DEDUP UPSERT KEYS(timestamp, ticker)
     `;
 
-    for (const iv of ['1m', '5m', '15m', '1h', '4h', '1d']) {
+    for (const { candles } of Object.values(venues)) for (const iv of ['1m', '5m', '15m', '1h', '4h', '1d']) {
         await sql.unsafe(`
-            CREATE TABLE IF NOT EXISTS crypto_candles_${iv} (
+            CREATE TABLE IF NOT EXISTS ${candles}_${iv} (
                 ticker SYMBOL CAPACITY 30000,
                 open DOUBLE,
                 high DOUBLE,
@@ -97,15 +98,17 @@ export async function createTables() {
         `);
     }
 
-    await sql`
-        CREATE TABLE IF NOT EXISTS crypto_funding (
-            ticker SYMBOL CAPACITY 30000,
-            rate DOUBLE,
-            interval_hours INT,
-            timestamp TIMESTAMP
-        ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY MONTH
-        DEDUP UPSERT KEYS(timestamp, ticker)
-    `;
+    for (const { funding } of Object.values(venues)) {
+        await sql.unsafe(`
+            CREATE TABLE IF NOT EXISTS ${funding} (
+                ticker SYMBOL CAPACITY 30000,
+                rate DOUBLE,
+                interval_hours INT,
+                timestamp TIMESTAMP
+            ), INDEX(ticker) TIMESTAMP(timestamp) PARTITION BY MONTH
+            DEDUP UPSERT KEYS(timestamp, ticker)
+        `);
+    }
 }
 
 export const sender = Sender.fromConfig(`http::addr=${HOST}:9000;username=${USERNAME};password=${PASSWORD};auto_flush_rows=1000;auto_flush_interval=3000;`)

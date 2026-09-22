@@ -9,6 +9,8 @@
   "description": "",
   "dependencies": {
     "@js-temporal/polyfill": "^0.5.1",
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0",
     "@questdb/nodejs-client": "^3.0.0",
     "aws-sdk": "^2.1692.0",
     "date-fns": "^4.1.0",

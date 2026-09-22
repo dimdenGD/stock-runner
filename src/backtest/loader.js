@@ -1,6 +1,6 @@
 import Stock from './stock.js';
 import { sql } from '../db.js';
-import { allowedIntervals, intervalMsMap, candleTable } from './consts.js';
+import { allowedIntervals, intervalMsMap, candleTable, fundingTable } from './consts.js';
 import Candle from './candle.js';
 import http from 'http';
 import { StringDecoder } from 'node:string_decoder';
@@ -122,7 +122,7 @@ async function* fastFetch(
  * @returns {Promise<Stock>} The loaded stock.
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
-export async function loadStockInRange(stockName, interval, startDate, endDate, market = 'stocks') {
+export async function loadStockInRange(stockName, interval, startDate, endDate, market = 'stocks', venue = 'binance') {
     if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
@@ -132,7 +132,7 @@ export async function loadStockInRange(stockName, interval, startDate, endDate, 
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const candle of candles) {
         pushRow(stock, candle, market);
     }
@@ -150,7 +150,7 @@ export async function loadStockInRange(stockName, interval, startDate, endDate, 
  * @returns {Promise<Stock>} The loaded stock.
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
-export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount, market = 'stocks') {
+export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount, market = 'stocks', venue = 'binance') {
     if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
@@ -166,7 +166,7 @@ export async function loadStockAfterTimestamp(stockName, interval, date, candles
 
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
     for await (const candle of candles) {
         pushRow(stock, candle, market);
     }
@@ -276,7 +276,7 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
  * @returns {Promise<Stock>} The loaded stock.
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
-export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount, market = 'stocks') {
+export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount, market = 'stocks', venue = 'binance') {
     if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
@@ -287,7 +287,7 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
     const intervalMs = intervalMsMap[interval];
     const stock = new Stock(stockName, intervalMs);
     let aboveTimestamp = startDate(interval, date, candlesCount, market).getTime();
-    const q = `SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE ticker = '${stockName}' AND timestamp <= ${date.getTime() * 1000} AND timestamp >= ${aboveTimestamp * 1000} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
+    const q = `SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp <= ${date.getTime() * 1000} AND timestamp >= ${aboveTimestamp * 1000} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
     const candles = fastFetch(q);
     const start = Date.now();
     for await (const candle of candles) {
@@ -306,7 +306,7 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
  * @returns {Promise<Object<string, Stock>>} The loaded stocks.
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
-export async function loadAllStocksInRange(interval, startDate, endDate, market = 'stocks') {
+export async function loadAllStocksInRange(interval, startDate, endDate, market = 'stocks', venue = 'binance') {
     if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
@@ -317,7 +317,7 @@ export async function loadAllStocksInRange(interval, startDate, endDate, market 
     const intervalMs = intervalMsMap[interval];
     const stocks = {};
 
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const candle of candles) {
         const stockName = candle[0];
         if (!stocks[stockName]) {
@@ -335,7 +335,7 @@ export async function loadAllStocksInRange(interval, startDate, endDate, market 
 /**
  * Streams all candles in timestamp order without materializing per-symbol columns.
  */
-export async function* streamAllStocksInRange(interval, startDate, endDate, market = 'stocks') {
+export async function* streamAllStocksInRange(interval, startDate, endDate, market = 'stocks', venue = 'binance') {
     if (!allowedIntervals.includes(interval)) {
         throw new TypeError(`Invalid interval: ${interval}`);
     }
@@ -343,7 +343,7 @@ export async function* streamAllStocksInRange(interval, startDate, endDate, mark
         throw new TypeError('startDate and endDate must be instances of Date');
     }
 
-    const rows = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    const rows = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const row of rows) {
         yield { stockName: row[0], candle: rowToCandle(row, market) };
     }
@@ -353,14 +353,14 @@ export async function* streamAllStocksInRange(interval, startDate, endDate, mark
  * Gets the names of all stocks in the database.
  * @returns {Promise<string[]>} The names of all stocks.
  */
-export async function getStockNames(market = 'stocks', interval = '1d') {
-    const stocks = await sql`SELECT DISTINCT ticker FROM ${sql(candleTable(market, interval))}`;
+export async function getStockNames(market = 'stocks', interval = '1d', venue = 'binance') {
+    const stocks = await sql`SELECT DISTINCT ticker FROM ${sql(candleTable(market, interval, venue))}`;
     return stocks.map(stock => stock.ticker);
 }
 
-export async function loadFundingInRange(startDate, endDate) {
+export async function loadFundingInRange(startDate, endDate, venue = 'binance') {
     const out = {};
-    const rows = fastFetch(`SELECT ticker, rate, timestamp FROM crypto_funding WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
+    const rows = fastFetch(`SELECT ticker, rate, timestamp FROM ${fundingTable(venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
     for await (const row of rows) {
         const e = out[row[0]] ??= { time: [], rate: [] };
         e.time.push(Math.floor(new Date(row[2]).getTime() / 1000) * 1000);

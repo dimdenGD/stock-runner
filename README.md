@@ -43,6 +43,22 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
    node scripts/binance_ingest.js <interval>
    ```
 
+### Hyperliquid (free, crypto perps)
+
+The API serves only the latest 5000 candles per interval (4h ≈ 2.3 years, 1h ≈ 7 months, 15m ≈ 52 days).
+
+1. Download candles and hourly funding into `data/hyperliquid/`:
+   ```bash
+   node scripts/hyperliquid_download.js <interval> [--coins=BTC,ETH] [--hip3] [--no-funding] [--funding-from=YYYY-MM]
+   ```
+   - Example: `node scripts/hyperliquid_download.js 4h`
+   - `--hip3` adds builder-dex markets (tickers like `xyz:TSLA`).
+   - Funding starts at each coin's first stored candle unless `--funding-from` is set.
+2. Ingest into QuestDB (`hl_candles_<interval>` and `hl_funding`):
+   ```bash
+   node scripts/hyperliquid_ingest.js <interval>
+   ```
+
 ### Massive (paid)
 
 1. Get API key from [massive.com](https://massive.com/)
@@ -151,6 +167,7 @@ bt.logMetrics(result);
 **Crypto options:**
 
 - **`market`** - `'stocks'` or `'crypto'`. Crypto enables 24/7 trading. Default: `broker.market`.
+- **`venue`** - Crypto data source: `'binance'` or `'hyperliquid'`.
 - **`allowShort`** - Override shorting. Default: `true` for crypto, `false` for stocks.
 - **`maxLeverage`** - Maximum gross exposure / equity.
 
@@ -224,6 +241,14 @@ bt.logMetrics(result);
   - `apiKey`, `apiSecret` - needed for forward testing.
   - `strictQuantization` - throw instead of passing the order through when a symbol has no rules, default `false`.
   - `quantize` floors to `MARKET_LOT_SIZE`/`LOT_SIZE` step and rejects below `minQty` or `MIN_NOTIONAL`
+- **`Hyperliquid`** - Perps on Hyperliquid. Supports forward testing:
+  - `new Hyperliquid({ feeBps, slippage, impactCoef, depthRatio, environment, privateKey, accountAddress, vaultAddress })`
+  - `feeBps` - default `4.5`.
+  - `slippage`, `impactCoef`, `depthRatio` - as `BinanceFutures`; `depthRatio` default `0.25`.
+  - `environment` - `testnet` (default) or `mainnet`.
+  - `privateKey` - API wallet key, needed for orders.
+  - `marketSlippage` - IOC limit offset from mid for market orders, default `0.05`.
+  - `quantize` floors to `szDecimals` and rejects orders under $10 unless reduce-only.
 
 ### ForwardRunner
 

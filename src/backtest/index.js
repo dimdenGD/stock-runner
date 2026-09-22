@@ -5,7 +5,7 @@ import RunJournal from '../journal.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadFundingInRange } from './loader.js';
-import { intervalMsMap, markets } from './consts.js';
+import { intervalMsMap, markets, venueTables } from './consts.js';
 import chalk from 'chalk';
 import { formatSwapLine, formatTradeLine } from './logFormat.js';
 import { runAllTickersStream } from './multiIntervalStream.js';
@@ -66,7 +66,7 @@ export default class Backtest {
      * @param {Date}   params.endDate             – Backtest end
      * @param {number} params.capital             – Starting cash balance
      */
-    constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, allowShort, maxLeverage,
+    constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, venue, allowShort, maxLeverage,
         journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily',
         journalRecords = 'summary', strategySourcePath = null,
         candleSource = null }) {
@@ -116,6 +116,8 @@ export default class Backtest {
             throw new TypeError(`market must be one of: ${markets.join(', ')}`);
         }
         this.market = market;
+        this.venue = venue ?? broker.venue ?? 'binance';
+        venueTables(this.venue);
         this.allowShort = allowShort ?? market === 'crypto';
         this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : null);
         this.positions = {};      // stockName -> { avgPrice, entryFees }
@@ -153,7 +155,7 @@ export default class Backtest {
         // Initialize every declared interval so getCandles has the same behavior for each one.
         for(let iv in this.strategy.intervals) {
             const interval = this.strategy.intervals[iv];
-            buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.warmupStart, this.endDate, interval.count, oneStockChunkBars[interval.name], this.market);
+            buffers[interval.name] = new CandleBuffer(stockName, interval.name, this.warmupStart, this.endDate, interval.count, oneStockChunkBars[interval.name], this.market, this.venue);
         }
         // Load the initial chunks.
         await Promise.all(
@@ -174,7 +176,7 @@ export default class Backtest {
         };
 
         if (this.market === 'crypto') {
-            this.fundingEvents = await loadFundingInRange(new Date(this.warmupStart.getTime() - 86400000), this.endDate);
+            this.fundingEvents = await loadFundingInRange(new Date(this.warmupStart.getTime() - 86400000), this.endDate, this.venue);
         }
         let prevTs = null;
 
