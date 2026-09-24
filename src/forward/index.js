@@ -1145,6 +1145,7 @@ export default class ForwardRunner {
             this.capital = Math.max(0, this.capital + delta);
             const applied = this.capital - before;
             this.adjustments += applied;
+            if (this.dayOpenEquity > 0) this.dayOpenEquity = Math.max(0, this.dayOpenEquity + applied);
             this.journal.adjustCapital(this.runId, applied);
             this.journal.record(this.runId, now, 'allocation', {
                 value: applied, from: before, to: this.capital, note: note || '',
