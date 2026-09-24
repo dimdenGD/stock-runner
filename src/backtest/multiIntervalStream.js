@@ -224,6 +224,7 @@ export async function runAllTickersStream(backtest) {
             }
         }
 
+        if (!backtest.isWarmup) backtest.applyAllocations(timestamp);
         await backtest.strategy.onTick({ currentDate, ctx: backtest, stocks });
         if (!backtest.isWarmup) backtest.recordEquity(currentDate, backtest.totalValue(), backtest.cashBalance);
     };

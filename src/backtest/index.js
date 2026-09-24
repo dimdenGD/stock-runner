@@ -34,6 +34,14 @@ const oneStockChunkBars = {
     '1m': 10000,
 }
 
+function normalizeAllocations(allocations) {
+    if (!Array.isArray(allocations)) return [];
+    return allocations
+        .map(entry => ({ ts: Number(entry?.ts), amount: Number(entry?.amount) }))
+        .filter(entry => Number.isFinite(entry.ts) && Number.isFinite(entry.amount) && entry.amount !== 0)
+        .sort((a, b) => a.ts - b.ts);
+}
+
 function pearsonCorrelation(xs, ys) {
     const n = xs.length;
     if (n < 2) return null;
@@ -69,7 +77,7 @@ export default class Backtest {
     constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, venue, allowShort, maxLeverage,
         journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily',
         journalRecords = 'summary', strategySourcePath = null,
-        candleSource = null }) {
+        candleSource = null, allocations = [] }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -91,6 +99,10 @@ export default class Backtest {
 
         this.capital = capital;
         this.cashBalance = capital;
+        this.allocations = normalizeAllocations(allocations);
+        this.allocationIndex = 0;
+        this.adjustments = 0;
+        this.deposits = new Map();
         this.stockBalances = {};
         this.holdSince = {};
         this.stockPrices = {};
@@ -199,6 +211,7 @@ export default class Backtest {
                 this.applyFunding(prevTs ?? ts, ts);
                 prevTs = ts;
             }
+            if (!this.isWarmup) this.applyAllocations(ts);
 
             const tickObj = {
                 stockName,
@@ -337,6 +350,43 @@ export default class Backtest {
         if (this.journalRecords === 'summary' && typeof data?.symbol === 'string') return;
         this.journal.record(this.runId, +this.currentTimestamp, kind, data);
         this.journal.batchStep();
+    }
+
+    applyAllocations(timestamp) {
+        const at = +timestamp;
+        let applied = 0;
+        while (this.allocationIndex < this.allocations.length
+            && this.allocations[this.allocationIndex].ts <= at) {
+            const { amount } = this.allocations[this.allocationIndex++];
+            const delta = Math.max(amount, -(this.capital + this.adjustments));
+            if (!delta) continue;
+            this.cashBalance += delta;
+            this.adjustments += delta;
+            applied += delta;
+            this._invalidateValuation();
+            if (this.journal && this.runId != null) {
+                this.journal.adjustCapital(this.runId, delta);
+                this.journal.record(this.runId, at, 'allocation', {
+                    value: delta, to: this.capital + this.adjustments,
+                });
+            }
+        }
+        if (applied) this.deposits.set(at, (this.deposits.get(at) ?? 0) + applied);
+        return applied;
+    }
+
+    invested() {
+        return this.capital + this.adjustments;
+    }
+
+    performanceSeries() {
+        if (!this.deposits.size) return this.equityCurve.map(point => point[1]);
+        let factor = 1;
+        return this.equityCurve.map(([ts, equity]) => {
+            const deposit = this.deposits.get(+ts) ?? 0;
+            if (deposit && equity) factor *= (equity - deposit) / equity;
+            return equity * factor;
+        });
     }
 
     _invalidateValuation() {
@@ -563,7 +613,7 @@ export default class Backtest {
         }
 
         /* ---------- equity series & simple returns ---------------------- */
-        const series = this.equityCurve.map(e => e[1]);
+        const series = this.performanceSeries();
 
         const periodRets = [];
         for (let i = 1; i < series.length; i++) {
@@ -572,10 +622,10 @@ export default class Backtest {
 
         const dayCloses = [[null, this.capital]];
         let lastDay = null;
-        for (const [ts, equity] of this.equityCurve) {
-            const day = new Date(ts).toISOString().slice(0, 10);
-            if (day === lastDay) dayCloses[dayCloses.length - 1][1] = equity;
-            else { dayCloses.push([day, equity]); lastDay = day; }
+        for (let i = 0; i < series.length; i++) {
+            const day = new Date(this.equityCurve[i][0]).toISOString().slice(0, 10);
+            if (day === lastDay) dayCloses[dayCloses.length - 1][1] = series[i];
+            else { dayCloses.push([day, series[i]]); lastDay = day; }
         }
         const dailyRets = [];
         for (let i = 1; i < dayCloses.length; i++) {
@@ -647,6 +697,7 @@ export default class Backtest {
             trades        : this.trades.length,
             totalFees     : this.totalFees,
             totalReturn,
+            netDeposits   : this.adjustments,
             avgDaily,
             geoDaily,
             dailyWinRate,
@@ -679,7 +730,8 @@ export default class Backtest {
             const funding = Math.round(Math.abs(this.totalFunding)).toLocaleString('en-US');
             console.log(`Funding           : ${this.totalFunding <= 0 ? chalk.greenBright(`received $${funding}`) : chalk.redBright(`paid $${funding}`)}`);
         }
-        console.log(`Total USD return  : ${m.totalReturn > 0 ? chalk.greenBright('+$' + (Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US'))} ($${this.capital.toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})`);
+        const usdReturn = Math.round(this.totalValue() - this.invested());
+        console.log(`Total USD return  : ${usdReturn > 0 ? chalk.greenBright('+$' + usdReturn.toLocaleString('en-US')) : chalk.redBright('-$' + Math.abs(usdReturn).toLocaleString('en-US'))} ($${Math.round(this.invested()).toLocaleString('en-US')} → $${Math.round(this.totalValue()).toLocaleString('en-US')})${this.adjustments ? chalk.gray(` including $${Math.round(this.adjustments).toLocaleString('en-US')} added to the allocation`) : ''}`);
         console.log(`Total % return    : ${m.totalReturn > 0 ? chalk.greenBright('+' + (m.totalReturn * 100).toFixed(2) + '%') : chalk.redBright('' + (m.totalReturn * 100).toFixed(2) + '%')}`);
         const pctColor = (v, d) => (v > 0 ? chalk.greenBright('+' + (v * 100).toFixed(d) + '%') : chalk.redBright('' + (v * 100).toFixed(d) + '%'));
         console.log(`Avg daily return  : ${pctColor(m.avgDaily, 3)}  (geo ${(m.geoDaily * 100).toFixed(3)}%, ${(m.dailyWinRate * 100).toFixed(1)}% of ${m.days} days up)`);
@@ -942,7 +994,7 @@ ${navHtml}
 <tr><td>Period</td><td>${this.startDate.toISOString().slice(0, 10)} → ${this.endDate.toISOString().slice(0, 10)}</td></tr>
 <tr><td>Trades</td><td>${this.trades.length} (win-rate ${winRate}%) / ${this.swaps.length} swaps</td></tr>
 <tr><td>Fees</td><td>$${Math.round(this.totalFees).toLocaleString('en-US')}</td></tr>
-<tr><td>Total USD return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : '-'}$${Math.abs(Math.round(m.totalReturn * this.capital)).toLocaleString('en-US')} ($${this.capital.toLocaleString('en-US')} → $${finalEquity.toLocaleString('en-US')})</td></tr>
+<tr><td>Total USD return</td><td style="color:${retColor(finalEquity - this.invested())}">${finalEquity >= this.invested() ? '+' : '-'}$${Math.abs(Math.round(finalEquity - this.invested())).toLocaleString('en-US')} ($${Math.round(this.invested()).toLocaleString('en-US')} → $${finalEquity.toLocaleString('en-US')})</td></tr>
 <tr><td>Total % return</td><td style="color:${retColor(m.totalReturn)}">${m.totalReturn >= 0 ? '+' : ''}${(m.totalReturn * 100).toFixed(2)}%</td></tr>
 <tr><td>Avg daily return</td><td style="color:${retColor(m.avgDaily)}">${m.avgDaily >= 0 ? '+' : ''}${(m.avgDaily * 100).toFixed(3)}% (geo ${(m.geoDaily * 100).toFixed(3)}%, ${(m.dailyWinRate * 100).toFixed(1)}% of ${m.days} days up)</td></tr>
 <tr><td>CAGR (Annualized)</td><td style="color:${retColor(m.CAGR)}">${m.CAGR >= 0 ? '+' : ''}${(m.CAGR * 100).toFixed(1)}%</td></tr>
