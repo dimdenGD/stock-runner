@@ -424,7 +424,7 @@ export default class BinanceFutures extends Broker {
     }
 
     splitMaxQty(symbol, signedQty) {
-        const max = this.symbolRules.get(symbol)?.maxQty;
+        const max = this.symbolRules?.get(symbol)?.maxQty;
         if (!(max > 0 && max < Infinity) || Math.abs(signedQty) <= max) return [signedQty];
         const n = Math.ceil(Math.abs(signedQty) / max);
         const sign = Math.sign(signedQty);

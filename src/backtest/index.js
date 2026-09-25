@@ -502,7 +502,7 @@ export default class Backtest {
             const requested = signedQty;
             let accepted = 0;
             for (const leg of splitPositionOrder(prev, requested)) {
-                for (const part of this.broker.splitMaxQty(stockName, leg.signedQty)) {
+                for (const part of this.broker.splitMaxQty?.(stockName, leg.signedQty) ?? [leg.signedQty]) {
                     accepted += this.broker.quantize(stockName, part, price, { reduceOnly: leg.reduceOnly }) || 0;
                 }
             }

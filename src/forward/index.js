@@ -577,7 +577,7 @@ export default class ForwardRunner {
             const current = projected[intent.symbol] || 0;
             for (const leg of splitPositionOrder(current, intent.signedQty).map(
                 (l) => (forceReduceOnly ? { ...l, reduceOnly: true } : l))
-                .flatMap((l) => this.broker.splitMaxQty(intent.symbol, l.signedQty).map((q) => ({ ...l, signedQty: q })))) {
+                .flatMap((l) => (this.broker.splitMaxQty?.(intent.symbol, l.signedQty) ?? [l.signedQty]).map((q) => ({ ...l, signedQty: q })))) {
                 const quantity = this.broker.normalizeQuantity(intent.symbol, leg.signedQty, intent.price, { reduceOnly: leg.reduceOnly });
                 const side = leg.signedQty > 0 ? 'buy' : 'sell';
                 const orderInfo = {
