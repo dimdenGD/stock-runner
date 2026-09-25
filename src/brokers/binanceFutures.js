@@ -423,6 +423,14 @@ export default class BinanceFutures extends Broker {
         return Math.sign(signedQty) * rounded;
     }
 
+    splitMaxQty(symbol, signedQty) {
+        const max = this.symbolRules.get(symbol)?.maxQty;
+        if (!(max > 0 && max < Infinity) || Math.abs(signedQty) <= max) return [signedQty];
+        const n = Math.ceil(Math.abs(signedQty) / max);
+        const sign = Math.sign(signedQty);
+        return Array.from({ length: n }, (_, i) => sign * (i < n - 1 ? max : Math.abs(signedQty) - max * (n - 1)));
+    }
+
     normalizeQuantity(symbol, quantity, price, { reduceOnly = false } = {}) {
         if (!this.symbolRules.has(symbol)) throw new Error(`No Binance Futures exchange rules for ${symbol}`);
         const signed = this.quantize(symbol, quantity, price, { reduceOnly });

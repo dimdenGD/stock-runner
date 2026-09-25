@@ -37,6 +37,10 @@ export default class Broker {
         return signedQty;
     }
 
+    splitMaxQty(symbol, signedQty) {
+        return [signedQty];
+    }
+
     missingForwardMethods() {
         return FORWARD_METHODS.filter(method => typeof this[method] !== 'function');
     }

@@ -217,6 +217,7 @@ bt.logMetrics(result);
 
 - **`Broker`** (base) - No fees, override `calculateFees(quantity, price, side)` for custom logic.
   - `quantize(symbol, signedQty, price, { reduceOnly })` - Returns the signed quantity the venue would accept, or `0` to reject.
+  - `splitMaxQty(symbol, signedQty)` - Splits an order into venue-sized parts.
   - `prepareBacktest()` - Awaited once before a backtest runs.
   - `executionPrice(quantity, price, side, candle)` - Modelled fill price
   - `tradingMode` - `'live'` or `'demo'`
