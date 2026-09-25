@@ -1083,12 +1083,12 @@ export default class ForwardRunner {
         if (!this.runId) return null;
         const row = this.journal.nextCommand(this.runId, this.lastCommandId);
         if (!row) return null;
-        if (!['pause', 'resume', 'stop'].includes(row.command)) {
+        if (!['pause', 'resume', 'stop', 'adjust'].includes(row.command)) {
             this.journal.ackCommands(this.runId, row.id);
             this.lastCommandId = row.id;
             return null;
         }
-        return { id: row.id, command: row.command, note: row.note || '' };
+        return { id: row.id, command: row.command, note: row.note || '', amount: row.amount ?? null };
     }
 
     resetAllocation() {
