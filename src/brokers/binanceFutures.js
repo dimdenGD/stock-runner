@@ -761,4 +761,22 @@ export default class BinanceFutures extends Broker {
             tradeId: row.tradeId || null,
         }));
     }
+
+    async getFundingRates(symbol, { startTime, endTime = this.now() } = {}) {
+        const out = [];
+        let from = startTime;
+        for (let page = 0; page < 100; page++) {
+            const rows = await this.request('/fapi/v1/fundingRate', { params: { symbol, startTime: from, endTime, limit: 1000 } });
+            if (!Array.isArray(rows) || !rows.length) break;
+            out.push(...rows);
+            const last = Number(rows.at(-1).fundingTime);
+            if (rows.length < 1000 || !(last >= from)) break;
+            from = last + 1;
+        }
+        return out.map(row => ({
+            time: Number(row.fundingTime),
+            rate: Number(row.fundingRate),
+            markPrice: Number(row.markPrice) || null,
+        }));
+    }
 }

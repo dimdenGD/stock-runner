@@ -277,7 +277,7 @@ export default class RunJournal {
                 FROM intents WHERE run_id = ? AND ts = ? ORDER BY id ASC`),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
             insertCommand: prepare('INSERT INTO commands (run_id, at, command, note, amount) VALUES (?, ?, ?, ?, ?)'),
-            nextCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND id > ? ORDER BY id DESC LIMIT 1'),
+            nextCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND id > ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             ackCommands: prepare('UPDATE commands SET acted_at = ? WHERE run_id = ? AND id <= ? AND acted_at IS NULL'),
             pendingCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             lastIncome: prepare('SELECT MAX(time) AS time FROM income WHERE account = ?'),

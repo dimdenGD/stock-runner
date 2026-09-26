@@ -469,4 +469,18 @@ export default class Hyperliquid extends Broker {
             tradeId: null,
         }));
     }
+
+    async getFundingRates(symbol, { startTime, endTime = this.now() } = {}) {
+        const out = [];
+        let from = startTime;
+        for (let page = 0; page < 100; page++) {
+            const rows = await this.info({ type: 'fundingHistory', coin: symbol, startTime: from, endTime }, 20 + 25);
+            if (!Array.isArray(rows) || !rows.length) break;
+            out.push(...rows);
+            const last = Number(rows.at(-1).time);
+            if (rows.length < 500 || !(last >= from)) break;
+            from = last + 1;
+        }
+        return out.map(row => ({ time: Number(row.time), rate: Number(row.fundingRate), markPrice: null }));
+    }
 }

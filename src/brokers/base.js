@@ -101,6 +101,10 @@ export default class Broker {
         return null;
     }
 
+    async getFundingRates() {
+        return null;
+    }
+
     async excludedSymbols() {
         return new Set();
     }

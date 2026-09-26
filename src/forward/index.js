@@ -28,8 +28,18 @@ export { splitPositionOrder };
 
 const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
 
+const SETTLEMENT_SLACK_MS = 60000;
 const UNRECOVERABLE_CODES = new Set([-1022, -2014, -2015]);
 const LEVERAGE_HEADROOM = 3;
+
+function heldAt(log, time) {
+    let qty = 0;
+    for (const [ts, q] of log) {
+        if (ts > time - SETTLEMENT_SLACK_MS) break;
+        qty = q;
+    }
+    return qty;
+}
 
 const sameCandle = (a, b) => a.open === b.open && a.high === b.high && a.low === b.low
     && a.close === b.close && a.volume === b.volume && a.quoteVolume === b.quoteVolume;
@@ -166,6 +176,8 @@ export default class ForwardRunner {
         this.unpricedFills = 0;
         this.driftWarned = false;
         this.adjustments = Number(this.state.adjustments) || 0;
+        this.funding = this.state.funding ?? null;
+        if (this.tracksFunding()) this.fundingBook();
         this.resumeRunId = Number.isInteger(Number(resumeRunId)) && Number(resumeRunId) > 0
             ? Number(resumeRunId)
             : null;
@@ -185,6 +197,7 @@ export default class ForwardRunner {
 
     writeState(patch) {
         this.state = { ...this.state, ...patch, updatedAt: new Date().toISOString() };
+        if (this.funding) this.state.funding = this.funding;
         mkdirSync(dirname(this.stateFile), { recursive: true });
         const tmp = `${this.stateFile}.tmp`;
         writeFileSync(tmp, JSON.stringify(this.state, null, 2));
@@ -270,38 +283,91 @@ export default class ForwardRunner {
             const last = this.journal.lastIncomeTime(this.broker.account);
             const startTime = last != null ? last : Date.now() - this.incomeLookbackMs;
             const rows = await this.broker.getIncome({ startTime });
-            if (!rows) return;
-            const inserted = this.journal.income(this.broker.account, this.runId, rows);
-            if (inserted) this.event('info', 'income', `${inserted} income rows`);
-            this.attributeFunding(rows);
+            if (rows) {
+                const inserted = this.journal.income(this.broker.account, this.runId, rows);
+                if (inserted) this.event('info', 'income', `${inserted} income rows`);
+            }
         } catch (err) {
             this.logger.warn(`ForwardRunner: income poll failed: ${err.message}`);
             this.event('warn', 'income-failed', err.message);
         }
+        await this.accrueFunding();
     }
 
-    attributeFunding(rows) {
-        const account = new Map();
-        for (const p of this.lastPortfolio?.positions || []) {
-            const qty = Number(p.quantity);
-            if (qty) account.set(p.symbol, Math.abs(qty));
+    tracksFunding() {
+        return this.market === 'crypto' && this.broker.getFundingRates !== Broker.prototype.getFundingRates;
+    }
+
+    fundingBook() {
+        if (this.funding) return this.funding;
+        const since = Math.min(Date.now(), this.journal?.lastIncomeTime?.(this.broker?.account) ?? Infinity);
+        const held = {};
+        const through = {};
+        for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
+            if (!Number(pos.quantity)) continue;
+            held[symbol] = [[0, Number(pos.quantity)]];
+            through[symbol] = since;
         }
-        let mine = 0;
-        for (const row of rows) {
-            const type = row.type ?? row.incomeType;
-            if (type && type !== 'FUNDING_FEE') continue;
-            const amount = Number(row.amount ?? row.income);
-            const symbol = row.symbol;
-            if (!Number.isFinite(amount) || !symbol) continue;
-            const own = Math.abs(Number(this.ledger.positions[symbol]?.quantity) || 0);
-            if (!own) continue;
-            const total = account.get(symbol) || own;
-            mine += amount * Math.min(1, own / total);
+        this.funding = { held, through };
+        return this.funding;
+    }
+
+    logHoldings(ts) {
+        if (!this.tracksFunding()) return;
+        const book = this.fundingBook();
+        for (const symbol of new Set([...Object.keys(book.held), ...Object.keys(this.ledger.positions)])) {
+            const qty = Number(this.ledger.positions[symbol]?.quantity) || 0;
+            const log = book.held[symbol] ?? [];
+            const prev = log.at(-1);
+            if ((prev?.[1] ?? 0) === qty) continue;
+            log.push([Math.max(Number(ts), prev?.[0] ?? -Infinity), qty]);
+            book.held[symbol] = log;
         }
-        if (mine) {
-            this.realized += mine;
-            this.writeState({ realized: this.realized });
+    }
+
+    async accrueFunding(now = Date.now()) {
+        if (!this.tracksFunding()) return;
+        const book = this.fundingBook();
+        let amount = 0;
+        let settlements = 0;
+        const failed = [];
+        await pool(Object.keys(book.held), this.concurrency, async (symbol) => {
+            const log = book.held[symbol];
+            const from = book.through[symbol] ?? log[0][0];
+            let rates;
+            try {
+                rates = await this.broker.getFundingRates(symbol, { startTime: from + 1, endTime: now });
+            } catch (err) {
+                failed.push(`${symbol}: ${err.message}`);
+                return;
+            }
+            let through = from;
+            for (const r of [...(rates || [])].sort((a, b) => a.time - b.time)) {
+                if (!(r.time > from) || !Number.isFinite(r.rate)) continue;
+                through = r.time;
+                const qty = heldAt(log, r.time);
+                const price = r.markPrice > 0 ? r.markPrice : this.stockPrices[symbol];
+                if (!qty || !(price > 0)) continue;
+                amount -= qty * price * r.rate;
+                settlements++;
+            }
+            book.through[symbol] = through;
+            const cut = through - SETTLEMENT_SLACK_MS;
+            let first = 0;
+            while (first + 1 < log.length && log[first + 1][0] <= cut) first++;
+            log.splice(0, first);
+            if (log.length === 1 && log[0][1] === 0 && log[0][0] <= cut) {
+                delete book.held[symbol];
+                delete book.through[symbol];
+            }
+        });
+        if (failed.length) {
+            this.logger.warn(`ForwardRunner: funding rates unavailable for ${failed.length} symbol(s)`);
+            this.event('warn', 'funding-failed', `funding rates unavailable for ${failed.length} symbol(s); retried next poll`, { data: failed });
         }
+        if (amount) this.realized += amount;
+        this.writeState({ realized: this.realized });
+        if (settlements) this.journal.record(this.runId, now, 'funding', { value: amount, settlements });
     }
 
     async refreshAccount() {
@@ -378,6 +444,7 @@ export default class ForwardRunner {
             else delete this.ledger.positions[symbol];
         }
         if (lost.length) {
+            this.logHoldings(Date.now());
             this.logger.warn(`ForwardRunner: ${lost.length} position(s) smaller than this strategy's book; adopting the venue`);
             this.event('warn', 'position-divergence',
                 `${lost.length} position(s) closed outside this strategy`,
@@ -1045,6 +1112,7 @@ export default class ForwardRunner {
         const fee = this.fee(intent.symbol, quantity, price, side);
         this.pendingLogs.push({ kind: 'swap', timestamp, stockName: intent.symbol, side, quantity, price, fee });
         const closed = this.ledger.apply({ symbol: intent.symbol, signedQty: side === 'buy' ? quantity : -quantity, price, fee, timestamp });
+        this.logHoldings(timestamp);
         if (closed) {
             this.realized += closed.profit;
             this.pendingLogs.push({
@@ -1165,6 +1233,7 @@ export default class ForwardRunner {
 
         if (this.adoptExisting) {
             this.ledger.reconcile(held, (symbol, quantity, price) => this.fee(symbol, quantity, price, 'buy'));
+            this.logHoldings(Date.now());
             for (const [symbol, pos] of Object.entries(this.ledger.positions)) {
                 if (pos.quantity) this.stockBalances[symbol] = pos.quantity;
             }
