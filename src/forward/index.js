@@ -141,6 +141,7 @@ export default class ForwardRunner {
         this.lastPortfolio = null;
         this.lastBatchInfo = {};
         this.venueLeverage = {};
+        this.accountLeverageCap = null;
         this.leverageChecked = new Set();
         this.currentTimestamp = null;
         this.runId = null;
@@ -1257,7 +1258,7 @@ export default class ForwardRunner {
             const ceiling = typeof this.broker.maxLeverageFor === 'function'
                 ? await this.broker.maxLeverageFor(symbol)
                 : null;
-            const wanted = Math.max(1, ceiling > 0 ? Math.min(target, ceiling) : target);
+            const wanted = Math.max(1, Math.min(target, ceiling > 0 ? ceiling : Infinity, this.accountLeverageCap ?? Infinity));
             const current = this.venueLeverage[symbol] ?? null;
             if (current === wanted) return;
             await this.broker.setLeverage(symbol, wanted);
@@ -1266,6 +1267,14 @@ export default class ForwardRunner {
                 `${symbol} venue leverage ${current == null ? 'not reported' : `${current}x`} -> ${wanted}x`,
                 { data: { symbol, from: current, to: wanted, target, ceiling } });
         } catch (error) {
+            const cap = Number(String(error.message).match(/leverage greater than (\d+)x/i)?.[1]);
+            if (cap > 0 && (this.accountLeverageCap == null || cap < this.accountLeverageCap)) {
+                this.accountLeverageCap = cap;
+                this.event('info', 'leverage-capped', `the account refuses leverage above ${cap}x; using ${cap}x`,
+                    { data: { symbol, cap, code: error.code ?? null } });
+                this.leverageChecked.delete(symbol);
+                return this.ensureLeverage(symbol);
+            }
             this.logger.warn(`ForwardRunner: could not set ${symbol} leverage: ${error.message}`);
             this.event('warn', 'leverage-failed', `${symbol} leverage stays as it is: ${error.message}`,
                 { data: { symbol, target, code: error.code ?? null } });
