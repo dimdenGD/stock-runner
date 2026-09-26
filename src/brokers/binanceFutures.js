@@ -133,6 +133,7 @@ export default class BinanceFutures extends Broker {
         exchangeInfoCachePath = 'data/binance/exchangeInfo.json',
         exchangeInfoMaxAgeMs = 7 * 86400000,
         fillPriceRetryDelaysMs = DEFAULT_FILL_PRICE_RETRY_DELAYS_MS,
+        orderConcurrency = 8,
     } = {}) {
         super();
         if (!['demo', 'live'].includes(environment)) {
@@ -164,6 +165,7 @@ export default class BinanceFutures extends Broker {
         this.exchangeInfoMaxAgeMs = exchangeInfoMaxAgeMs;
         this.fillPriceRetryDelaysMs = [...fillPriceRetryDelaysMs];
         this.limiter = new MinuteWeightLimiter(maxRequestWeightPerMinute);
+        this.orderConcurrency = Math.max(1, Math.trunc(Number(orderConcurrency) || 1));
     }
 
     get isDemo() { return this.environment === 'demo'; }
@@ -316,12 +318,16 @@ export default class BinanceFutures extends Broker {
 
     async getLeverageBrackets() {
         if (this.leverageBrackets) return this.leverageBrackets;
-        const rows = await this.request('/fapi/v1/leverageBracket', { signed: true, weight: 40 });
-        this.leverageBrackets = new Map((rows || []).map((row) => [
-            row.symbol,
-            Math.max(...(row.brackets || []).map((b) => Number(b.initialLeverage) || 1), 1),
-        ]));
-        return this.leverageBrackets;
+        this.leverageBracketsPending ??= this.request('/fapi/v1/leverageBracket', { signed: true, weight: 40 })
+            .then((rows) => {
+                this.leverageBrackets = new Map((rows || []).map((row) => [
+                    row.symbol,
+                    Math.max(...(row.brackets || []).map((b) => Number(b.initialLeverage) || 1), 1),
+                ]));
+                return this.leverageBrackets;
+            })
+            .finally(() => { this.leverageBracketsPending = null; });
+        return this.leverageBracketsPending;
     }
 
     async maxLeverageFor(symbol) {
@@ -401,9 +407,9 @@ export default class BinanceFutures extends Broker {
         return row ? rowToClosedCandle(row, stepMs) : null;
     }
 
-    createStream({ symbols, interval, stepMs, graceMs, logger }) {
+    createStream({ symbols, interval, stepMs, graceMs, settleMs = null, logger }) {
         return new BinanceKlineStream({
-            symbols, interval, stepMs, graceMs, logger,
+            symbols, interval, stepMs, graceMs, settleMs, logger,
             webSocketImpl: this.webSocketImpl,
             ...(this.webSocketUrl ? { url: this.webSocketUrl } : {}),
         });

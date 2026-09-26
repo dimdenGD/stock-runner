@@ -24,6 +24,7 @@ export default class BinanceKlineStream {
         stepMs,
         url = 'wss://fstream.binance.com/market/ws',
         graceMs = 5000,
+        settleMs = null,
         staleMs = 90000,
         reconnectMinMs = 1000,
         reconnectMaxMs = 30000,
@@ -36,6 +37,9 @@ export default class BinanceKlineStream {
         this.stepMs = stepMs;
         this.url = url;
         this.graceMs = graceMs;
+        this.settleMs = settleMs == null ? null : Math.max(0, Number(settleMs));
+        this.onCorrection = null;
+        this.lateCloses = 0;
         this.staleMs = staleMs;
         this.reconnectMinMs = reconnectMinMs;
         this.reconnectMaxMs = reconnectMaxMs;
@@ -188,18 +192,27 @@ export default class BinanceKlineStream {
         if (!data.k.x) return;
         this.closedKlines++;
         const timestamp = Number(data.k.t) + this.stepMs;
-        if (!Number.isFinite(timestamp) || this.finalized.has(timestamp)) return;
+        if (!Number.isFinite(timestamp)) return;
         const candle = new Candle(
             Number(data.k.o), Number(data.k.h), Number(data.k.l), Number(data.k.c),
             Number(data.k.v), timestamp, Number(data.k.q),
         );
+        if (this.finalized.has(timestamp)) {
+            this.lateCloses++;
+            try {
+                this.onCorrection?.({ timestamp, symbol, candle });
+            } catch (err) {
+                this.logger.error(`Binance WebSocket late close handler failed: ${err.message}`);
+            }
+            return;
+        }
         let batch = this.pending.get(timestamp);
         if (!batch) {
             batch = {
                 timestamp,
                 expected: new Set(this.symbols),
                 candles: new Map(),
-                timer: setTimeout(() => this.flush(timestamp), this.graceMs),
+                timer: setTimeout(() => this.flush(timestamp), this.settleMs ?? this.graceMs),
             };
             this.pending.set(timestamp, batch);
         }
@@ -243,6 +256,7 @@ export default class BinanceKlineStream {
             lastDataAt: this.lastDataAt,
             dataMessages: this.dataMessages,
             closedKlines: this.closedKlines,
+            lateCloses: this.lateCloses,
         };
     }
 

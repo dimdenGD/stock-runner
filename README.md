@@ -241,6 +241,7 @@ bt.logMetrics(result);
   - `environment` - `demo` (default) or `live`.
   - `apiKey`, `apiSecret` - needed for forward testing.
   - `strictQuantization` - throw instead of passing the order through when a symbol has no rules, default `false`.
+  - `orderConcurrency` - orders to send at once in forward runs, default `8`.
   - `quantize` floors to `MARKET_LOT_SIZE`/`LOT_SIZE` step and rejects below `minQty` or `MIN_NOTIONAL`
 - **`Hyperliquid`** - Perps on Hyperliquid. Supports forward testing:
   - `new Hyperliquid({ feeBps, slippage, impactCoef, depthRatio, environment, privateKey, accountAddress, vaultAddress })`
@@ -278,6 +279,8 @@ await runner.run();
 - **`maxDailyLoss`** - Fraction of the strategy's own equity.
 - **`symbols`** - Fixed universe. Default: all tradable symbols from the broker.
 - **`logs.ticks`** - Print a line per bar.
+- **`streamSettleMs`** - Ms after a bar's first close before the bar is released. 
+- Order legs are placed `broker.orderConcurrency` at a time, reduce-only legs first. Brokers default to `1`.
 - **`journalFile`** - Journal path, default `output/journal.sqlite`.
 - **`journal`** - An existing `RunJournal` to write into instead of opening one.
 - **`run()`** - Warms up on `strategy.warmup` bars of history, then trades on each closed bar until `stop()`.

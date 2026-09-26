@@ -31,6 +31,9 @@ const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
 const UNRECOVERABLE_CODES = new Set([-1022, -2014, -2015]);
 const LEVERAGE_HEADROOM = 3;
 
+const sameCandle = (a, b) => a.open === b.open && a.high === b.high && a.low === b.low
+    && a.close === b.close && a.volume === b.volume && a.quoteVolume === b.quoteVolume;
+
 function unrecoverable(err) {
     if (err?.fatal) return true;
     if (err?.status === 401 || err?.status === 403) return true;
@@ -61,6 +64,7 @@ export default class ForwardRunner {
         concurrency = 16,
         symbolRefreshMs = 3600000,
         streamGraceMs = 5000,
+        streamSettleMs = undefined,
         streamHealthTimeoutMs = 15000,
         maxMissingFraction = 0.02,
         incomePollMs = 3600000,
@@ -100,6 +104,9 @@ export default class ForwardRunner {
         this.concurrency = concurrency;
         this.symbolRefreshMs = symbolRefreshMs;
         this.streamGraceMs = streamGraceMs;
+        this.streamSettleMs = streamSettleMs;
+        this.pendingCorrections = new Map();
+        this.correctionLog = new Map();
         this.streamHealthTimeoutMs = streamHealthTimeoutMs;
         this.maxMissingFraction = maxMissingFraction;
         this.incomePollMs = incomePollMs;
@@ -432,10 +439,61 @@ export default class ForwardRunner {
         };
     }
 
+    applyCandleCorrection({ timestamp, symbol, candle }) {
+        if (timestamp > Number(this.state.lastProcessedBar || 0)) {
+            if (!this.pendingCorrections.has(timestamp)) this.pendingCorrections.set(timestamp, new Map());
+            this.pendingCorrections.get(timestamp).set(symbol, candle);
+            return;
+        }
+        const buffer = this.buffers.get(symbol);
+        const at = buffer ? buffer.findIndex((c) => c.timestamp === timestamp) : -1;
+        if (at >= 0 && sameCandle(buffer[at], candle)) return;
+        this.cache.append(timestamp, [{ symbol, candle }]);
+        if (at >= 0) {
+            buffer[at] = candle;
+            if (at === buffer.length - 1) this.stockPrices[symbol] = candle.close;
+        }
+        if (!this.correctionLog.has(timestamp)) this.correctionLog.set(timestamp, []);
+        this.correctionLog.get(timestamp).push(symbol);
+    }
+
+    withCorrections(timestamp, candles) {
+        for (const ts of this.pendingCorrections.keys()) if (ts < timestamp) this.pendingCorrections.delete(ts);
+        const fixes = this.pendingCorrections.get(timestamp);
+        if (!fixes) return candles;
+        this.pendingCorrections.delete(timestamp);
+        const changed = [];
+        const out = candles.map((row) => {
+            const fix = fixes.get(row.symbol);
+            if (!fix) return row;
+            fixes.delete(row.symbol);
+            if (!sameCandle(row.candle, fix)) changed.push(row.symbol);
+            return { symbol: row.symbol, candle: fix };
+        });
+        for (const [symbol, candle] of fixes) out.push({ symbol, candle });
+        if (changed.length) {
+            if (!this.correctionLog.has(timestamp)) this.correctionLog.set(timestamp, []);
+            this.correctionLog.get(timestamp).push(...changed);
+        }
+        return out;
+    }
+
+    journalCorrections(beforeTimestamp) {
+        for (const [ts, symbols] of this.correctionLog) {
+            if (ts >= beforeTimestamp) continue;
+            this.correctionLog.delete(ts);
+            this.event('info', 'candles-corrected',
+                `${symbols.length} candle(s) replaced by a later closed candle: ${symbols.slice(0, 8).join(', ')}${symbols.length > 8 ? ', ...' : ''}`,
+                { barTs: ts, data: symbols });
+        }
+    }
+
     async tick(timestamp, candles, { execute = true, paused = false, info = {} } = {}) {
         if (execute && timestamp <= Number(this.state.lastProcessedBar || 0)) return { skipped: true, intents: [] };
         const startedAt = Date.now();
         if (execute) {
+            candles = this.withCorrections(timestamp, candles);
+            this.journalCorrections(timestamp);
             this.cache.append(timestamp, candles);
             this.pruneCache(timestamp);
             await this.refreshAccount();
@@ -568,151 +626,230 @@ export default class ForwardRunner {
     }
 
     async executeBatch(timestamp, intents, stats, { forceReduceOnly = false } = {}) {
-        const fills = [];
         this.unpricedFills = 0;
-        const projected = { ...this.stockBalances };
-        const maxAttempts = Math.min(3, Math.max(1, Math.trunc(Number(this.maxOrderAttempts) || 1)));
-        const skippedSymbols = [];
-        let sequence = 0;
-        for (const intent of intents) {
-            const current = projected[intent.symbol] || 0;
-            for (const leg of splitPositionOrder(current, intent.signedQty).map(
-                (l) => (forceReduceOnly ? { ...l, reduceOnly: true } : l))
-                .flatMap((l) => (this.broker.splitMaxQty?.(intent.symbol, l.signedQty) ?? [l.signedQty]).map((q) => ({ ...l, signedQty: q })))) {
-                const quantity = this.broker.normalizeQuantity(intent.symbol, leg.signedQty, intent.price, { reduceOnly: leg.reduceOnly });
-                const side = leg.signedQty > 0 ? 'buy' : 'sell';
-                const orderInfo = {
-                    intentId: intent.journalId, symbol: intent.symbol, side,
-                    reduceOnly: leg.reduceOnly, decisionPrice: intent.price,
-                };
-                if (!quantity) {
-                    skippedSymbols.push(intent.symbol);
-                    this.journal.orderSkipped(this.runId, timestamp, { ...orderInfo, quantity: Math.abs(leg.signedQty) }, 'below exchange quantity/notional minimum');
-                    stats.skipped++;
-                    continue;
-                }
-                await this.ensureLeverage(intent.symbol);
-                const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
-                const clientOrderId = this.broker.createClientOrderId({
-                    timestamp, symbol: intent.symbol, sequence: sequence++, owner: this.ownTag,
-                });
-                const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity: Number(quantity), clientOrderId });
-                stats.orders++;
-                let fill;
-                let placed = false;
-                let accepted = false;
-                let placementError = null;
-                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                    try {
-                        fill = await this.broker.placeMarketOrder({
-                            symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
-                        });
-                        accepted = true;
-                        if (typeof this.broker.finalizeOrderResult === 'function') {
-                            fill = await this.broker.finalizeOrderResult(fill, {
-                                symbol: intent.symbol,
-                                side,
-                                quantity: Number(quantity),
-                                reduceOnly: leg.reduceOnly,
-                                clientOrderId,
-                            });
-                        }
-                        placed = true;
-                        break;
-                    } catch (err) {
-                        placementError = err;
-                        const disposition = accepted
-                            ? { action: 'ambiguous' }
-                            : typeof this.broker.orderFailureDisposition === 'function'
-                            ? this.broker.orderFailureDisposition(err, {
-                                attempt,
-                                maxAttempts,
-                                symbol: intent.symbol,
-                                side,
-                                clientOrderId,
-                            }) || { action: 'ambiguous' }
-                            : { action: 'reject' };
-                        if (disposition.action === 'retry' && attempt < maxAttempts) {
-                            const delayMs = Math.max(0, Number(disposition.delayMs) || 0);
-                            stats.retries = (stats.retries || 0) + 1;
-                            this.event('warn', 'order-retry',
-                                `${intent.symbol} ${side} ${quantity}: attempt ${attempt} failed; `
-                                    + `retrying in ${delayMs}ms`,
-                                { barTs: timestamp, data: { clientOrderId, attempt, delayMs, code: err.code ?? null } });
-                            if (delayMs) await sleep(delayMs);
-                            continue;
-                        }
-                        if (disposition.action === 'ambiguous') {
-                            this.event('error', 'order-unanswered',
-                                `${intent.symbol} ${side} ${quantity}: venue outcome is ambiguous; restarting into reconciliation`,
-                                { barTs: timestamp, data: { clientOrderId, attempt, code: err.code ?? null } });
-                            err.fatal = true;
-                            err.restartRunner = true;
-                            throw err;
-                        }
-                        break;
-                    }
-                }
-                if (!placed) {
-                    const err = placementError || new Error('order placement failed without an error');
-                    this.journal.orderFailed(orderId, err);
-                    stats.failed++;
-                    this.event('error', 'order-failed', `${intent.symbol} ${side} ${quantity}: ${err.message}`, {
-                        barTs: timestamp, data: { clientOrderId, code: err.code ?? null, body: err.body ?? null },
-                    });
-                    if (unrecoverable(err)) {
-                        await this.refreshAccount();
-                        err.fatal = true;
-                        throw err;
-                    }
-                    if (stats.failed >= this.maxOrderFailures) {
-                        this.event('error', 'batch-abandoned',
-                            `${stats.failed} orders rejected in one batch, ${fills.length} filled; `
-                            + 'the rest of the batch was dropped',
-                            { barTs: timestamp });
-                        return fills;
-                    }
-                    continue;
-                }
-                const parsed = this.broker.parseOrderResult(fill) || {};
-                const executedQty = Number(parsed.executedQty) > 0
-                    ? Number(parsed.executedQty)
-                    : Number(quantity);
-                const completionTolerance = Math.max(1e-12, Number(quantity) * 1e-9);
-                const partiallyFilled = executedQty + completionTolerance < Number(quantity);
-                const booked = partiallyFilled ? { ...parsed, status: 'filled' } : parsed;
-                this.journal.orderResult(orderId, booked, fill);
-                this.recordFill(timestamp, intent, side, Number(quantity), booked, orderId);
-                fills.push(fill);
-                stats.fills++;
-                projected[intent.symbol] = (projected[intent.symbol] || 0)
-                    + Math.sign(signedRounded) * executedQty;
-                if (partiallyFilled) {
-                    this.event('warn', 'order-partial',
-                        `${intent.symbol} ${side} filled ${executedQty} of ${quantity}; restarting into target reconciliation`,
-                        { barTs: timestamp, data: { clientOrderId, requestedQty: Number(quantity), executedQty } });
-                    const error = new Error(
-                        `${intent.symbol} order only filled ${executedQty} of ${quantity}`,
-                    );
-                    error.code = 'PARTIAL_FILL';
-                    error.fatal = true;
-                    error.restartRunner = true;
-                    throw error;
+        const run = {
+            timestamp, stats, forceReduceOnly,
+            fills: [],
+            skippedSymbols: [],
+            sequence: 0,
+            projected: { ...this.stockBalances },
+            maxAttempts: Math.min(3, Math.max(1, Math.trunc(Number(this.maxOrderAttempts) || 1))),
+        };
+        const width = Math.max(1, Math.trunc(Number(this.broker.orderConcurrency) || 1));
+        if (width > 1) {
+            if (await this.executeConcurrently(run, intents, width) === 'abandon') return run.fills;
+        } else {
+            for (const intent of intents) {
+                for (const leg of this.planLegs(run, intent)) {
+                    if (await this.placeLeg(run, intent, leg) === 'abandon') return run.fills;
                 }
             }
         }
-        if (skippedSymbols.length) {
-            const shown = skippedSymbols.slice(0, 12).join(', ');
-            const rest = skippedSymbols.length - 12;
-            this.logger.warn(`ForwardRunner: ${skippedSymbols.length} order(s) below exchange minimum: ${shown}${rest > 0 ? `, +${rest} more` : ''}`);
+        if (run.skippedSymbols.length) {
+            const shown = run.skippedSymbols.slice(0, 12).join(', ');
+            const rest = run.skippedSymbols.length - 12;
+            this.logger.warn(`ForwardRunner: ${run.skippedSymbols.length} order(s) below exchange minimum: ${shown}${rest > 0 ? `, +${rest} more` : ''}`);
         }
         if (this.unpricedFills) {
             this.event('warn', 'fill-price-missing',
-                `${this.unpricedFills} of ${fills.length} fills came back without a price, `
+                `${this.unpricedFills} of ${run.fills.length} fills came back without a price, `
                 + 'those are booked at the decision price and their slippage is unmeasured',
                 { barTs: timestamp });
         }
-        return fills;
+        return run.fills;
+    }
+
+    planLegs(run, intent) {
+        const current = run.projected[intent.symbol] || 0;
+        return splitPositionOrder(current, intent.signedQty)
+            .map((l) => (run.forceReduceOnly ? { ...l, reduceOnly: true } : l))
+            .flatMap((l) => (this.broker.splitMaxQty?.(intent.symbol, l.signedQty) ?? [l.signedQty]).map((q) => ({ ...l, signedQty: q })));
+    }
+
+    async executeConcurrently(run, intents, width) {
+        const chains = new Map();
+        for (const intent of intents) {
+            if (!chains.has(intent.symbol)) chains.set(intent.symbol, []);
+            chains.get(intent.symbol).push(intent);
+        }
+        let reducing = chains.size;
+        let releaseOpens;
+        const opensAllowed = new Promise((resolve) => { releaseOpens = resolve; });
+        if (!reducing) releaseOpens();
+        const slots = { free: width, waiting: [] };
+        const acquire = () => (slots.free > 0 ? (slots.free--, Promise.resolve()) : new Promise((resolve) => slots.waiting.push(resolve)));
+        const release = () => { const next = slots.waiting.shift(); if (next) next(); else slots.free++; };
+        let stop = null;
+        const halt = (reason) => {
+            if (!(stop instanceof Error)) stop = reason;
+        };
+
+        const runChain = async (list) => {
+            let reduced = false;
+            const pastReductions = () => {
+                if (reduced) return;
+                reduced = true;
+                if (--reducing === 0) releaseOpens();
+            };
+            try {
+                for (const intent of list) {
+                    for (const leg of this.planLegs(run, intent)) {
+                        if (stop || run.halted) return;
+                        if (!leg.reduceOnly) {
+                            pastReductions();
+                            await opensAllowed;
+                            if (stop || run.halted) return;
+                        }
+                        await acquire();
+                        try {
+                            if (stop || run.halted) return;
+                            if (await this.placeLeg(run, intent, leg) === 'abandon') halt('abandon');
+                        } finally {
+                            release();
+                        }
+                    }
+                }
+            } catch (err) {
+                halt(err);
+            } finally {
+                pastReductions();
+            }
+        };
+        await Promise.all([...chains.values()].map(runChain));
+        if (stop instanceof Error) throw stop;
+        return stop;
+    }
+
+    async placeLeg(run, intent, leg) {
+        const { timestamp, stats, maxAttempts } = run;
+        const quantity = this.broker.normalizeQuantity(intent.symbol, leg.signedQty, intent.price, { reduceOnly: leg.reduceOnly });
+        const side = leg.signedQty > 0 ? 'buy' : 'sell';
+        const orderInfo = {
+            intentId: intent.journalId, symbol: intent.symbol, side,
+            reduceOnly: leg.reduceOnly, decisionPrice: intent.price,
+        };
+        if (!quantity) {
+            run.skippedSymbols.push(intent.symbol);
+            this.journal.orderSkipped(this.runId, timestamp, { ...orderInfo, quantity: Math.abs(leg.signedQty) }, 'below exchange quantity/notional minimum');
+            stats.skipped++;
+            return 'skipped';
+        }
+        await this.ensureLeverage(intent.symbol);
+        const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
+        const clientOrderId = this.broker.createClientOrderId({
+            timestamp, symbol: intent.symbol, sequence: run.sequence++, owner: this.ownTag,
+        });
+        const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity: Number(quantity), clientOrderId });
+        stats.orders++;
+        let fill;
+        let placed = false;
+        let accepted = false;
+        let placementError = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                fill = await this.broker.placeMarketOrder({
+                    symbol: intent.symbol, side, quantity, reduceOnly: leg.reduceOnly, clientOrderId,
+                });
+                accepted = true;
+                if (typeof this.broker.finalizeOrderResult === 'function') {
+                    fill = await this.broker.finalizeOrderResult(fill, {
+                        symbol: intent.symbol,
+                        side,
+                        quantity: Number(quantity),
+                        reduceOnly: leg.reduceOnly,
+                        clientOrderId,
+                    });
+                }
+                placed = true;
+                break;
+            } catch (err) {
+                placementError = err;
+                const disposition = accepted
+                    ? { action: 'ambiguous' }
+                    : typeof this.broker.orderFailureDisposition === 'function'
+                    ? this.broker.orderFailureDisposition(err, {
+                        attempt,
+                        maxAttempts,
+                        symbol: intent.symbol,
+                        side,
+                        clientOrderId,
+                    }) || { action: 'ambiguous' }
+                    : { action: 'reject' };
+                if (disposition.action === 'retry' && attempt < maxAttempts) {
+                    const delayMs = Math.max(0, Number(disposition.delayMs) || 0);
+                    stats.retries = (stats.retries || 0) + 1;
+                    this.event('warn', 'order-retry',
+                        `${intent.symbol} ${side} ${quantity}: attempt ${attempt} failed; `
+                            + `retrying in ${delayMs}ms`,
+                        { barTs: timestamp, data: { clientOrderId, attempt, delayMs, code: err.code ?? null } });
+                    if (delayMs) await sleep(delayMs);
+                    continue;
+                }
+                if (disposition.action === 'ambiguous') {
+                    this.event('error', 'order-unanswered',
+                        `${intent.symbol} ${side} ${quantity}: venue outcome is ambiguous; restarting into reconciliation`,
+                        { barTs: timestamp, data: { clientOrderId, attempt, code: err.code ?? null } });
+                    run.halted = true;
+                    err.fatal = true;
+                    err.restartRunner = true;
+                    throw err;
+                }
+                break;
+            }
+        }
+        if (!placed) {
+            const err = placementError || new Error('order placement failed without an error');
+            this.journal.orderFailed(orderId, err);
+            stats.failed++;
+            this.event('error', 'order-failed', `${intent.symbol} ${side} ${quantity}: ${err.message}`, {
+                barTs: timestamp, data: { clientOrderId, code: err.code ?? null, body: err.body ?? null },
+            });
+            if (unrecoverable(err)) {
+                run.halted = true;
+                await this.refreshAccount();
+                err.fatal = true;
+                throw err;
+            }
+            if (stats.failed >= this.maxOrderFailures) {
+                run.halted = true;
+                if (!run.abandoned) {
+                    run.abandoned = true;
+                    this.event('error', 'batch-abandoned',
+                        `${stats.failed} orders rejected in one batch, ${run.fills.length} filled; `
+                        + 'the rest of the batch was dropped',
+                        { barTs: timestamp });
+                }
+                return 'abandon';
+            }
+            return 'failed';
+        }
+        const parsed = this.broker.parseOrderResult(fill) || {};
+        const executedQty = Number(parsed.executedQty) > 0
+            ? Number(parsed.executedQty)
+            : Number(quantity);
+        const completionTolerance = Math.max(1e-12, Number(quantity) * 1e-9);
+        const partiallyFilled = executedQty + completionTolerance < Number(quantity);
+        const booked = partiallyFilled ? { ...parsed, status: 'filled' } : parsed;
+        this.journal.orderResult(orderId, booked, fill);
+        this.recordFill(timestamp, intent, side, Number(quantity), booked, orderId);
+        run.fills.push(fill);
+        stats.fills++;
+        run.projected[intent.symbol] = (run.projected[intent.symbol] || 0)
+            + Math.sign(signedRounded) * executedQty;
+        if (partiallyFilled) {
+            this.event('warn', 'order-partial',
+                `${intent.symbol} ${side} filled ${executedQty} of ${quantity}; restarting into target reconciliation`,
+                { barTs: timestamp, data: { clientOrderId, requestedQty: Number(quantity), executedQty } });
+            const error = new Error(
+                `${intent.symbol} order only filled ${executedQty} of ${quantity}`,
+            );
+            error.code = 'PARTIAL_FILL';
+            run.halted = true;
+            error.fatal = true;
+            error.restartRunner = true;
+            throw error;
+        }
+        return 'filled';
     }
 
     /**
@@ -1010,8 +1147,10 @@ export default class ForwardRunner {
             interval: this.interval,
             stepMs: this.stepMs,
             graceMs: this.streamGraceMs,
+            settleMs: this.streamSettleMs,
             logger: this.logger,
         });
+        this.stream.onCorrection = (correction) => this.applyCandleCorrection(correction);
         await this.stream.start();
         if (this.streamHealthTimeoutMs > 0 && typeof this.stream.waitForData === 'function') {
             await this.stream.waitForData(this.streamHealthTimeoutMs);
@@ -1293,7 +1432,8 @@ export default class ForwardRunner {
     }
 
     async recoverMissing(batch) {
-        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, recovered: 0, missing: 0 };
+        const provisional = batch.provisional?.length || 0;
+        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, provisional, recovered: 0, missing: 0 };
         if (!batch.missing.length) return batch.candles;
         const recovered = await this.fetchClosedBatch(batch.timestamp, batch.missing);
         const got = new Set(recovered.map(x => x.symbol));
@@ -1301,7 +1441,7 @@ export default class ForwardRunner {
         if (stillMissing.length / Math.max(1, batch.expected) > this.maxMissingFraction) {
             throw new Error(`Market-data batch ${new Date(batch.timestamp).toISOString()} remains incomplete: ${stillMissing.length}/${batch.expected} symbols missing after history recovery`);
         }
-        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, recovered: recovered.length, missing: stillMissing.length };
+        this.lastBatchInfo = { expected: batch.expected, streamed: batch.candles.length, provisional, recovered: recovered.length, missing: stillMissing.length };
         if (stillMissing.length) {
             this.logger.warn(`ForwardRunner: ${stillMissing.length} inactive symbols omitted after history recovery`);
             this.event('warn', 'symbols-missing', `${stillMissing.length} symbols omitted after history recovery`, { barTs: batch.timestamp, data: stillMissing });
@@ -1416,7 +1556,7 @@ export default class ForwardRunner {
                         execute: true, paused: this.paused, info: this.lastBatchInfo,
                     });
                     this.consecutiveBarErrors = 0;
-                    if (this.logs.ticks) this.logger.log(`ForwardRunner: ${new Date(batch.timestamp).toISOString()} ${candles.length}/${batch.expected} candles, ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
+                    if (this.logs.ticks) this.logger.log(`ForwardRunner: ${new Date(batch.timestamp).toISOString()} ${candles.length}/${batch.expected} candles (${this.lastBatchInfo?.provisional || 0} provisional), ${result.intents.length} intents, ${result.fills?.length || 0} fills`);
                 } catch (err) {
                     if (unrecoverable(err)) throw err;
                     this.consecutiveBarErrors++;

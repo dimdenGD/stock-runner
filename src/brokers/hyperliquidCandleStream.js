@@ -17,6 +17,9 @@ async function messageText(event) {
     return String(data);
 }
 
+const sameCandle = (a, b) => a.open === b.open && a.high === b.high && a.low === b.low
+    && a.close === b.close && a.volume === b.volume;
+
 export function hyperliquidCandle(c, stepMs) {
     const o = Number(c.o), h = Number(c.h), l = Number(c.l), cl = Number(c.c), v = Number(c.v);
     return new Candle(o, h, l, cl, v, Number(c.t) + stepMs, v * (o + h + l + cl) / 4);
@@ -29,6 +32,7 @@ export default class HyperliquidCandleStream {
         stepMs,
         url = 'wss://api.hyperliquid.xyz/ws',
         graceMs = 5000,
+        settleMs = null,
         staleMs = 90000,
         pingMs = 30000,
         reconnectMinMs = 1000,
@@ -42,6 +46,11 @@ export default class HyperliquidCandleStream {
         this.stepMs = stepMs;
         this.url = url;
         this.graceMs = graceMs;
+        this.settleMs = settleMs == null ? null : Math.max(0, Number(settleMs));
+        this.onCorrection = null;
+        this.provisional = new Map();
+        this.provisionalCandles = 0;
+        this.corrections = 0;
         this.staleMs = staleMs;
         this.pingMs = pingMs;
         this.reconnectMinMs = reconnectMinMs;
@@ -118,11 +127,12 @@ export default class HyperliquidCandleStream {
     scheduleBoundary() {
         if (this.stopped) return;
         const now = Date.now();
-        const boundary = Math.ceil((now - this.graceMs + 1) / this.stepMs) * this.stepMs;
+        const wait = this.settleMs ?? this.graceMs;
+        const boundary = Math.ceil((now - wait + 1) / this.stepMs) * this.stepMs;
         this.boundaryTimer = setTimeout(() => {
             this.flush(boundary);
             this.scheduleBoundary();
-        }, Math.max(0, boundary + this.graceMs - now));
+        }, Math.max(0, boundary + wait - now));
     }
 
     async connect() {
@@ -206,6 +216,20 @@ export default class HyperliquidCandleStream {
         if (prev && prev.t < t) this.closed.set(`${symbol}|${prev.t}`, prev.c);
         if (!prev || prev.t <= t) this.latest.set(symbol, { t, c });
         if (t + this.stepMs <= Date.now() - this.graceMs) this.closed.set(`${symbol}|${t}`, c);
+        if (this.finalized.has(t + this.stepMs)) this.settleProvisional(symbol, t + this.stepMs, hyperliquidCandle(c, this.stepMs));
+    }
+
+    settleProvisional(symbol, timestamp, candle) {
+        const key = `${symbol}|${timestamp}`;
+        const provisional = this.provisional.get(key);
+        if (!provisional || sameCandle(provisional, candle)) return;
+        this.provisional.set(key, candle);
+        this.corrections++;
+        try {
+            this.onCorrection?.({ timestamp, symbol, candle, provisional });
+        } catch (err) {
+            this.logger.error(`Hyperliquid WebSocket correction handler failed: ${err.message}`);
+        }
     }
 
     flush(timestamp) {
@@ -213,23 +237,33 @@ export default class HyperliquidCandleStream {
         this.finalized.add(timestamp);
         while (this.finalized.size > 100) this.finalized.delete(this.finalized.values().next().value);
         const barStart = timestamp - this.stepMs;
-        const candles = [], missing = [];
+        const candles = [], missing = [], provisional = [];
         for (const symbol of this.symbols) {
             const key = `${symbol}|${barStart}`;
             const latest = this.latest.get(symbol);
-            const c = this.closed.get(key) ?? (latest && latest.t === barStart ? latest.c : null);
+            const confirmed = this.closed.get(key);
+            const c = confirmed ?? (latest && latest.t === barStart ? latest.c : null);
             if (c) {
-                candles.push({ symbol, candle: hyperliquidCandle(c, this.stepMs) });
+                const candle = hyperliquidCandle(c, this.stepMs);
+                candles.push({ symbol, candle });
                 this.closedKlines++;
+                if (!confirmed && this.settleMs != null) {
+                    this.provisional.set(`${symbol}|${timestamp}`, candle);
+                    provisional.push(symbol);
+                }
             } else {
                 missing.push(symbol);
             }
+        }
+        this.provisionalCandles += provisional.length;
+        for (const key of this.provisional.keys()) {
+            if (Number(key.slice(key.lastIndexOf('|') + 1)) < timestamp - 4 * this.stepMs) this.provisional.delete(key);
         }
         for (const key of this.closed.keys()) {
             if (Number(key.slice(key.lastIndexOf('|') + 1)) <= barStart) this.closed.delete(key);
         }
         if (!this.lastDataAt && !candles.length) return;
-        this.push({ timestamp, candles, missing, expected: this.symbols.size });
+        this.push({ timestamp, candles, missing, provisional, expected: this.symbols.size });
     }
 
     push(batch) {
@@ -252,6 +286,8 @@ export default class HyperliquidCandleStream {
             lastDataAt: this.lastDataAt,
             dataMessages: this.dataMessages,
             closedKlines: this.closedKlines,
+            provisionalCandles: this.provisionalCandles,
+            corrections: this.corrections,
         };
     }
 

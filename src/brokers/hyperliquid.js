@@ -307,9 +307,9 @@ export default class Hyperliquid extends Broker {
         return c ? hyperliquidCandle(c, stepMs) : null;
     }
 
-    createStream({ symbols, interval, stepMs, graceMs, logger }) {
+    createStream({ symbols, interval, stepMs, graceMs, settleMs = 1500, logger }) {
         return new HyperliquidCandleStream({
-            symbols, interval, stepMs, graceMs, logger,
+            symbols, interval, stepMs, graceMs, settleMs, logger,
             url: this.webSocketUrl,
             webSocketImpl: this.webSocketImpl,
         });

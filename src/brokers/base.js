@@ -5,6 +5,7 @@ export const FORWARD_METHODS = [
 
 export default class Broker {
     market = 'stocks';
+    orderConcurrency = 1;
 
     get label() {
         return this.constructor.name;
