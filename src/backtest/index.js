@@ -34,6 +34,17 @@ const oneStockChunkBars = {
     '1m': 10000,
 }
 
+const MAX_LEVERAGE = 10;
+const validLeverage = (value) => Number.isFinite(value) && value > 0 && value <= MAX_LEVERAGE;
+
+function normalizeLeverageChanges(changes) {
+    if (!Array.isArray(changes)) return [];
+    return changes
+        .map(entry => ({ ts: Number(entry?.ts), value: Number(entry?.value) }))
+        .filter(entry => Number.isFinite(entry.ts) && validLeverage(entry.value))
+        .sort((a, b) => a.ts - b.ts);
+}
+
 function normalizeAllocations(allocations) {
     if (!Array.isArray(allocations)) return [];
     return allocations
@@ -77,7 +88,7 @@ export default class Backtest {
     constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, venue, allowShort, maxLeverage,
         journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily',
         journalRecords = 'summary', strategySourcePath = null,
-        candleSource = null, allocations = [] }) {
+        candleSource = null, allocations = [], leverage = 1, leverageChanges = [] }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -90,6 +101,9 @@ export default class Backtest {
         if(!(broker instanceof Broker)) {
             throw new TypeError('broker must be an instance of Broker');
         }
+        if (!validLeverage(leverage)) {
+            throw new TypeError(`leverage must be greater than 0 and at most ${MAX_LEVERAGE}`);
+        }
         
         this.strategy = strategy;
         this.startDate = startDate;
@@ -101,6 +115,11 @@ export default class Backtest {
         this.cashBalance = capital;
         this.allocations = normalizeAllocations(allocations);
         this.allocationIndex = 0;
+        this.startLeverage = leverage;
+        this.leverage = leverage;
+        this.leverageChanges = normalizeLeverageChanges(leverageChanges);
+        this.leverageIndex = 0;
+        this._sizingView = null;
         this.adjustments = 0;
         this.deposits = new Map();
         this.stockBalances = {};
@@ -211,12 +230,15 @@ export default class Backtest {
                 this.applyFunding(prevTs ?? ts, ts);
                 prevTs = ts;
             }
-            if (!this.isWarmup) this.applyAllocations(ts);
+            if (!this.isWarmup) {
+                this.applyAllocations(ts);
+                this.applyLeverage(ts);
+            }
 
             const tickObj = {
                 stockName,
                 candle: mainCandle,
-                ctx: this,
+                ctx: this.sizingView(),
                 stockBalance: this.stockBalances[stockName] || 0,
                 _features: null,
                 features: this.stockFeatures[stockName] ?? null,
@@ -277,6 +299,7 @@ export default class Backtest {
                 warmup: this.strategy.warmup,
                 allowShort: this.allowShort,
                 maxLeverage: this.maxLeverage,
+                leverage: this.startLeverage,
             },
         });
         this.journal.snapshot(this.runId, +this.startDate, 'start', { cash: this.capital, equity: this.capital, positions: [] });
@@ -373,6 +396,26 @@ export default class Backtest {
         }
         if (applied) this.deposits.set(at, (this.deposits.get(at) ?? 0) + applied);
         return applied;
+    }
+
+    applyLeverage(timestamp) {
+        const at = +timestamp;
+        while (this.leverageIndex < this.leverageChanges.length
+            && this.leverageChanges[this.leverageIndex].ts <= at) {
+            this.leverage = this.leverageChanges[this.leverageIndex++].value;
+        }
+    }
+
+    sizingView() {
+        if (this.leverage === 1 && !this.leverageChanges.length) return this;
+        this._sizingView ??= new Proxy(this, {
+            get(target, key) {
+                if (key === 'totalValue') return () => target.totalValue() * target.leverage;
+                const value = Reflect.get(target, key, target);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
+        return this._sizingView;
     }
 
     invested() {
@@ -546,8 +589,9 @@ export default class Backtest {
             const grossNow = this.grossExposure();
             const grossAfter = grossNow - Math.abs(prev * price) + Math.abs(next * price);
             const equity = this.totalValue() - fee;
-            if (grossAfter > grossNow + 1e-9 && grossAfter > this.maxLeverage * equity) {
-                throw new Error(`Insufficient margin: ${stockName} would take gross exposure to $${Math.round(grossAfter)} on $${Math.round(equity)} equity (max ${this.maxLeverage}x)`);
+            const cap = this.maxLeverage * this.leverage;
+            if (grossAfter > grossNow + 1e-9 && grossAfter > cap * equity) {
+                throw new Error(`Insufficient margin: ${stockName} would take gross exposure to $${Math.round(grossAfter)} on $${Math.round(equity)} equity (max ${+cap.toFixed(4)}x)`);
             }
         }
 

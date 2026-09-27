@@ -31,6 +31,9 @@ const fileSafe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, '_');
 const SETTLEMENT_SLACK_MS = 60000;
 const UNRECOVERABLE_CODES = new Set([-1022, -2014, -2015]);
 const LEVERAGE_HEADROOM = 3;
+const MAX_LEVERAGE = 10;
+
+const validLeverage = (value) => Number.isFinite(value) && value > 0 && value <= MAX_LEVERAGE;
 
 function heldAt(log, time) {
     let qty = 0;
@@ -61,6 +64,7 @@ export default class ForwardRunner {
         maxLeverage,
         maxNetExposure = Infinity,
         maxOrderNotional = Infinity,
+        leverage = 1,
         symbols = null,
         dryRun = false,
         dataDir = 'output/forward',
@@ -92,6 +96,7 @@ export default class ForwardRunner {
             throw new TypeError(`${broker.label} does not support forward trading; missing ${missing.join(', ')}`);
         }
         if (typeof capital !== 'number' || !(capital > 0)) throw new TypeError('capital must be a positive number');
+        if (!validLeverage(leverage)) throw new TypeError(`leverage must be greater than 0 and at most ${MAX_LEVERAGE}`);
         if (Object.keys(strategy.intervals).length !== 1) throw new Error('ForwardRunner currently supports one strategy interval');
         market = market ?? broker.market ?? 'stocks';
         if (!markets.includes(market)) throw new TypeError(`market must be one of: ${markets.join(', ')}`);
@@ -108,6 +113,9 @@ export default class ForwardRunner {
         this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : 1);
         this.maxNetExposure = maxNetExposure;
         this.maxOrderNotional = maxOrderNotional;
+        this.startLeverage = leverage;
+        this.leverage = leverage;
+        this.venueLeverageWarned = false;
         this.fixedSymbols = symbols ? [...symbols].sort() : null;
         this.dryRun = dryRun;
         this.logger = logger;
@@ -211,8 +219,16 @@ export default class ForwardRunner {
         return `${slug}${(hash % 1296).toString(36).padStart(2, '0')}`;
     }
 
-    totalValue() {
+    bookValue() {
         return Math.max(0, this.capital + this.realized + this.unrealized());
+    }
+
+    totalValue() {
+        return this.bookValue() * this.leverageFactor();
+    }
+
+    leverageFactor() {
+        return validLeverage(this.leverage) ? this.leverage : 1;
     }
 
     unrealized() {
@@ -395,7 +411,7 @@ export default class ForwardRunner {
 
     reconcileAccount() {
         if (!(this.accountEquity > 0)) return;
-        const mine = this.totalValue();
+        const mine = this.bookValue();
         const claimed = this.claimedShare();
         if (!(claimed > 0)) return;
         const drift = mine - claimed;
@@ -404,13 +420,13 @@ export default class ForwardRunner {
         if (over && !this.driftWarned) {
             this.driftWarned = true;
             this.event('warn', 'equity-drift',
-                `sizing equity ${mine.toFixed(2)} is ${(ratio * 100).toFixed(1)}% `
+                `strategy equity ${mine.toFixed(2)} is ${(ratio * 100).toFixed(1)}% `
                 + `${drift > 0 ? 'above' : 'below'} the ${claimed.toFixed(2)} this strategy can account for `
                 + 'on the venue; modelled fees or funding attribution have drifted');
         } else if (!over && this.driftWarned) {
             this.driftWarned = false;
             this.event('info', 'equity-drift-cleared',
-                `sizing equity is back within ${(this.driftWarnFraction * 100).toFixed(0)}% of the account`);
+                `strategy equity is back within ${(this.driftWarnFraction * 100).toFixed(0)}% of the account`);
         }
     }
 
@@ -592,10 +608,12 @@ export default class ForwardRunner {
         for (const intent of intents) intent.journalId = this.journal.intent(this.runId, timestamp, { ...intent, sizingEquity });
         const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
 
+        // A tick's sizingEquity is the run's own equity, which P&L and the
+        // equity curve are read from, so it is the book, not book x leverage.
         if (paused) {
             this.journal.tick(this.runId, {
                 ts: timestamp, durationMs: Date.now() - startedAt, ...info,
-                equity: this.equity, sizingEquity, available: this.availableBalance,
+                equity: this.equity, sizingEquity: this.bookValue(), available: this.availableBalance,
                 gross: this.grossExposure(), net: this.netExposure(),
                 positions: Object.keys(this.stockBalances).length, intents: intents.length,
                 ...stats, skipped: intents.length, status: 'paused',
@@ -613,7 +631,7 @@ export default class ForwardRunner {
         }
         const finish = (status) => this.journal.tick(this.runId, {
             ts: timestamp, durationMs: Date.now() - startedAt, ...info,
-            equity: this.equity, sizingEquity: this.totalValue(), available: this.availableBalance,
+            equity: this.equity, sizingEquity: this.bookValue(), available: this.availableBalance,
             gross: this.grossExposure(), net: this.netExposure(),
             positions: Object.keys(this.stockBalances).length, intents: intents.length, ...stats, status,
         });
@@ -685,10 +703,10 @@ export default class ForwardRunner {
             net += qty * px;
         }
         if (gross > this.maxLeverage * sizingEquity) {
-            throw new Error(`Projected gross ${(gross / sizingEquity).toFixed(2)}x exceeds maxLeverage ${this.maxLeverage}x`);
+            throw new Error(`Projected gross ${(gross / sizingEquity).toFixed(2)}x exceeds maxLeverage ${this.maxLeverage}x${this.leverageNote()}`);
         }
         if (Math.abs(net) > this.maxNetExposure * sizingEquity) {
-            throw new Error(`Projected net ${(net / sizingEquity).toFixed(2)}x exceeds maxNetExposure ${this.maxNetExposure}x`);
+            throw new Error(`Projected net ${(net / sizingEquity).toFixed(2)}x exceeds maxNetExposure ${this.maxNetExposure}x${this.leverageNote()}`);
         }
     }
 
@@ -1018,7 +1036,7 @@ export default class ForwardRunner {
             durationMs: 0,
             ...this.lastBatchInfo,
             equity: this.equity,
-            sizingEquity: this.totalValue(),
+            sizingEquity: this.bookValue(),
             available: this.availableBalance,
             gross: this.grossExposure(),
             net: this.netExposure(),
@@ -1299,7 +1317,7 @@ export default class ForwardRunner {
         if (!this.runId) return null;
         const row = this.journal.nextCommand(this.runId, this.lastCommandId);
         if (!row) return null;
-        if (!['pause', 'resume', 'stop', 'adjust'].includes(row.command)) {
+        if (!['pause', 'resume', 'stop', 'adjust', 'leverage'].includes(row.command)) {
             this.journal.ackCommands(this.runId, row.id);
             this.lastCommandId = row.id;
             return null;
@@ -1341,6 +1359,24 @@ export default class ForwardRunner {
         });
     }
 
+    restoreLeverage() {
+        const saved = Number(this.state.leverage);
+        const savedHalt = Number(this.state.maxDailyLoss);
+        const resuming = this.resumeRunId != null;
+        this.leverage = resuming && validLeverage(saved) ? saved : this.startLeverage;
+        if (resuming && savedHalt > 0 && savedHalt <= 1 && Number.isFinite(this.maxDailyLoss)) this.maxDailyLoss = savedHalt;
+        this.writeState({
+            leverage: this.leverage,
+            maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+        });
+        if (!resuming) {
+            this.journal.record(this.runId, Date.now(), 'leverage', {
+                value: this.leverage, from: null, note: 'start',
+                maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+            });
+        }
+    }
+
     async applyCommand({ id, command, note, amount }) {
         this.lastCommandId = id;
         this.journal.ackCommands(this.runId, id);
@@ -1371,6 +1407,24 @@ export default class ForwardRunner {
                 `allocation ${applied >= 0 ? '+' : ''}${applied.toFixed(2)} to ${this.capital.toFixed(2)}${detail}`,
                 { barTs: now });
             this.writeState({ adjustments: this.adjustments });
+            return null;
+        }
+        if (command === 'leverage') {
+            const next = Number(amount);
+            if (!validLeverage(next) || next === this.leverage) return null;
+            const now = Date.now();
+            const before = this.leverage;
+            const haltBefore = this.maxDailyLoss;
+            this.changeLeverage(next);
+            const halt = Number.isFinite(this.maxDailyLoss)
+                ? `, daily loss halt ${(haltBefore * 100).toFixed(1)}% -> ${(this.maxDailyLoss * 100).toFixed(1)}%`
+                : '';
+            this.event('info', 'leverage',
+                `leverage ${before}x -> ${next}x${halt}${detail}; resizes on the next bar`, { barTs: now });
+            this.journal.record(this.runId, now, 'leverage', {
+                value: next, from: before, note: note || '',
+                maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+            });
             return null;
         }
         if (command === 'pause') {
@@ -1414,7 +1468,7 @@ export default class ForwardRunner {
         if (!Number.isFinite(this.maxDailyLoss)) return null;
 
         const day = new Date(timestamp).toISOString().slice(0, 10);
-        const equity = this.totalValue();
+        const equity = this.bookValue();
         if (day !== this.dayKey) {
             this.dayKey = day;
             this.dayOpenEquity = equity;
@@ -1454,10 +1508,48 @@ export default class ForwardRunner {
         }
     }
 
-    targetLeverage() {
+    // The caps apply to book x leverage. Against the run's own money, which is
+    // what the venue margins, gross can therefore reach cap x leverage.
+    accountGrossCap() {
         const cap = Number(this.maxLeverage);
         if (!Number.isFinite(cap) || cap <= 0) return null;
-        return Math.max(1, Math.round(cap * LEVERAGE_HEADROOM));
+        return cap * this.leverageFactor();
+    }
+
+    targetLeverage() {
+        const gross = this.accountGrossCap();
+        if (gross == null) return null;
+        return Math.max(1, Math.round(gross * LEVERAGE_HEADROOM));
+    }
+
+    leverageNote() {
+        const lev = this.leverageFactor();
+        return lev === 1 ? '' : ` (sized at ${lev}x the run's own equity)`;
+    }
+
+    changeLeverage(value) {
+        if (Number.isFinite(this.maxDailyLoss) && this.leverage > 0) {
+            this.maxDailyLoss = Math.min(1, this.maxDailyLoss * value / this.leverage);
+        }
+        this.leverage = value;
+        this.venueLeverageWarned = false;
+        this.leverageChecked.clear();
+        this.writeState({
+            leverage: value,
+            maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+        });
+    }
+
+    checkVenueLeverage(symbol, wanted, ceiling) {
+        const gross = this.accountGrossCap();
+        if (gross == null || this.venueLeverageWarned || wanted >= gross * 1.5) return;
+        this.venueLeverageWarned = true;
+        const limit = this.accountLeverageCap != null && wanted >= this.accountLeverageCap
+            ? `the account allows at most ${this.accountLeverageCap}x`
+            : `${symbol} allows at most ${ceiling}x`;
+        this.event('warn', 'leverage-short',
+            `${limit}, but this run can hold ${gross.toFixed(2)}x its equity, so orders that add margin may be refused. Lower the leverage.`,
+            { data: { symbol, wanted, ceiling, accountCap: this.accountLeverageCap, gross } });
     }
 
     async ensureLeverage(symbol) {
@@ -1474,6 +1566,7 @@ export default class ForwardRunner {
                 ? await this.broker.maxLeverageFor(symbol)
                 : null;
             const wanted = Math.max(1, Math.min(target, ceiling > 0 ? ceiling : Infinity, this.accountLeverageCap ?? Infinity));
+            this.checkVenueLeverage(symbol, wanted, ceiling);
             const current = this.venueLeverage[symbol] ?? null;
             if (current === wanted) return;
             await this.broker.setLeverage(symbol, wanted);
@@ -1553,6 +1646,8 @@ export default class ForwardRunner {
             maxLeverage: this.maxLeverage,
             maxNetExposure: Number.isFinite(this.maxNetExposure) ? this.maxNetExposure : null,
             maxOrderNotional: Number.isFinite(this.maxOrderNotional) ? this.maxOrderNotional : null,
+            leverage: this.startLeverage,
+            maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
             maxOrderAttempts: this.maxOrderAttempts,
             maxMissingFraction: this.maxMissingFraction,
             symbols: this.fixedSymbols,
@@ -1583,9 +1678,10 @@ export default class ForwardRunner {
                 : null;
             if (this.resumeRunId == null) this.resetAllocation();
             else this.resumeAllocation();
+            this.restoreLeverage();
             const latestWarmup = await this.initialize({ interruptedBar });
             if (this.resumeRunId == null) {
-                this.baseline = this.totalValue();
+                this.baseline = this.bookValue();
                 this.journal.baselineEquity(this.runId, this.baseline);
             }
             if (interruptedBar != null) {
@@ -1594,7 +1690,7 @@ export default class ForwardRunner {
             }
             await this.pollIncome(true);
             let last = Math.max(latestWarmup, Number(this.state.lastProcessedBar || 0));
-            this.logger.log(`ForwardRunner: ${this.strategy.name} on ${this.broker.label}${this.dryRun ? ' (dry-run)' : ''}, $${this.capital.toLocaleString('en-US')} capital; live after ${new Date(last).toISOString()}`);
+            this.logger.log(`ForwardRunner: ${this.strategy.name} on ${this.broker.label}${this.dryRun ? ' (dry-run)' : ''}, $${this.capital.toLocaleString('en-US')} capital${this.leverageFactor() === 1 ? '' : ` at ${this.leverageFactor()}x`}; live after ${new Date(last).toISOString()}`);
             while (!this.stopped) {
                 this.pendingBatch ??= this.stream.nextBatch().then((batch) => ({ batch }));
                 const signal = this.waitForSignal();
@@ -1665,12 +1761,9 @@ export default class ForwardRunner {
         } finally {
             await this.stream?.stop();
             if (!fatal) await this.pollIncome(true);
-            // An ambiguous placement deliberately leaves the run open. The
-            // supervisor sees the non-zero exit, reattaches the same run, and
-            // resolves its pending venue key before completing the batch.
             if (!fatal?.restartRunner) {
                 this.journal.endRun(this.runId, endReason, fatal);
-                this.journal.finishRun(this.runId, { finalEquity: this.totalValue() });
+                this.journal.finishRun(this.runId, { finalEquity: this.bookValue() });
             }
             if (this.ownsJournal) this.journal.close();
             this.cache.close();
