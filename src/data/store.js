@@ -62,6 +62,8 @@ class Lru {
     }
 }
 
+const CACHED_SPAN = 2;
+const READ_COST = 150000;
 const HEADERS = new Lru(Number(process.env.STOCK_RUNNER_HEADER_CACHE_MB || 256) * 2 ** 20);
 const VIEWS = new Lru(Number(process.env.STOCK_RUNNER_VIEW_CACHE_MB || 1024) * 2 ** 20);
 
@@ -75,6 +77,22 @@ const headerBytes = (h) => h.layout.ts - h.layout.dirStart + 64 * h.names.length
 function headerIndex(h) {
     if (!h.index) h.index = new Map(h.names.map((name, i) => [name, i]));
     return h.index;
+}
+
+function headerFind(h, name) {
+    if (h.sorted === undefined) {
+        h.sorted = true;
+        for (let i = 1; i < h.names.length; i++) if (compareNames(h.names[i - 1], h.names[i]) >= 0) { h.sorted = false; break; }
+    }
+    if (!h.sorted) return headerIndex(h).get(name);
+    let lo = 0;
+    let hi = h.names.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (h.names[mid] < name) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < h.names.length && h.names[lo] === name ? lo : undefined;
 }
 
 function headerCoverage(h) {
@@ -537,7 +555,7 @@ export class Dataset {
         return ordered;
     }
 
-    view(key, fields = null) {
+    view(key, fields = null, { cache = true } = {}) {
         return this.retrying(() => {
             const segs = this.parts.get(key) ?? [];
             if (!segs.length) return null;
@@ -553,7 +571,7 @@ export class Dataset {
             const view = loaded.length === 1
                 ? singleView(key, headers[0], loaded[0])
                 : mergedView(key, loaded, wanted, this.step, this.tolerance);
-            return VIEWS.set(`${sig}|${tag}`, view, view.bytes);
+            return cache ? VIEWS.set(`${sig}|${tag}`, view, view.bytes) : view;
         });
     }
 
@@ -565,21 +583,23 @@ export class Dataset {
 
     *scan({ from = -Infinity, to = Infinity, fields = null } = {}) {
         this.list();
-        for (const key of this.keysIn(from, to)) {
-            const view = this.view(key, fields);
+        const keys = this.keysIn(from, to);
+        const cache = keys.length <= CACHED_SPAN;
+        for (const key of keys) {
+            const view = this.view(key, fields, { cache });
             if (!view || !view.rows) continue;
             const [i0, i1] = view.orderRange(from, to);
             if (i0 < i1) yield { view, i0, i1 };
         }
     }
 
-    readPartition(key, names, from, to, fields) {
+    readPartition(key, names, from, to, fields, { cache = true } = {}) {
         return this.retrying(() => {
             const out = new Map();
             const cached = this.cachedView(key);
             const segs = this.parts.get(key) ?? [];
-            if (cached || names.length > 64) {
-                const view = cached ?? this.view(key, fields);
+            if (cached || this.wantsView(segs, names, from, to, fields)) {
+                const view = cached ?? this.view(key, fields, { cache });
                 if (!view) return out;
                 for (const name of names) {
                     const s = view.indexOf(name);
@@ -592,10 +612,9 @@ export class Dataset {
             const found = new Map();
             segs.forEach((seg, priority) => {
                 const h = this.header(seg);
-                const index = headerIndex(h);
                 const requests = [];
                 for (const name of names) {
-                    const j = index.get(name);
+                    const j = headerFind(h, name);
                     if (j === undefined || !h.count[j] || h.dirMax[j] < from || h.dirMin[j] > to) continue;
                     requests.push({ sym: j, from, to, name });
                 }
@@ -617,20 +636,77 @@ export class Dataset {
         });
     }
 
+    wantsView(segs, names, from, to, fields) {
+        let hits = 0;
+        let total = 0;
+        for (const seg of segs) {
+            const h = this.header(seg);
+            total += h.rows;
+            for (const name of names) {
+                const j = headerFind(h, name);
+                if (j === undefined || !h.count[j] || h.dirMax[j] < from || h.dirMin[j] > to) continue;
+                hits++;
+            }
+        }
+        return hits * (1 + fields.length) * READ_COST > total * (12 + 8 * fields.length);
+    }
+
+    readWide(keys, from, to, wanted, fields, cache) {
+        const counts = new Map();
+        for (const key of keys) {
+            for (const [name, s] of this.partitionStats(key, from, to, { cache })) counts.set(name, (counts.get(name) ?? 0) + s.count);
+        }
+        const out = new Map();
+        const at = new Map();
+        for (const [name, n] of counts) {
+            const series = { ts: new Float64Array(n) };
+            for (const field of wanted) series[field] = new Float64Array(n);
+            out.set(name, series);
+            at.set(name, 0);
+        }
+        for (const key of keys) {
+            const view = this.view(key, fields, { cache });
+            if (!view) continue;
+            for (let s = 0; s < view.names.length; s++) {
+                if (!view.count[s]) continue;
+                const [a, b] = view.runRange(s, from, to);
+                if (a >= b) continue;
+                const name = view.names[s];
+                const series = out.get(name);
+                const i = at.get(name);
+                if (!series || i + b - a > series.ts.length) throw new Error(`${this.dir}: ${name} has more rows in ${key} than its header counts`);
+                series.ts.set(view.ts.subarray(a, b), i);
+                for (const field of wanted) {
+                    const col = view.cols[field];
+                    if (col) series[field].set(col.subarray(a, b), i);
+                    else series[field].fill(NaN, i, i + b - a);
+                }
+                at.set(name, i + b - a);
+            }
+        }
+        for (const [name, series] of out) {
+            if (at.get(name) !== series.ts.length) throw new Error(`${this.dir}: ${name} has fewer rows than its header counts`);
+        }
+        return out;
+    }
+
     read({ symbols = null, from = -Infinity, to = Infinity, fields = null } = {}) {
         this.list();
         const wanted = fields ?? this.fields;
+        const keys = this.keysIn(from, to);
+        const cache = keys.length <= CACHED_SPAN;
+        if (!symbols && keys.length > 1) return this.readWide(keys, from, to, wanted, fields, cache);
         const chunks = new Map();
         const push = (name, run) => {
             if (!chunks.has(name)) chunks.set(name, []);
             chunks.get(name).push(run);
         };
-        for (const key of this.keysIn(from, to)) {
+        for (const key of keys) {
             if (symbols) {
-                for (const [name, run] of this.readPartition(key, symbols, from, to, wanted)) push(name, run);
+                for (const [name, run] of this.readPartition(key, symbols, from, to, wanted, { cache })) push(name, run);
                 continue;
             }
-            const view = this.view(key, fields);
+            const view = this.view(key, fields, { cache });
             if (!view) continue;
             for (let s = 0; s < view.names.length; s++) {
                 if (!view.count[s]) continue;
@@ -656,7 +732,7 @@ export class Dataset {
             const found = this.retrying(() => {
                 for (const seg of this.parts.get(key) ?? []) {
                     const h = this.header(seg);
-                    const j = headerIndex(h).get(name);
+                    const j = headerFind(h, name);
                     if (j === undefined || !h.count[j] || h.dirMax[j] < from || h.dirMin[j] > to) continue;
                     if (h.dirMin[j] >= from || h.dirMax[j] <= to) return true;
                     const [run] = readRuns(seg.file, h, [{ sym: j, from, to }], []);
@@ -705,7 +781,7 @@ export class Dataset {
         return { ts: run.ts, ...run.cols };
     }
 
-    partitionStats(key, from, to) {
+    partitionStats(key, from, to, { cache = true } = {}) {
         return this.retrying(() => {
             const segs = this.parts.get(key) ?? [];
             const [pa, pb] = this.boundsOf(key);
@@ -731,7 +807,7 @@ export class Dataset {
                 }
                 if (disjoint) return seen;
             }
-            const view = this.view(key, []);
+            const view = this.view(key, [], { cache });
             if (!view) return out;
             for (let s = 0; s < view.names.length; s++) {
                 if (!view.count[s]) continue;
