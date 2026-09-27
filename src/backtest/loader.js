@@ -1,119 +1,69 @@
 import Stock from './stock.js';
-import { sql } from '../db.js';
-import { allowedIntervals, intervalMsMap, candleTable, fundingTable } from './consts.js';
 import Candle from './candle.js';
-import http from 'http';
-import { StringDecoder } from 'node:string_decoder';
+import { allowedIntervals, candleDataset, intervalMsMap } from './consts.js';
+import { candles, funding } from '../data/datasets.js';
 
-const columnsFor = (market) => market === 'crypto'
-    ? 'ticker, open, high, low, close, volume, quote_volume, cast(timestamp as long) timestamp_us'
-    : 'ticker, open, high, low, close, volume, cast(timestamp as long) timestamp_us';
+const fieldsFor = (market) => (market === 'crypto'
+    ? ['open', 'high', 'low', 'close', 'volume', 'quoteVolume']
+    : ['open', 'high', 'low', 'close', 'volume']);
 
-const timestampMs = value => {
-    const numeric = Number(value);
-    // QuestDB TIMESTAMP values cast to LONG are microseconds.
-    if (Number.isFinite(numeric)) return numeric / 1000;
-    return Date.parse(value);
-};
-
-function rowToCandle(row, market) {
-    if (market === 'crypto') {
-        return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[7]), +row[6]);
+function checkInterval(interval) {
+    if (!allowedIntervals.includes(interval)) {
+        throw new TypeError(`Invalid interval: ${interval}`);
     }
-    return new Candle(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[6]));
 }
 
-function pushRow(stock, row, market) {
-    if (market === 'crypto') {
-        stock.pushValues(+row[1], +row[2], +row[3], +row[4], +row[5], timestampMs(row[7]), +row[6]);
-        return;
+function checkDates(...dates) {
+    if (!dates.every(d => d instanceof Date)) {
+        throw new TypeError('dates must be instances of Date');
     }
-    const close = +row[4];
-    const volume = +row[5];
-    stock.pushValues(+row[1], +row[2], +row[3], close, volume, timestampMs(row[6]), volume * close);
 }
 
-function parseCsvLine(line) {
-    const fields = line.split(',');
-    for (let i = 0; i < fields.length; i++) {
-        const field = fields[i];
-        if (field.length >= 2 && field.charCodeAt(0) === 34 && field.charCodeAt(field.length - 1) === 34) {
-            fields[i] = field.slice(1, -1).replaceAll('""', '"');
-        }
-    }
-    return fields;
+function column(series, field) {
+    return series[field] ?? new Float64Array(series.ts.length).fill(NaN);
 }
 
-/**
- * Async-generator that streams rows from QuestDB’s /exp CSV API.
- *
- * @param {string} query   A SQL query to run
- * @param {object} opts    Optional connection params
- * @param {string} opts.host    QuestDB host (default 'localhost')
- * @param {number} opts.port    QuestDB port (default 9000)
- * @param {object} opts.headers Any extra HTTP headers
- *
- * @yields {object} Each row as an object: { col1: val1, col2: val2, … }
- */
-async function* fastFetch(
-    query,
-    { host = 'localhost', port = 9000, headers = {} } = {}
-) {
-    // 1) kick off the HTTP request
-    const req = http.request({
-        host,
-        port,
-        path: `/exp?query=${encodeURIComponent(query)}`,  // :contentReference[oaicite:0]{index=0}
-        method: 'GET',
-        headers: {
-            Accept: 'text/csv',
-            ...headers,
-        },
-    });
+function quoteVolumes(series, market) {
+    const { close, volume } = series;
+    if (market === 'crypto' && series.quoteVolume) return series.quoteVolume;
+    const out = new Float64Array(series.ts.length);
+    for (let i = 0; i < out.length; i++) out[i] = volume[i] * close[i];
+    return out;
+}
 
-    const res = await new Promise((resolve, reject) => {
-        req.on('error', reject);
-        req.on('response', resolve);
-        req.end();
-    });
-
-    if (res.statusCode !== 200) {
-        throw new Error(`QuestDB error: ${res.statusCode}`);
+function stockFrom(name, interval, series, market, reverse = false) {
+    const stock = new Stock(name, intervalMsMap[interval]);
+    if (!series || !series.ts.length) {
+        stock.finish();
+        return stock;
     }
-
-    const decoder = new StringDecoder('utf8');
-    let leftover = '';
-    let header = true;
-
-    const consumeLine = line => {
-        if (line.endsWith('\r')) line = line.slice(0, -1);
-        if (!line) return null;
-        if (header) {
-            header = false;
-            return null;
-        }
-        return parseCsvLine(line);
+    const n = series.ts.length;
+    const cols = {
+        opens: column(series, 'open'),
+        highs: column(series, 'high'),
+        lows: column(series, 'low'),
+        closes: column(series, 'close'),
+        volumes: column(series, 'volume'),
+        timestamps: series.ts,
+        quoteVolumes: quoteVolumes(series, market),
     };
-
-    for await (const chunk of res) {
-        const text = leftover + decoder.write(chunk);
-        let start = 0;
-        for (let i = 0; i < text.length; i++) {
-            if (text.charCodeAt(i) !== 10) continue;
-            const row = consumeLine(text.slice(start, i));
-            if (row) yield row;
-            start = i + 1;
-        }
-        leftover = text.slice(start);
+    for (const [key, values] of Object.entries(cols)) {
+        const buffer = Float64Array.from(values);
+        if (reverse) buffer.reverse();
+        stock[key].buffer = buffer;
+        stock[key].length = n;
     }
+    stock.size = n;
+    stock.finish();
+    return stock;
+}
 
-    leftover += decoder.end();
-    const row = consumeLine(leftover);
-    if (row) yield row;
+function dataset(interval, market, venue) {
+    return candles(market, interval, venue);
 }
 
 /**
- * Loads data for a stock from the database.
+ * Loads data for a stock from the store.
  * @param {string} stockName - The name of the stock to load.
  * @param {string} interval - The interval of the data to load.
  * @param {Date} startDate - The start date of the data to load.
@@ -123,25 +73,16 @@ async function* fastFetch(
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
 export async function loadStockInRange(stockName, interval, startDate, endDate, market = 'stocks', venue = 'binance') {
-    if (!allowedIntervals.includes(interval)) {
-        throw new TypeError(`Invalid interval: ${interval}`);
-    }
-    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
-        throw new TypeError('startDate and endDate must be instances of Date');
-    }
-
-    const intervalMs = intervalMsMap[interval];
-    const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp >= ${startDate.getTime() * 1000} AND timestamp < ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
-    for await (const candle of candles) {
-        pushRow(stock, candle, market);
-    }
-    stock.finish();
-    return stock;
+    checkInterval(interval);
+    checkDates(startDate, endDate);
+    const series = dataset(interval, market, venue).series(stockName, {
+        from: startDate.getTime(), to: endDate.getTime() - 1, fields: fieldsFor(market),
+    });
+    return stockFrom(stockName, interval, series, market);
 }
 
 /**
- * Loads data for a stock from the database.
+ * Loads data for a stock from the store.
  * @param {string} stockName - The name of the stock to load.
  * @param {string} interval - The interval of the data to load.
  * @param {Date} date - The date to load the data after.
@@ -151,32 +92,22 @@ export async function loadStockInRange(stockName, interval, startDate, endDate, 
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
 export async function loadStockAfterTimestamp(stockName, interval, date, candlesCount, market = 'stocks', venue = 'binance') {
-    if (!allowedIntervals.includes(interval)) {
-        throw new TypeError(`Invalid interval: ${interval}`);
-    }
-    if (!(date instanceof Date)) {
-        throw new TypeError('date must be an instance of Date');
-    }
+    checkInterval(interval);
+    checkDates(date);
     if (typeof candlesCount !== 'number') {
         throw new TypeError('candlesCount must be a number');
     }
     if (candlesCount < 1) {
         throw new TypeError('candlesCount must be greater than 0');
     }
-
-    const intervalMs = intervalMsMap[interval];
-    const stock = new Stock(stockName, intervalMs);
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp >= ${date.getTime() * 1000} ORDER BY timestamp ASC LIMIT ${candlesCount}`);
-    for await (const candle of candles) {
-        pushRow(stock, candle, market);
-    }
-    stock.finish();
-    return stock;
+    const series = dataset(interval, market, venue).first(stockName, {
+        from: date.getTime(), count: candlesCount, fields: fieldsFor(market),
+    });
+    return stockFrom(stockName, interval, series, market);
 }
 
 function startDate(interval, date, candlesCount, market = 'stocks') {
     if (market === 'crypto') {
-        // 24/7 market
         const t = (date instanceof Date) ? date.getTime() : +date;
         return new Date(t - (candlesCount + 1) * intervalMsMap[interval]);
     }
@@ -216,7 +147,6 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
         while (need > 0) {
           const p = parts(curOpen);
           const year = +p.year, month = +p.month;
-          // find first trading day of this month
           let cursor = curOpen;
           while (true) {
             const q = parts(cursor);
@@ -226,7 +156,6 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
           }
           curOpen = firstOpen;
           need--;
-          // move to previous completed trading day before the last day of previous month
           curOpen = prevTradingDayOpen(curOpen - 1);
         }
         return new Date(curOpen);
@@ -236,11 +165,11 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
       while (totalDays > 1) { cur = prevTradingDayOpen(cur - 1); totalDays--; }
       return new Date(cur);
     }
-  
+
     const intervalMin = unit === 'h' ? n * 60 : n;
     const stepMs = intervalMin * 60000;
     const candlesPerSession = Math.floor(sessionMin / intervalMin);
-  
+
     const lastSessionInfo = (() => {
       const p = parts(t - 1);
       const localMinFromOpen = minutesOfDay(p) - openMin;
@@ -251,24 +180,24 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
       const sessionOpen = openForLocalDate(t - 1);
       return {available, lastIndex, sessionOpen};
     })();
-  
+
     let need = candlesCount;
     if (need <= lastSessionInfo.available) {
       const startIndex = lastSessionInfo.lastIndex - (need - 1);
       return new Date(lastSessionInfo.sessionOpen + startIndex * stepMs);
     }
     need -= lastSessionInfo.available;
-    let fullSkip = Math.floor((need - 1) / candlesPerSession); // how many full sessions to step back beyond the one that will supply partial
+    let fullSkip = Math.floor((need - 1) / candlesPerSession);
     let remainder = need - fullSkip * candlesPerSession;
-    // move to the session that will provide the earliest candle
     let targetOpen = lastSessionInfo.available ? prevTradingDayOpen(lastSessionInfo.sessionOpen - 1) : prevTradingDayOpen(t - 1);
     for (let i=0;i<fullSkip;i++) targetOpen = prevTradingDayOpen(targetOpen - 1);
-    if (remainder === 0) return new Date(targetOpen); // exact fit: start at open of that session
+    if (remainder === 0) return new Date(targetOpen);
     const startIndex = candlesPerSession - remainder;
     return new Date(targetOpen + startIndex * stepMs);
 }
+
 /**
- * Loads data for a stock from the database.
+ * Loads data for a stock from the store.
  * @param {string} stockName - The name of the stock to load.
  * @param {string} interval - The interval of the data to load.
  * @param {Date} date - The date to load the data before.
@@ -277,29 +206,19 @@ function startDate(interval, date, candlesCount, market = 'stocks') {
  * @throws {TypeError} If the interval is invalid or date is not an instance of Date.
  */
 export async function loadStockBeforeTimestamp(stockName, interval, date, candlesCount, market = 'stocks', venue = 'binance') {
-    if (!allowedIntervals.includes(interval)) {
-        throw new TypeError(`Invalid interval: ${interval}`);
-    }
-    if (!(date instanceof Date)) {
-        throw new TypeError('date must be an instance of Date');
-    }
-
-    const intervalMs = intervalMsMap[interval];
-    const stock = new Stock(stockName, intervalMs);
-    let aboveTimestamp = startDate(interval, date, candlesCount, market).getTime();
-    const q = `SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE ticker = '${stockName}' AND timestamp <= ${date.getTime() * 1000} AND timestamp >= ${aboveTimestamp * 1000} ORDER BY timestamp DESC LIMIT ${candlesCount}`;
-    const candles = fastFetch(q);
-    const start = Date.now();
-    for await (const candle of candles) {
-        pushRow(stock, candle, market);
-    }
-    stock.finish();
-    return stock;
+    checkInterval(interval);
+    checkDates(date);
+    const series = dataset(interval, market, venue).last(stockName, {
+        at: date.getTime(),
+        from: startDate(interval, date, candlesCount, market).getTime(),
+        count: candlesCount,
+        fields: fieldsFor(market),
+    });
+    return stockFrom(stockName, interval, series, market, true);
 }
 
-
 /**
- * Loads data for all stocks from the database.
+ * Loads data for all stocks from the store.
  * @param {string} interval - The interval of the data to load.
  * @param {Date} startDate - The start date of the data to load.
  * @param {Date} endDate - The end date of the data to load.
@@ -307,64 +226,75 @@ export async function loadStockBeforeTimestamp(stockName, interval, date, candle
  * @throws {TypeError} If the interval is invalid or startDate and endDate are not instances of Date.
  */
 export async function loadAllStocksInRange(interval, startDate, endDate, market = 'stocks', venue = 'binance') {
-    if (!allowedIntervals.includes(interval)) {
-        throw new TypeError(`Invalid interval: ${interval}`);
-    }
-    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
-        throw new TypeError('startDate and endDate must be instances of Date');
-    }
+    checkInterval(interval);
+    checkDates(startDate, endDate);
+    const out = {};
+    const all = dataset(interval, market, venue).read({ from: startDate.getTime(), to: endDate.getTime(), fields: fieldsFor(market) });
+    for (const [name, series] of all) out[name] = stockFrom(name, interval, series, market);
+    return out;
+}
 
-    const intervalMs = intervalMsMap[interval];
-    const stocks = {};
-
-    const candles = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
-    for await (const candle of candles) {
-        const stockName = candle[0];
-        if (!stocks[stockName]) {
-            stocks[stockName] = new Stock(stockName, intervalMs);
+export function* candleGroups(interval, startDate, endDate, market = 'stocks', venue = 'binance') {
+    checkInterval(interval);
+    checkDates(startDate, endDate);
+    const ds = dataset(interval, market, venue);
+    if (!ds.exists) {
+        throw new Error(`no ${candleDataset(market, interval, venue)} data in the store; ingest it first`);
+    }
+    const crypto = market === 'crypto';
+    for (const { view, i0, i1 } of ds.scan({ from: startDate.getTime(), to: endDate.getTime(), fields: fieldsFor(market) })) {
+        const { ts, order, names } = view;
+        const sym = view.symbols();
+        const nan = new Float64Array(view.rows).fill(NaN);
+        const open = view.cols.open ?? nan;
+        const high = view.cols.high ?? nan;
+        const low = view.cols.low ?? nan;
+        const close = view.cols.close ?? nan;
+        const volume = view.cols.volume ?? nan;
+        const quoteVolume = crypto ? view.cols.quoteVolume : null;
+        let i = i0;
+        while (i < i1) {
+            const timestamp = ts[order[i]];
+            const records = [];
+            while (i < i1 && ts[order[i]] === timestamp) {
+                const r = order[i++];
+                const c = close[r];
+                const v = volume[r];
+                records.push({
+                    stockName: names[sym[r]],
+                    candle: new Candle(open[r], high[r], low[r], c, v, timestamp, quoteVolume ? quoteVolume[r] : v * c),
+                });
+            }
+            yield { timestamp, records };
         }
-        pushRow(stocks[stockName], candle, market);
     }
-
-    for (const stock in stocks) {
-        stocks[stock].finish();
-    }
-    return stocks;
 }
 
 /**
  * Streams all candles in timestamp order without materializing per-symbol columns.
  */
 export async function* streamAllStocksInRange(interval, startDate, endDate, market = 'stocks', venue = 'binance') {
-    if (!allowedIntervals.includes(interval)) {
-        throw new TypeError(`Invalid interval: ${interval}`);
-    }
-    if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
-        throw new TypeError('startDate and endDate must be instances of Date');
-    }
-
-    const rows = fastFetch(`SELECT ${columnsFor(market)} FROM ${candleTable(market, interval, venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
-    for await (const row of rows) {
-        yield { stockName: row[0], candle: rowToCandle(row, market) };
+    for (const group of candleGroups(interval, startDate, endDate, market, venue)) {
+        yield* group.records;
     }
 }
 
 /**
- * Gets the names of all stocks in the database.
+ * Gets the names of all stocks in the store.
  * @returns {Promise<string[]>} The names of all stocks.
  */
 export async function getStockNames(market = 'stocks', interval = '1d', venue = 'binance') {
-    const stocks = await sql`SELECT DISTINCT ticker FROM ${sql(candleTable(market, interval, venue))}`;
-    return stocks.map(stock => stock.ticker);
+    return dataset(interval, market, venue).symbolNames();
 }
 
 export async function loadFundingInRange(startDate, endDate, venue = 'binance') {
     const out = {};
-    const rows = fastFetch(`SELECT ticker, rate, timestamp FROM ${fundingTable(venue)} WHERE timestamp >= ${startDate.getTime() * 1000} AND timestamp <= ${endDate.getTime() * 1000} ORDER BY timestamp ASC`);
-    for await (const row of rows) {
-        const e = out[row[0]] ??= { time: [], rate: [] };
-        e.time.push(Math.floor(new Date(row[2]).getTime() / 1000) * 1000);
-        e.rate.push(+row[1]);
+    const all = funding(venue).read({ from: startDate.getTime(), to: endDate.getTime(), fields: ['rate'] });
+    for (const [name, series] of all) {
+        out[name] = {
+            time: Array.from(series.ts, t => Math.floor(t / 1000) * 1000),
+            rate: Array.from(series.rate),
+        };
     }
     return out;
 }

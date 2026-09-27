@@ -1,4 +1,4 @@
-data/
+/data/
 .env
 node_modules/
 comments.txt
@@ -8,3 +8,4 @@ output/
 .DS_Store
 strategies/.terminal/
 output/HALT
+test/

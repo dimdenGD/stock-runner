@@ -1,19 +1,12 @@
 # Stock Runner
 
 Because of lack of good algotrading tools in JavaScript, I've decided to build my own.
-It uses QuestDB to efficiently store and query the data.
 It's also quite fast and nice to use. You can run a 5 year backtest on ALL stocks in 1 minute (on daily ticks).
 
 ## Installation
 
 1. Clone the repository.
 2. Install dependencies: `npm install`
-3. **QuestDB**
-   - Download from [questdb.com/download](https://questdb.com/download/)
-   - Run: `./questdb` (or `./questdb.exe` on Windows)
-   - Default: `admin:quest@localhost:8812/qdb`. For custom setup, set:
-     - `QUESTDB_USERNAME`, `QUESTDB_PASSWORD`
-     - `QUESTDB_HOST`, `QUESTDB_PORT`, `QUESTDB_DATABASE`
 
 ---
 
@@ -23,7 +16,7 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
 
 1. Go to [stooq.com/db/h](https://stooq.com/db/h/)
 2. Download daily/hourly/5m data and place `nasdaq stocks`, etc., in `data/stooq/1d`, `data/stooq/1h`, `data/stooq/5m`
-3. Ingest into QuestDB:
+3. Ingest into the store:
    ```bash
    node scripts/stooq_ingest.js <1d|1h|5m>
    ```
@@ -31,33 +24,29 @@ It's also quite fast and nice to use. You can run a 5 year backtest on ALL stock
 
 ### Binance (free, crypto futures)
 
-1. Download klines and funding rates into `data/binance/`:
-   ```bash
-   node scripts/binance_download.js <interval> [startMonth] [endMonth] [--no-daily] [--tail-only]
-   ```
-   - Example: `node scripts/binance_download.js 15m 2023-09`
-   - `interval` can be `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
-   - Re-run to update data.
-2. Ingest into QuestDB (`crypto_candles_<interval>` and `crypto_funding`):
-   ```bash
-   node scripts/binance_ingest.js <interval>
-   ```
+Download klines and funding rates:
+
+```bash
+node scripts/binance_download.js <interval> [startMonth] [endMonth] [--no-daily] [--tail-only]
+```
+
+- Example: `node scripts/binance_download.js 15m 2023-09`
+- `interval` can be `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
+- Re-run to update data. Only data that is not in the store yet is downloaded.
+- `--tail-only` only gets the days after the last full month in the store, it's much faster.
 
 ### Hyperliquid (free, crypto perps)
 
 The API serves only the latest 5000 candles per interval (4h ≈ 2.3 years, 1h ≈ 7 months, 15m ≈ 52 days).
 
-1. Download candles and hourly funding into `data/hyperliquid/`:
-   ```bash
-   node scripts/hyperliquid_download.js <interval> [--coins=BTC,ETH] [--hip3] [--no-funding] [--funding-from=YYYY-MM]
-   ```
-   - Example: `node scripts/hyperliquid_download.js 4h`
-   - `--hip3` adds builder-dex markets (tickers like `xyz:TSLA`).
-   - Funding starts at each coin's first stored candle unless `--funding-from` is set.
-2. Ingest into QuestDB (`hl_candles_<interval>` and `hl_funding`):
-   ```bash
-   node scripts/hyperliquid_ingest.js <interval>
-   ```
+```bash
+node scripts/hyperliquid_download.js <interval> [--coins=BTC,ETH] [--hip3] [--no-funding] [--funding-from=YYYY-MM]
+```
+
+- Example: `node scripts/hyperliquid_download.js 4h`
+- `--hip3` adds builder-dex markets (tickers like `xyz:TSLA`).
+- Funding starts at each coin's first stored candle unless `--funding-from` is set.
+- Re-run to update data.
 
 ### Massive (paid)
 
@@ -65,18 +54,12 @@ The API serves only the latest 5000 candles per interval (4h ≈ 2.3 years, 1h �
 2. Set `MASSIVE_KEY` in `.env`
 3. Run:
    ```bash
-   node scripts/massive_download.js <period> <startDate> <skip downloaded tickers>
+   node scripts/massive_download.js <period> <startDate> <skip stored tickers>
    ```
    - Example: `node scripts/massive_download.js 1d 2003-09-10 true`
-   - `period` can be `1d`, `1h`, `5m`, `1m`
-   - `startDate` is the date to start downloading from
-   - `skip downloaded tickers` is a boolean flag to skip already downloaded tickers
-5. Ingest into QuestDB:
-   ```bash
-   node scripts/massive_ingest.js <period>
-   ```
-   - Example: `node scripts/massive_ingest.js 1d`
-   - `period` can be `1d`, `1h`, `5m`, `1m`
+   - `period` can be `1d`, `1h`, `15m`, `5m`, `1m`
+   - `startDate` defaults to the last timestamp in the store, or `2003-09-10`
+   - `skip stored tickers` skips tickers that are already in the store
 
 ### Alpaca (free with an account, history from 2016)
 
@@ -85,16 +68,12 @@ The API serves only the latest 5000 candles per interval (4h ≈ 2.3 years, 1h �
    - Optional: `ALPACA_FEED` (`sip` or `iex`, default `sip`), `ALPACA_RPM` (requests per minute, default `200`), `ALPACA_TRADING_URL` (default paper API)
 3. Run:
    ```bash
-   node scripts/alpaca_download.js <period> <startDate> <skip downloaded tickers> <adjustment>
+   node scripts/alpaca_download.js <period> <startDate> <skip stored tickers> <adjustment>
    ```
    - Example: `node scripts/alpaca_download.js 15m 2023-01-01 true all`
    - `period` can be `1d`, `1h`, `15m`, `5m`, `1m`
-   - `startDate` defaults to the last timestamp in the table, or `2016-01-01`
+   - `startDate` defaults to the last timestamp in the store, or `2016-01-01`
    - `adjustment` can be `raw`, `split`, `dividend`, `all` (default `all`)
-4. Ingest into QuestDB:
-   ```bash
-   node scripts/alpaca_ingest.js <period>
-   ```
 
 ---
 
@@ -154,7 +133,7 @@ const bt = new Backtest({
 
 const result = await bt.runOnTicker('AAPL');  // single symbol
 // or
-const result = await bt.runOnAllTickers();    // all symbols in DB
+const result = await bt.runOnAllTickers();    // all symbols in the store
 
 bt.logMetrics(result);
 ```
@@ -228,10 +207,13 @@ bt.logMetrics(result);
   - Both: SEC $20.60/million sold, FINRA TAF $0.000195/sold share capped at $9.79, CAT $0.000003/share on buys and sells.
   - Optional second argument: slippage (decimal, e.g. `0.001` = 0.1%).
   - Optional third argument: `{ exchangeFeePerShare }`. default `0.003`
-- **`Alpaca`** - Commission-free U.S. equity; regulatory fees only:
-  - `new Alpaca(slippage?)`
+- **`Alpaca`** - Commission-free U.S. equity, regulatory fees only:
+  - `new Alpaca({ environment, apiKey, apiSecret, feed, slippage, rpm })`
   - Commission: $0. Sells: SEC $20.60 per $1M, FINRA TAF $0.000195/share (max $9.79). All: CAT $0.000003/share.
-  - `slippage` - fraction (e.g. `0.001` = 0.1%), default `0`.
+  - `environment` - `paper` (default) or `live`.
+  - `apiKey`, `apiSecret` - needed for data and orders
+  - `feed` - `sip` (default) or `iex`. `slippage` - fraction, default `0`. `rpm` - requests per minute, default `190`.
+ 
 - **`BinanceFutures`** - USD-M futures. Supports forward testing:
   - `new BinanceFutures({ feeBps, slippage, impactCoef, depthRatio, environment, apiKey, apiSecret })`
   - `feeBps` - fee in basis points, default `5` (VIP0 taker).
@@ -289,6 +271,51 @@ await runner.run();
 ```bash
 node scripts/forward_report.js --strategy=<name> [--run=N | --runs]
 ```
+
+### AuctionRunner
+
+Close-to-open books
+
+```js
+import AuctionRunner from '../src/forward/auction.js';
+
+const broker = new Alpaca({ environment: 'paper', apiKey, apiSecret });
+const runner = new AuctionRunner({ strategy, broker, capital: 25_000, dryRun: false });
+await runner.run();
+```
+
+```js
+import { replayAuction } from '../src/forward/auction.js';
+
+const { runId, metrics } = await replayAuction({ strategy, broker, capital: 25_000, from: '2026-08-01', to: '2026-09-25' });
+```
+
+### Data store
+
+Data is saved in `data/`.
+
+```js
+import { candles, dataset } from '../src/data/datasets.js';
+
+const ds = candles('crypto', '15m', 'binance');
+ds.series('BTCUSDT', { from, to });   // { ts, open, high, low, close, volume, ... }
+ds.read({ symbols, from, to });       // Map of symbol -> data
+ds.last('BTCUSDT', { at, count });    // last `count` bars up to `at`
+ds.stats();                           // first bar, last bar and bar count of every symbol
+```
+
+- Values are `Float64Array`s and timestamps are candle close times in ms.
+
+You can store your own data too:
+
+```js
+const mine = dataset('custom/1h', { create: true, fields: ['close'], step: 3600000, partition: 'month' });
+mine.write({ BTCUSDT: { ts, close } });
+```
+
+- `partition` is how much time goes in one file: `hour`, `day`, `week`, `month`, `quarter` or `year`.
+- Writing the same symbol and timestamp again replaces the old row.
+
 ---
 
 ## Strategies

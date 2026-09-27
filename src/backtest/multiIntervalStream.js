@@ -3,7 +3,7 @@ import ms from 'ms';
 import { subDays } from 'date-fns';
 import { formatDate } from '../utils.js';
 import { intervalMsMap } from './consts.js';
-import { loadFundingInRange, loadStockBeforeTimestamp, streamAllStocksInRange } from './loader.js';
+import { candleGroups, loadFundingInRange, loadStockBeforeTimestamp } from './loader.js';
 
 const chunkBarsByInterval = {
     '1d': 250,
@@ -57,6 +57,10 @@ export class GroupedCandleReader {
         this.pending = next.done ? null : next.value;
     }
 
+    get nextTimestamp() {
+        return this.pending ? this.pending.candle.timestamp : null;
+    }
+
     async nextGroup() {
         await this.prime();
         if (this.done) return null;
@@ -85,6 +89,46 @@ export class GroupedCandleReader {
     }
 }
 
+export class GroupReader {
+    constructor(groups) {
+        this.iterator = groups[Symbol.iterator]();
+        this.pending = null;
+        this.done = false;
+    }
+
+    async prime() {
+        if (this.pending || this.done) return;
+        const next = this.iterator.next();
+        this.done = next.done;
+        this.pending = next.done ? null : next.value;
+    }
+
+    get nextTimestamp() {
+        return this.pending ? this.pending.timestamp : null;
+    }
+
+    async nextGroup() {
+        await this.prime();
+        const group = this.pending;
+        this.pending = null;
+        return group;
+    }
+
+    async advanceTo(timestamp, consume) {
+        await this.prime();
+        while (this.pending && this.pending.timestamp <= timestamp) {
+            await consume(await this.nextGroup());
+            await this.prime();
+        }
+    }
+
+    async close() {
+        if (!this.done) this.iterator.return?.();
+        this.pending = null;
+        this.done = true;
+    }
+}
+
 const historyCapacity = interval => Math.max(8, interval.count * 4);
 
 function queryStartFor(timestamp, intervalName, capacity, market) {
@@ -108,9 +152,12 @@ export async function runAllTickersStream(backtest) {
     const histories = Object.fromEntries(intervalEntries.map(([name]) => [name, new Map()]));
     const advancedThrough = Object.fromEntries(intervalEntries.map(([name]) => [name, -Infinity]));
     const fallbackCache = new Map();
-    const streamRange = backtest.candleSource
-        ? backtest.candleSource.streamAllStocksInRange.bind(backtest.candleSource)
-        : streamAllStocksInRange;
+    const openReader = (intervalName) => {
+        const queryStart = queryStartFor(rangeStart, intervalName, capacities[intervalName], backtest.market);
+        return backtest.candleSource
+            ? new GroupedCandleReader(backtest.candleSource.streamAllStocksInRange(intervalName, queryStart, backtest.endDate, backtest.market, backtest.venue))
+            : new GroupReader(candleGroups(intervalName, queryStart, backtest.endDate, backtest.market, backtest.venue));
+    };
     const loadBefore = backtest.candleSource
         ? backtest.candleSource.loadStockBeforeTimestamp.bind(backtest.candleSource)
         : loadStockBeforeTimestamp;
@@ -229,44 +276,49 @@ export async function runAllTickersStream(backtest) {
         if (!backtest.isWarmup) backtest.recordEquity(currentDate, backtest.totalValue(), backtest.cashBalance);
     };
 
-    let chunkIndex = 0;
-    for (let chunkStart = rangeStart; chunkStart <= rangeEnd && !backtest.ruined; chunkStart += chunkSpan) {
-        const chunkEndExclusive = Math.min(rangeEnd + 1, chunkStart + chunkSpan);
-        const readers = {};
-        for (const [intervalName] of intervalEntries) {
-            const queryStart = queryStartFor(chunkStart, intervalName, capacities[intervalName], backtest.market);
-            readers[intervalName] = new GroupedCandleReader(streamRange(
-                intervalName,
-                queryStart,
-                new Date(chunkEndExclusive - 1),
-                backtest.market,
-                backtest.venue,
-            ));
-        }
+    const readers = Object.fromEntries(intervalEntries.map(([intervalName]) => [intervalName, openReader(intervalName)]));
+    const mainReader = readers[mainInterval];
+    const recent = [];
+    try {
         await Promise.all(Object.values(readers).map(reader => reader.prime()));
-        if (backtest.logs.progress !== false) {
-            console.log(`++++++++++++++++++++ ${((chunkIndex / chunkCount) * 100).toFixed(2)}%`);
-        }
-        chunkIndex++;
-
-        const symbolOrder = new Map();
-        let nextOrder = 0;
-        const mainReader = readers[mainInterval];
-        let mainGroup;
-        while (!backtest.ruined && (mainGroup = await mainReader.nextGroup())) {
-            for (const record of mainGroup.records) {
-                if (!symbolOrder.has(record.stockName)) symbolOrder.set(record.stockName, nextOrder++);
+        let chunkIndex = 0;
+        for (let chunkStart = rangeStart; chunkStart <= rangeEnd && !backtest.ruined; chunkStart += chunkSpan) {
+            const chunkEndExclusive = Math.min(rangeEnd + 1, chunkStart + chunkSpan);
+            if (backtest.logs.progress !== false) {
+                console.log(`++++++++++++++++++++ ${((chunkIndex / chunkCount) * 100).toFixed(2)}%`);
             }
-            if (mainGroup.timestamp <= advancedThrough[mainInterval]) continue;
-            pushGroup(mainInterval, mainGroup);
-            if (mainGroup.timestamp < chunkStart || mainGroup.timestamp >= chunkEndExclusive) continue;
+            chunkIndex++;
 
-            for (const [intervalName] of intervalEntries) {
-                if (intervalName === mainInterval) continue;
-                await readers[intervalName].advanceTo(mainGroup.timestamp, group => pushGroup(intervalName, group));
+            const symbolOrder = new Map();
+            let nextOrder = 0;
+            const orderFrom = queryStartFor(chunkStart, mainInterval, capacities[mainInterval], backtest.market).getTime();
+            while (recent.length && recent[0].timestamp < orderFrom) recent.shift();
+            for (const group of recent) {
+                for (const name of group.names) {
+                    if (!symbolOrder.has(name)) symbolOrder.set(name, nextOrder++);
+                }
             }
-            await processMainGroup(mainGroup.timestamp, mainGroup.records, symbolOrder);
+            while (!backtest.ruined) {
+                await mainReader.prime();
+                const next = mainReader.nextTimestamp;
+                if (next == null || next >= chunkEndExclusive) break;
+                const mainGroup = await mainReader.nextGroup();
+                for (const record of mainGroup.records) {
+                    if (!symbolOrder.has(record.stockName)) symbolOrder.set(record.stockName, nextOrder++);
+                }
+                recent.push({ timestamp: mainGroup.timestamp, names: mainGroup.records.map(r => r.stockName) });
+                if (mainGroup.timestamp <= advancedThrough[mainInterval]) continue;
+                pushGroup(mainInterval, mainGroup);
+                if (mainGroup.timestamp < chunkStart) continue;
+
+                for (const [intervalName] of intervalEntries) {
+                    if (intervalName === mainInterval) continue;
+                    await readers[intervalName].advanceTo(mainGroup.timestamp, group => pushGroup(intervalName, group));
+                }
+                await processMainGroup(mainGroup.timestamp, mainGroup.records, symbolOrder);
+            }
         }
+    } finally {
         await Promise.all(Object.values(readers).map(reader => reader.close()));
     }
 

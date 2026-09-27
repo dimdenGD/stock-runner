@@ -5,7 +5,7 @@ import RunJournal from '../journal.js';
 import CandleBuffer from './candleBuffer.js';
 import Strategy from './strategy.js';
 import { loadFundingInRange } from './loader.js';
-import { intervalMsMap, markets, venueTables } from './consts.js';
+import { checkVenue, intervalMsMap, markets } from './consts.js';
 import chalk from 'chalk';
 import { formatSwapLine, formatTradeLine } from './logFormat.js';
 import { runAllTickersStream } from './multiIntervalStream.js';
@@ -129,7 +129,7 @@ export default class Backtest {
         }
         this.market = market;
         this.venue = venue ?? broker.venue ?? 'binance';
-        venueTables(this.venue);
+        checkVenue(this.venue);
         this.allowShort = allowShort ?? market === 'crypto';
         this.maxLeverage = maxLeverage ?? (market === 'crypto' ? 3 : null);
         this.positions = {};      // stockName -> { avgPrice, entryFees }

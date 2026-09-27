@@ -3,21 +3,20 @@
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
-  "scripts": {},
+  "scripts": {
+    "test": "node --test"
+  },
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@js-temporal/polyfill": "^0.5.1",
     "@noble/curves": "^1.9.7",
     "@noble/hashes": "^1.8.0",
-    "@questdb/nodejs-client": "^3.0.0",
     "aws-sdk": "^2.1692.0",
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.1",
     "fast-csv": "^5.0.2",
-    "ms": "^2.1.3",
-    "postgres": "^3.4.7"
+    "ms": "^2.1.3"
   },
   "devDependencies": {
     "chalk": "^5.5.0"

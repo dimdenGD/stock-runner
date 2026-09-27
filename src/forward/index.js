@@ -141,7 +141,7 @@ export default class ForwardRunner {
         this.maxOrderAttempts = Math.min(3, Math.max(1, Math.trunc(Number(maxOrderAttempts) || 1)));
         this.maxConsecutiveBarErrors = maxConsecutiveBarErrors;
         this.consecutiveBarErrors = 0;
-        this.cache = new CandleCache({ file: join(dataDir, 'cache', fileSafe(broker.dataSource), `${this.interval}.sqlite`), stepMs: this.stepMs });
+        this.cache = new CandleCache({ directory: join(dataDir, 'cache', fileSafe(broker.dataSource)), interval: this.interval, stepMs: this.stepMs });
         this.lastPrune = 0;
 
         this.symbols = [];
@@ -1143,7 +1143,7 @@ export default class ForwardRunner {
     }
 
     async loadHistory(symbol, fromTs, latest, endTime, counts) {
-        const coverage = this.cache.coverage(symbol);
+        const coverage = this.cache.coverage(symbol, fromTs);
         if (coverage && coverage.from_ts <= fromTs && coverage.to_ts >= fromTs - this.stepMs) {
             const missingBars = Math.round((latest - coverage.to_ts) / this.stepMs);
             if (missingBars <= 0) {
@@ -1172,7 +1172,14 @@ export default class ForwardRunner {
         const latest = Math.floor(endTime / this.stepMs) * this.stepMs;
         const fromTs = latest - (this.warmupBars - 1) * this.stepMs;
         const counts = { cached: 0, topped: 0, fetched: 0 };
-        const historiesRaw = await pool(this.symbols, this.concurrency, symbol => this.loadHistory(symbol, fromTs, latest, endTime, counts));
+        this.cache.preload(fromTs, latest);
+        let historiesRaw;
+        try {
+            historiesRaw = await pool(this.symbols, this.concurrency, symbol => this.loadHistory(symbol, fromTs, latest, endTime, counts));
+        } finally {
+            this.cache.release();
+            this.cache.flush();
+        }
         this.pruneCache(latest, true);
         const histories = historiesRaw.map((candles, i) => ({ symbol: this.symbols[i], candles, at: 0 }));
         const times = new Set();

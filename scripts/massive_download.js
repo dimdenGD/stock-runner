@@ -1,19 +1,9 @@
-// node scripts/massive_download.js [period] <startDate> <skip downloaded tickers>
+// node scripts/massive_download.js [period] <startDate> <skip stored tickers>
 // example: node scripts/massive_download.js 1d 2003-09-10 true
 
 import 'dotenv/config';
-import fs from 'fs';
-import { writeFile } from 'fs/promises';
-import { sender, sql, createTables } from "../src/db.js";
-
-await createTables();
-
-if(!fs.existsSync('data')) {
-    fs.mkdirSync('data');
-}
-if(!fs.existsSync('data/massive')) {
-    fs.mkdirSync('data/massive');
-}
+import { candles } from "../src/data/datasets.js";
+import { intervalMsMap } from "../src/backtest/consts.js";
 
 const periodMap = {
     's': 'second',
@@ -35,9 +25,9 @@ const period = periodMap[rawPeriod.replace(multiplier+'', '')];
 if(isNaN(multiplier) || !period) {
     throw "Invalid period. Example: node scripts/massive_download.js 1d";
 }
-
-if(!fs.existsSync(`data/massive/${rawPeriod}`)) {
-    fs.mkdirSync(`data/massive/${rawPeriod}`);
+const toAdd = rawPeriod === '1d' ? 60000*60*16 : intervalMsMap[rawPeriod];
+if(!toAdd) {
+    throw "Period must be one of 1d, 1h, 15m, 5m, 1m";
 }
 
 const MASSIVE_KEY = process.env.MASSIVE_KEY;
@@ -45,11 +35,12 @@ if(!MASSIVE_KEY) {
     throw "MASSIVE_KEY is not set. Please set it in the environment variables.";
 }
 
-const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${rawPeriod}`)} ORDER BY timestamp DESC LIMIT 1`;
+const ds = candles('stocks', rawPeriod, 'binance', { create: true, fields: ['open', 'high', 'low', 'close', 'volume', 'trades'] });
+const lastTimestamp = ds.lastTimestamp();
 let startDate = new Date(process.argv[3] || '2003-09-10');
 let skip = process.argv[4] === 'true';
-if(lastDate.length > 0 && !process.argv[3]) {
-    startDate = new Date(lastDate[0].timestamp);
+if(lastTimestamp != null && !process.argv[3]) {
+    startDate = new Date(lastTimestamp);
 }
 
 async function callMassive(path, params) {
@@ -92,8 +83,8 @@ let tickerList = [];
 }
 console.log(`Got ${tickerList.length} tickers`);
 if(skip) {
-    const files = fs.readdirSync(`data/massive/${rawPeriod}`).map(f => f.split('.').slice(0, -1).join('.'));
-    tickerList = tickerList.filter(t => !files.includes(t));
+    const stored = new Set(ds.stats().symbols.keys());
+    tickerList = tickerList.filter(t => !stored.has(t));
     console.log(`Remaining ${tickerList.length} tickers`);
 }
 
@@ -101,29 +92,33 @@ const BATCH_SIZE = 50;
 const endDate = new Date().toISOString().split('T')[0];
 const startStr = startDate.toISOString().split('T')[0];
 
+const writer = ds.bulk();
 for (let i = 0; i < tickerList.length; i += BATCH_SIZE) {
     const batch = tickerList.slice(i, i + BATCH_SIZE);
     const range = `${i + 1}-${Math.min(i + BATCH_SIZE, tickerList.length)}/${tickerList.length}`;
     console.log(`Downloading batch ${range}: ${batch.join(', ')}`);
     const results = await Promise.all(batch.map(async (ticker) => {
         const url = `/v2/aggs/ticker/${ticker}/range/${multiplier}/${period}/${startStr}/${endDate}`;
-        const data = await callMassive(url, {
+        const rows = await callMassive(url, {
             adjusted: true,
             sort: 'asc',
             limit: 50000,
         });
-        let output = '';
-        /* ticker,volume,open,close,high,low,window_start,transactions*/
-        for (const row of data) {
-            output += `${ticker},${row.v},${row.o},${row.c},${row.h},${row.l},${row.t},${row.n}\n`;
-        }
-        return { ticker, output };
+        return { ticker, rows };
     }));
-    await Promise.all(results.map(({ ticker, output }) =>
-        writeFile(`data/massive/${rawPeriod}/${ticker}.csv`, output)
-    ));
+    for (const { ticker, rows } of results) {
+        if (!rows.length) continue;
+        writer.add(ticker, {
+            ts: rows.map(r => r.t + toAdd),
+            open: rows.map(r => r.o),
+            high: rows.map(r => r.h),
+            low: rows.map(r => r.l),
+            close: rows.map(r => r.c),
+            volume: rows.map(r => r.v),
+            trades: rows.map(r => r.n),
+        });
+    }
 }
 
+writer.close();
 console.log('Done');
-await sender.close();
-await sql.end();

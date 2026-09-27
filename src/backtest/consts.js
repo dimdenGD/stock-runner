@@ -12,20 +12,28 @@ export const prefetchFactor = 10;
 export const markets = ['stocks', 'crypto'];
 
 export const venues = {
-    binance: { candles: 'crypto_candles', funding: 'crypto_funding' },
-    hyperliquid: { candles: 'hl_candles', funding: 'hl_funding' },
+    binance: 'Binance USD-M futures',
+    hyperliquid: 'Hyperliquid perps',
 };
 
-export function venueTables(venue = 'binance') {
-    const v = venues[venue];
-    if (!v) throw new TypeError(`venue must be one of: ${Object.keys(venues).join(', ')}`);
-    return v;
+export function checkVenue(venue = 'binance') {
+    if (!venues[venue]) throw new TypeError(`venue must be one of: ${Object.keys(venues).join(', ')}`);
+    return venue;
 }
 
-export function candleTable(market, interval, venue = 'binance') {
-    return market === 'crypto' ? `${venueTables(venue).candles}_${interval}` : `candles_${interval}`;
+export function candleDataset(market, interval, venue = 'binance') {
+    return market === 'crypto' ? `${checkVenue(venue)}/${interval}` : `stocks/${interval}`;
 }
 
-export function fundingTable(venue = 'binance') {
-    return venueTables(venue).funding;
+export function fundingDataset(venue = 'binance') {
+    return `${checkVenue(venue)}/funding`;
+}
+
+const partitions = {
+    crypto: { '1m': 'day', '5m': 'week', '15m': 'month', '1h': 'quarter', '4h': 'year', '1d': 'year' },
+    stocks: { '1m': 'day', '5m': 'day', '15m': 'week', '1h': 'month', '4h': 'quarter', '1d': 'year' },
+};
+
+export function partitionFor(market, interval) {
+    return partitions[market]?.[interval] ?? 'month';
 }

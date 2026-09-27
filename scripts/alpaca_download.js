@@ -1,12 +1,8 @@
-// node scripts/alpaca_download.js [period] <startDate> <skip downloaded tickers> <adjustment>
+// node scripts/alpaca_download.js [period] <startDate> <skip stored tickers> <adjustment>
 // example: node scripts/alpaca_download.js 15m 2023-01-01 true all
 
 import 'dotenv/config';
-import fs from 'fs';
-import { writeFile } from 'fs/promises';
-import { sender, sql, createTables } from "../src/db.js";
-
-await createTables();
+import { candles } from "../src/data/datasets.js";
 
 const timeframes = {
     '1d': '1Day',
@@ -14,6 +10,13 @@ const timeframes = {
     '15m': '15Min',
     '5m': '5Min',
     '1m': '1Min',
+};
+const toAdd = {
+    '1d': 60000*60*16,
+    '1h': 60000*60,
+    '15m': 60000*15,
+    '5m': 60000*5,
+    '1m': 60000,
 };
 const rawPeriod = process.argv[2];
 const timeframe = timeframes[rawPeriod];
@@ -32,14 +35,13 @@ const FEED = process.env.ALPACA_FEED || 'sip';
 const RPM = +(process.env.ALPACA_RPM || 200);
 const EXCHANGES = ['NASDAQ', 'NYSE', 'ARCA', 'AMEX', 'BATS'];
 
-fs.mkdirSync(`data/alpaca/${rawPeriod}`, { recursive: true });
-
-const lastDate = await sql`SELECT timestamp FROM ${sql(`candles_${rawPeriod}`)} ORDER BY timestamp DESC LIMIT 1`;
+const ds = candles('stocks', rawPeriod, 'binance', { create: true, fields: ['open', 'high', 'low', 'close', 'volume', 'trades'] });
+const lastTimestamp = ds.lastTimestamp();
 let startDate = new Date(process.argv[3] || '2016-01-01');
 const skip = process.argv[4] === 'true';
 const adjustment = process.argv[5] || 'all';
-if(lastDate.length > 0 && !process.argv[3]) {
-    startDate = new Date(lastDate[0].timestamp);
+if(lastTimestamp != null && !process.argv[3]) {
+    startDate = new Date(lastTimestamp);
 }
 
 let nextSlot = 0;
@@ -92,8 +94,8 @@ let tickerList = [];
 }
 console.log(`Got ${tickerList.length} tickers`);
 if(skip) {
-    const files = new Set(fs.readdirSync(`data/alpaca/${rawPeriod}`).map(f => f.split('.').slice(0, -1).join('.')));
-    tickerList = tickerList.filter(t => !files.has(t));
+    const stored = new Set(ds.stats().symbols.keys());
+    tickerList = tickerList.filter(t => !stored.has(t));
     console.log(`Remaining ${tickerList.length} tickers`);
 }
 
@@ -117,16 +119,14 @@ async function downloadBatch(batch) {
             page_token: pageToken,
         });
         for(const ticker in data.bars || {}) {
-            /* ticker,volume,open,close,high,low,window_start,transactions*/
-            for(const row of data.bars[ticker]) {
-                outputs[ticker]?.push(`${ticker},${row.v},${row.o},${row.c},${row.h},${row.l},${Date.parse(row.t)},${row.n}`);
-            }
+            outputs[ticker]?.push(...data.bars[ticker]);
         }
         pageToken = data.next_page_token;
     } while(pageToken);
     return outputs;
 }
 
+const writer = ds.bulk();
 for(let i = 0; i < tickerList.length; i += BATCH_SIZE) {
     let batch = tickerList.slice(i, i + BATCH_SIZE);
     const range = `${i + 1}-${Math.min(i + BATCH_SIZE, tickerList.length)}/${tickerList.length}`;
@@ -141,11 +141,20 @@ for(let i = 0; i < tickerList.length; i += BATCH_SIZE) {
             batch = batch.filter(t => t !== e.invalidSymbol);
         }
     }
-    await Promise.all(batch.map(ticker =>
-        writeFile(`data/alpaca/${rawPeriod}/${ticker}.csv`, outputs[ticker].length ? outputs[ticker].join('\n') + '\n' : '')
-    ));
+    for(const ticker of batch) {
+        const rows = outputs[ticker];
+        if(!rows.length) continue;
+        writer.add(ticker, {
+            ts: rows.map(r => Date.parse(r.t) + toAdd[rawPeriod]),
+            open: rows.map(r => r.o),
+            high: rows.map(r => r.h),
+            low: rows.map(r => r.l),
+            close: rows.map(r => r.c),
+            volume: rows.map(r => r.v),
+            trades: rows.map(r => r.n),
+        });
+    }
 }
 
+writer.close();
 console.log('Done');
-await sender.close();
-await sql.end();
