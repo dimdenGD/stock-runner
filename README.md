@@ -1,4 +1,4 @@
-# Stock Runner
+# Algo Runner
 
 Because of lack of good algotrading tools in JavaScript, I've decided to build my own.
 It's also quite fast and nice to use. You can run a 5 year backtest on ALL stocks in 1 minute (on daily ticks).

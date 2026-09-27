@@ -1,7 +1,7 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { endianness } from 'node:os';
 
-if (endianness() !== 'LE') throw new Error('stock-runner data files are little-endian and need a little-endian host');
+if (endianness() !== 'LE') throw new Error('algo-runner data files are little-endian and need a little-endian host');
 
 const MAGIC = 'SRSEG001';
 const PREFIX = 16;
@@ -182,7 +182,7 @@ function preadBuffer(fd, position, byteLength) {
 
 function parseHeader(prefix, jsonBytes, file) {
     if (Buffer.from(prefix.buffer, prefix.byteOffset, 8).toString('latin1') !== MAGIC) {
-        throw new Error(`${file} is not a stock-runner segment`);
+        throw new Error(`${file} is not a algo-runner segment`);
     }
     const meta = JSON.parse(Buffer.from(jsonBytes.buffer, jsonBytes.byteOffset, jsonBytes.byteLength).toString('utf8'));
     const L = layout(meta.rows, meta.symbols, meta.cov, meta.fields, align(PREFIX + jsonBytes.byteLength));
