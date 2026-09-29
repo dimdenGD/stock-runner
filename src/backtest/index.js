@@ -494,6 +494,7 @@ export default class Backtest {
 
     applyFunding(fromTs, toTs) {
         if (!this.fundingEvents) return;
+        const before = this.totalFunding;
         for (const stockName in this.stockBalances) {
             const ev = this.fundingEvents[stockName];
             if (!ev) continue;
@@ -512,6 +513,11 @@ export default class Backtest {
                 this._invalidateValuation();
             }
             this.fundingCursor[stockName] = cursor;
+        }
+        const received = before - this.totalFunding;
+        if (received && this.journal && this.runId != null && !this.isWarmup && this.journalRecords !== false) {
+            this.journal.record(this.runId, toTs, 'funding', { value: received });
+            this.journal.batchStep();
         }
     }
 
