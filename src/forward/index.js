@@ -295,6 +295,7 @@ export default class ForwardRunner {
     async pollIncome(force = false) {
         if (!force && Date.now() - this.lastIncomePoll < this.incomePollMs) return;
         this.lastIncomePoll = Date.now();
+        if (this.dryRun) return this.accrueFunding();
         try {
             const last = this.journal.lastIncomeTime(this.broker.account);
             const startTime = last != null ? last : Date.now() - this.incomeLookbackMs;
@@ -386,8 +387,22 @@ export default class ForwardRunner {
         if (settlements) this.journal.record(this.runId, now, 'funding', { value: amount, settlements });
     }
 
+    simulatedPortfolio() {
+        const positions = Object.entries(this.ledger.positions)
+            .filter(([, pos]) => Number(pos.quantity))
+            .map(([symbol, pos]) => {
+                const markPrice = this.stockPrices[symbol] > 0 ? this.stockPrices[symbol] : Number(pos.avgPrice) || 0;
+                return {
+                    symbol, quantity: Number(pos.quantity), markPrice, entryPrice: Number(pos.avgPrice) || null,
+                    unrealizedPnl: Number(pos.quantity) * (markPrice - (Number(pos.avgPrice) || markPrice)), leverage: null,
+                };
+            });
+        const equity = this.bookValue();
+        return { cash: this.capital + this.realized, available: equity, equity, positions };
+    }
+
     async refreshAccount() {
-        const portfolio = await this.broker.getPortfolio();
+        const portfolio = this.dryRun ? this.simulatedPortfolio() : await this.broker.getPortfolio();
         this.lastPortfolio = portfolio;
         this.cashBalance = Number(portfolio.cash ?? 0);
         this.availableBalance = Number(portfolio.available ?? 0);
@@ -650,23 +665,21 @@ export default class ForwardRunner {
             appliedOrderIds: [],
         });
         let fills = [];
-        if (!this.dryRun) {
-            try {
-                fills = await this.executeBatch(timestamp, intents, stats);
-            } catch (err) {
-                this.snapshot(timestamp, 'post');
-                this.flushTradeLogs();
-                this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
-                finish('failed');
-                throw err;
-            }
-            await this.refreshAccount();
+        try {
+            fills = await this.executeBatch(timestamp, intents, stats);
+        } catch (err) {
             this.snapshot(timestamp, 'post');
             this.flushTradeLogs();
+            this.writeState({ ledger: this.ledger.toJSON(), realized: this.realized, traded: [...this.traded], disowned: [...this.disowned] });
+            finish('failed');
+            throw err;
         }
+        await this.refreshAccount();
+        this.snapshot(timestamp, 'post');
+        this.flushTradeLogs();
         this.writeState({
             lastProcessedBar: timestamp,
-            status: this.dryRun ? 'dry-run' : 'complete',
+            status: 'complete',
             runId: this.runId,
             intentCount: intents.length,
             ledger: this.ledger.toJSON(),
@@ -675,7 +688,7 @@ export default class ForwardRunner {
             disowned: [...this.disowned],
             appliedOrderIds: [],
         });
-        finish(this.dryRun ? 'dry-run' : stats.failed ? 'partial' : 'complete');
+        finish(stats.failed ? 'partial' : 'complete');
         return { skipped: false, intents, fills };
     }
 
@@ -819,6 +832,7 @@ export default class ForwardRunner {
             stats.skipped++;
             return 'skipped';
         }
+        if (this.dryRun) return this.simulateLeg(run, intent, side, Number(quantity), orderInfo);
         await this.ensureLeverage(intent.symbol);
         const signedRounded = Math.sign(leg.signedQty) * Number(quantity);
         const clientOrderId = this.broker.createClientOrderId({
@@ -937,6 +951,23 @@ export default class ForwardRunner {
         return 'filled';
     }
 
+    simulateLeg(run, intent, side, quantity, orderInfo) {
+        const { timestamp, stats } = run;
+        const clientOrderId = this.broker.createClientOrderId({
+            timestamp, symbol: intent.symbol, sequence: run.sequence++, owner: this.ownTag,
+        });
+        const orderId = this.journal.orderPending(this.runId, timestamp, { ...orderInfo, quantity, clientOrderId });
+        stats.orders++;
+        const booked = { status: 'FILLED', executedQty: quantity, avgPrice: intent.price };
+        const shown = this.broker.executionPrice(quantity, intent.price, side, this.lastCandle(intent.symbol));
+        this.journal.orderResult(orderId, { ...booked, avgPrice: shown }, { simulated: true, clientOrderId });
+        this.recordFill(timestamp, intent, side, quantity, booked, orderId);
+        run.fills.push(booked);
+        stats.fills++;
+        run.projected[intent.symbol] = (run.projected[intent.symbol] || 0) + (side === 'buy' ? quantity : -quantity);
+        return 'filled';
+    }
+
     /**
      * Finish a batch whose process died after its strategy intents were
      * journalled but before every venue response was durably recorded.
@@ -966,7 +997,7 @@ export default class ForwardRunner {
         }
 
         const rows = this.journal.pendingOrdersAt(this.runId, timestamp);
-        const inspected = await Promise.all(rows.map((row) => inspectPendingOrder(this.broker, row)));
+        const inspected = await Promise.all(rows.map((row) => this.inspectPending(row)));
         let recoveredFills = 0;
         let neverPlaced = 0;
         const unresolved = [];
@@ -1008,7 +1039,7 @@ export default class ForwardRunner {
         const sourceIntents = this.journal.intentsAt(this.runId, timestamp);
         const intents = remainingBatchIntents(sourceIntents, this.stockBalances, this.stockPrices);
         const stats = { orders: 0, fills: 0, skipped: 0, failed: 0 };
-        const fills = this.dryRun ? [] : await this.executeBatch(timestamp, intents, stats);
+        const fills = await this.executeBatch(timestamp, intents, stats);
         await this.refreshAccount();
         this.snapshot(timestamp, 'recovered');
         this.flushTradeLogs();
@@ -1022,7 +1053,7 @@ export default class ForwardRunner {
 
         this.writeState({
             lastProcessedBar: timestamp,
-            status: this.dryRun ? 'dry-run' : 'complete',
+            status: 'complete',
             runId: this.runId,
             intentCount: sourceIntents.length,
             ledger: this.ledger.toJSON(),
@@ -1052,14 +1083,23 @@ export default class ForwardRunner {
         return { journalledFills, recoveredFills, neverPlaced, intents: intents.length, ...stats };
     }
 
+    inspectPending(row) {
+        if (this.dryRun) return { id: row.id, symbol: row.symbol, outcome: 'rejected', reason: 'simulated order did not complete before the restart' };
+        return inspectPendingOrder(this.broker, row);
+    }
+
     async reconcileUnfinalizedOrders({ interruptedBar = null } = {}) {
         const rows = this.journal.unfinalizedOrders(this.runId);
         if (!rows.length) return { repaired: 0, addedQuantity: 0 };
+        if (this.dryRun) {
+            for (const row of rows) this.journal.orderFailed(row.id, Object.assign(new Error('simulated order did not complete before the restart'), { code: 'unanswered' }));
+            return { repaired: 0, addedQuantity: 0 };
+        }
 
         let repaired = 0;
         let addedQuantity = 0;
         for (const row of rows) {
-            const result = await inspectPendingOrder(this.broker, row);
+            const result = await this.inspectPending(row);
             if (result.outcome !== 'filled') {
                 const reason = result.error || result.reason || 'the venue result is still ambiguous';
                 this.event('error', 'recovery-blocked',
@@ -1229,7 +1269,8 @@ export default class ForwardRunner {
     }
 
     async initialize({ interruptedBar = null } = {}) {
-        await this.broker.initialize();
+        if (this.dryRun && typeof this.broker.initializeData === 'function') await this.broker.initializeData();
+        else await this.broker.initialize();
         await this.refreshSymbols(true);
         await this.refreshAccount();
         await this.reconcileUnfinalizedOrders({ interruptedBar });

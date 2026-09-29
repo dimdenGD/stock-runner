@@ -347,6 +347,11 @@ export default class BinanceFutures extends Broker {
         return this.request('/fapi/v1/income', { signed: true, params: { startTime, endTime, limit }, weight: 30 });
     }
 
+    async initializeData() {
+        await this.syncTime();
+        await this.loadExchangeInfo();
+    }
+
     async initialize() {
         await this.syncTime();
         const mode = await this.getPositionMode();
