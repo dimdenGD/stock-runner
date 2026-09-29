@@ -6,9 +6,10 @@ export default class Strategy {
      * @param {Object} options
      * @param {Object} options.intervals          — Map of interval names to { count, main }
      * @param {Function} options.onTick           — Called each tick with context
+     * @param {Function} [options.onParams]       — Takes { name: value } for params changed while running
      * @throws {TypeError} on invalid intervals or onTick
      */
-    constructor({ name, params = {}, warmup = 0, intervals, onTick }) {
+    constructor({ name, params = {}, warmup = 0, intervals, onTick, onParams }) {
         if (typeof intervals !== 'object') {
             throw new TypeError('Intervals must be an object');
         }
@@ -27,6 +28,9 @@ export default class Strategy {
         }
         if (typeof onTick !== 'function') {
             throw new TypeError('`onTick` must be a function');
+        }
+        if (onParams != null && typeof onParams !== 'function') {
+            throw new TypeError('`onParams` must be a function');
         }
         if (!Number.isInteger(warmup) || warmup < 0) {
             throw new TypeError('`warmup` must be a non-negative integer number of bars');
@@ -50,5 +54,6 @@ export default class Strategy {
         this.intervals = normalizedIntervals;
         this.mainInterval = Object.values(normalizedIntervals).find(interval => interval.main);
         this.onTick = onTick;
+        if (onParams) this.onParams = onParams;
     }
 }

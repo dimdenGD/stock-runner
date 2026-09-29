@@ -34,6 +34,15 @@ const LEVERAGE_HEADROOM = 3;
 const MAX_LEVERAGE = 10;
 
 const validLeverage = (value) => Number.isFinite(value) && value > 0 && value <= MAX_LEVERAGE;
+const finiteOrNull = (value) => (Number.isFinite(value) ? value : null);
+
+const RUN_SETTINGS = {
+    leverage: { field: 'leverage', valid: validLeverage },
+    maxDailyLoss: { field: 'maxDailyLoss', valid: (v) => v > 0 && v <= 1 },
+    maxLeverage: { field: 'maxLeverage', valid: (v) => v > 0 && v <= MAX_LEVERAGE },
+    maxNet: { field: 'maxNetExposure', valid: (v) => v >= 0 && v <= MAX_LEVERAGE },
+    maxOrderNotional: { field: 'maxOrderNotional', valid: (v) => v > 0 },
+};
 
 function heldAt(log, time) {
     let qty = 0;
@@ -1358,12 +1367,14 @@ export default class ForwardRunner {
         if (!this.runId) return null;
         const row = this.journal.nextCommand(this.runId, this.lastCommandId);
         if (!row) return null;
-        if (!['pause', 'resume', 'stop', 'adjust', 'leverage'].includes(row.command)) {
+        if (!['pause', 'resume', 'stop', 'adjust', 'leverage', 'set'].includes(row.command)) {
             this.journal.ackCommands(this.runId, row.id);
             this.lastCommandId = row.id;
             return null;
         }
-        return { id: row.id, command: row.command, note: row.note || '', amount: row.amount ?? null };
+        let data = null;
+        try { data = row.data ? JSON.parse(row.data) : null; } catch { /* a bad row sets nothing */ }
+        return { id: row.id, command: row.command, note: row.note || '', amount: row.amount ?? null, data };
     }
 
     resetAllocation() {
@@ -1400,25 +1411,96 @@ export default class ForwardRunner {
         });
     }
 
-    restoreLeverage() {
-        const saved = Number(this.state.leverage);
-        const savedHalt = Number(this.state.maxDailyLoss);
+    async restoreSettings() {
         const resuming = this.resumeRunId != null;
-        this.leverage = resuming && validLeverage(saved) ? saved : this.startLeverage;
-        if (resuming && savedHalt > 0 && savedHalt <= 1 && Number.isFinite(this.maxDailyLoss)) this.maxDailyLoss = savedHalt;
+        const settings = resuming ? { ...(this.state.settings || {}) } : {};
+        // Saved on their own before settings were generic.
+        if (resuming && settings.leverage == null) settings.leverage = Number(this.state.leverage);
+        if (resuming && settings.maxDailyLoss == null) settings.maxDailyLoss = Number(this.state.maxDailyLoss);
+        this.leverage = this.startLeverage;
+        for (const [name, value] of Object.entries(settings)) {
+            const def = RUN_SETTINGS[name];
+            if (def?.valid(Number(value))) this[def.field] = Number(value);
+            else delete settings[name];
+        }
+        const params = resuming ? { ...(this.state.params || {}) } : {};
+        if (Object.keys(params).length) {
+            try {
+                if (typeof this.strategy.onParams !== 'function') throw new Error('this strategy version cannot take them');
+                await this.strategy.onParams(params);
+            } catch (err) {
+                this.event('warn', 'setting-refused', `params changed on this run were not restored: ${err.message}`, { data: params });
+            }
+        }
         this.writeState({
+            settings,
+            params,
             leverage: this.leverage,
-            maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+            maxDailyLoss: finiteOrNull(this.maxDailyLoss),
         });
         if (!resuming) {
             this.journal.record(this.runId, Date.now(), 'leverage', {
                 value: this.leverage, from: null, note: 'start',
-                maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
+                maxDailyLoss: finiteOrNull(this.maxDailyLoss),
             });
         }
     }
 
-    async applyCommand({ id, command, note, amount }) {
+    /** Changes one runner setting or strategy param (`param.<name>`) from the next bar on. */
+    async applySetting(name, value, note = '') {
+        const now = Date.now();
+        const refuse = (why) => {
+            this.event('warn', 'setting-refused', `${name}: ${why}`, { barTs: now, data: { name, value } });
+            return null;
+        };
+        if (typeof name === 'string' && name.startsWith('param.')) {
+            const key = name.slice('param.'.length);
+            if (typeof this.strategy.onParams !== 'function') return refuse('this strategy cannot change params while running');
+            const before = this.state.params?.[key] ?? this.strategy.params?.[key] ?? null;
+            if (before === value) return null;
+            try {
+                await this.strategy.onParams({ [key]: value });
+            } catch (err) {
+                return refuse(err.message);
+            }
+            this.writeState({ params: { ...(this.state.params || {}), [key]: value } });
+            this.journal.record(this.runId, now, 'setting', { name, value, from: before, note });
+            this.event('info', 'setting', `${key} ${before ?? 'default'} -> ${value}${note ? `: ${note}` : ''}`, { barTs: now });
+            return null;
+        }
+        const def = RUN_SETTINGS[name];
+        if (!def) return refuse('not a setting this runner has');
+        const next = Number(value);
+        if (!def.valid(next)) return refuse(`${value} is out of range`);
+        const before = this[def.field];
+        if (next === before) return null;
+        const changes = [[name, next, finiteOrNull(before), note]];
+        if (name === 'leverage') {
+            const haltBefore = this.maxDailyLoss;
+            this.changeLeverage(next);
+            if (this.maxDailyLoss !== haltBefore) {
+                changes.push(['maxDailyLoss', this.maxDailyLoss, finiteOrNull(haltBefore), 'scaled with leverage']);
+            }
+        } else {
+            this[def.field] = next;
+            if (name === 'maxLeverage') {
+                this.venueLeverageWarned = false;
+                this.leverageChecked.clear();
+            }
+        }
+        const settings = { ...(this.state.settings || {}) };
+        for (const [key, to, from, why] of changes) {
+            settings[key] = to;
+            this.journal.record(this.runId, now, 'setting', { name: key, value: to, from, note: why });
+        }
+        this.writeState({ settings, leverage: this.leverage, maxDailyLoss: finiteOrNull(this.maxDailyLoss) });
+        this.event('info', 'setting',
+            `${changes.map(([key, to, from]) => `${key} ${from ?? 'none'} -> ${to}`).join(', ')}${note ? `: ${note}` : ''}; applies from the next bar`,
+            { barTs: now });
+        return null;
+    }
+
+    async applyCommand({ id, command, note, amount, data }) {
         this.lastCommandId = id;
         this.journal.ackCommands(this.runId, id);
         const detail = note ? `: ${note}` : '';
@@ -1450,24 +1532,8 @@ export default class ForwardRunner {
             this.writeState({ adjustments: this.adjustments });
             return null;
         }
-        if (command === 'leverage') {
-            const next = Number(amount);
-            if (!validLeverage(next) || next === this.leverage) return null;
-            const now = Date.now();
-            const before = this.leverage;
-            const haltBefore = this.maxDailyLoss;
-            this.changeLeverage(next);
-            const halt = Number.isFinite(this.maxDailyLoss)
-                ? `, daily loss halt ${(haltBefore * 100).toFixed(1)}% -> ${(this.maxDailyLoss * 100).toFixed(1)}%`
-                : '';
-            this.event('info', 'leverage',
-                `leverage ${before}x -> ${next}x${halt}${detail}; resizes on the next bar`, { barTs: now });
-            this.journal.record(this.runId, now, 'leverage', {
-                value: next, from: before, note: note || '',
-                maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
-            });
-            return null;
-        }
+        if (command === 'set') return this.applySetting(data?.name, data?.value, note || '');
+        if (command === 'leverage') return this.applySetting('leverage', amount, note || '');
         if (command === 'pause') {
             if (this.paused) return null;
             const now = Date.now();
@@ -1575,7 +1641,10 @@ export default class ForwardRunner {
         this.leverage = value;
         this.venueLeverageWarned = false;
         this.leverageChecked.clear();
+        const settings = { ...(this.state.settings || {}), leverage: value };
+        if (Number.isFinite(this.maxDailyLoss)) settings.maxDailyLoss = this.maxDailyLoss;
         this.writeState({
+            settings,
             leverage: value,
             maxDailyLoss: Number.isFinite(this.maxDailyLoss) ? this.maxDailyLoss : null,
         });
@@ -1719,7 +1788,7 @@ export default class ForwardRunner {
                 : null;
             if (this.resumeRunId == null) this.resetAllocation();
             else this.resumeAllocation();
-            this.restoreLeverage();
+            await this.restoreSettings();
             const latestWarmup = await this.initialize({ interruptedBar });
             if (this.resumeRunId == null) {
                 this.baseline = this.bookValue();

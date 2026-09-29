@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS commands (
     command TEXT NOT NULL,
     note TEXT,
     amount REAL,
+    data TEXT,
     acted_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS commands_run ON commands (run_id, id);
@@ -204,6 +205,7 @@ const MIGRATIONS = [
     ['runs', 'baseline_equity', 'REAL'],
     ['runs', 'adjustments', 'REAL NOT NULL DEFAULT 0'],
     ['commands', 'amount', 'REAL'],
+    ['commands', 'data', 'TEXT'],
 ];
 
 const json = (value) => (value === undefined ? null : JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? String(v) : v)));
@@ -276,10 +278,10 @@ export default class RunJournal {
             intentsAt: prepare(`SELECT id, symbol, signed_qty, price, held_qty
                 FROM intents WHERE run_id = ? AND ts = ? ORDER BY id ASC`),
             record: prepare('INSERT INTO records (run_id, ts, kind, symbol, value, data) VALUES (?, ?, ?, ?, ?, ?)'),
-            insertCommand: prepare('INSERT INTO commands (run_id, at, command, note, amount) VALUES (?, ?, ?, ?, ?)'),
-            nextCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND id > ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
+            insertCommand: prepare('INSERT INTO commands (run_id, at, command, note, amount, data) VALUES (?, ?, ?, ?, ?, ?)'),
+            nextCommand: prepare('SELECT id, command, note, amount, data, at FROM commands WHERE run_id = ? AND id > ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             ackCommands: prepare('UPDATE commands SET acted_at = ? WHERE run_id = ? AND id <= ? AND acted_at IS NULL'),
-            pendingCommand: prepare('SELECT id, command, note, amount, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
+            pendingCommand: prepare('SELECT id, command, note, amount, data, at FROM commands WHERE run_id = ? AND acted_at IS NULL ORDER BY id DESC LIMIT 1'),
             lastIncome: prepare('SELECT MAX(time) AS time FROM income WHERE account = ?'),
             income: prepare(`INSERT OR IGNORE INTO income (account, id, time, symbol, type, amount, asset, info, trade_id, run_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -523,9 +525,9 @@ export default class RunJournal {
         this.sql.record.run(runId, ts, String(kind), symbol, value, json(data));
     }
 
-    command(runId, command, note = '', amount = null) {
+    command(runId, command, note = '', amount = null, data = null) {
         this.sql.insertCommand.run(
-            Number(runId), Date.now(), String(command), String(note || '').slice(0, 200), num(amount));
+            Number(runId), Date.now(), String(command), String(note || '').slice(0, 200), num(amount), json(data ?? undefined));
     }
 
     nextCommand(runId, afterId = 0) {

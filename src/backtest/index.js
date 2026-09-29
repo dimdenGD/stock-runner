@@ -45,6 +45,16 @@ function normalizeLeverageChanges(changes) {
         .sort((a, b) => a.ts - b.ts);
 }
 
+function normalizeSettingChanges(changes) {
+    if (!Array.isArray(changes)) return [];
+    return changes
+        .map(entry => ({ ts: Number(entry?.ts), name: String(entry?.name ?? ''), value: entry?.value }))
+        .filter(entry => Number.isFinite(entry.ts)
+            && ((entry.name === 'maxLeverage' && Number(entry.value) > 0 && Number(entry.value) <= MAX_LEVERAGE)
+                || (entry.name.startsWith('param.') && entry.name.length > 'param.'.length)))
+        .sort((a, b) => a.ts - b.ts);
+}
+
 function normalizeAllocations(allocations) {
     if (!Array.isArray(allocations)) return [];
     return allocations
@@ -88,7 +98,7 @@ export default class Backtest {
     constructor({ strategy, startDate, endDate, capital, broker = new Broker(), logs = {}, features = [], market, venue, allowShort, maxLeverage,
         journal = null, journalFile = 'output/journal.sqlite', journalTicks = 'daily',
         journalRecords = 'summary', strategySourcePath = null,
-        candleSource = null, allocations = [], leverage = 1, leverageChanges = [] }) {
+        candleSource = null, allocations = [], leverage = 1, leverageChanges = [], settingChanges = [] }) {
         if (!(startDate instanceof Date) || !(endDate instanceof Date)) {
             throw new TypeError('startDate and endDate must be instances of Date');
         }
@@ -117,8 +127,13 @@ export default class Backtest {
         this.allocationIndex = 0;
         this.startLeverage = leverage;
         this.leverage = leverage;
-        this.leverageChanges = normalizeLeverageChanges(leverageChanges);
+        this.leverageChanges = normalizeLeverageChanges([
+            ...(Array.isArray(leverageChanges) ? leverageChanges : []),
+            ...(Array.isArray(settingChanges) ? settingChanges.filter(c => c?.name === 'leverage') : []),
+        ]);
         this.leverageIndex = 0;
+        this.settingChanges = normalizeSettingChanges(settingChanges);
+        this.settingIndex = 0;
         this._sizingView = null;
         this.adjustments = 0;
         this.deposits = new Map();
@@ -233,6 +248,7 @@ export default class Backtest {
             if (!this.isWarmup) {
                 this.applyAllocations(ts);
                 this.applyLeverage(ts);
+                await this.applySettings(ts);
             }
 
             const tickObj = {
@@ -404,6 +420,21 @@ export default class Backtest {
             && this.leverageChanges[this.leverageIndex].ts <= at) {
             this.leverage = this.leverageChanges[this.leverageIndex++].value;
         }
+    }
+
+    async applySettings(timestamp) {
+        const at = +timestamp;
+        const params = {};
+        while (this.settingIndex < this.settingChanges.length && this.settingChanges[this.settingIndex].ts <= at) {
+            const { name, value } = this.settingChanges[this.settingIndex++];
+            if (name === 'maxLeverage') this.maxLeverage = Number(value);
+            else params[name.slice('param.'.length)] = value;
+        }
+        if (!Object.keys(params).length) return;
+        if (typeof this.strategy.onParams !== 'function') {
+            throw new Error(`the run changed ${Object.keys(params).join(', ')} while running, and this strategy version cannot take param changes`);
+        }
+        await this.strategy.onParams(params);
     }
 
     sizingView() {
