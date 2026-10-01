@@ -212,7 +212,17 @@ export default class BinanceFutures extends Broker {
         return Date.now() + Number(this.timeOffsetMs || 0);
     }
 
-    async request(path, {
+    async request(path, options = {}) {
+        try {
+            return await this.send(path, options);
+        } catch (err) {
+            if (!options.signed || err?.code !== -1021) throw err;
+            await this.syncTime();
+            return this.send(path, options);
+        }
+    }
+
+    async send(path, {
         method = 'GET', params = {}, signed = false, weight = 1,
         trade = signed, retry = !signed && method === 'GET',
     } = {}) {

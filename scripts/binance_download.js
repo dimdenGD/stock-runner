@@ -192,6 +192,31 @@ if (!noDaily && dayKey(lastDay).slice(0, 7) <= endMonth) {
             }
             if (++checked % 200 === 0) console.log(`Daily tail ${checked}/${symbols.length} symbols, ${days} files`);
         });
+        const months = [];
+        for (let m = monthOf(nextMonthStart(activeMonth)); m <= dayKey(lastDay).slice(0, 7) && m <= endMonth; m = monthOf(nextMonthStart(m))) months.push(m);
+        const known = new Set(symbols);
+        const fresh = months.length
+            ? (await listS3('data/futures/um/daily/klines/', true)).map(p => p.split('/').at(-2)).filter(s => s.endsWith('USDT') && !known.has(s))
+            : [];
+        const before = days;
+        const added = new Set();
+        await pool(fresh, CONCURRENCY, async (sym) => {
+            for (const m of months) {
+                for (const key of await listS3(`data/futures/um/daily/klines/${sym}/${interval}/${sym}-${interval}-${m}`)) {
+                    const day = key.match(/-(\d{4}-\d{2}-\d{2})\.zip$/)?.[1];
+                    const ts = day ? Date.parse(`${day}T00:00:00Z`) : NaN;
+                    if (!(ts <= lastDay) || storedDay(sym, ts)) continue;
+                    const buf = await fetchRetry(`${ARCHIVE}/${key}`);
+                    if (!buf) continue;
+                    writer.add(sym, klineSeries(parseCsv(unzipSingle(buf), KLINE_COLUMNS)));
+                    writer.cover(sym, ts + stepMs, ts + DAY_MS);
+                    added.add(sym);
+                    days++;
+                    dayBytes += buf.length;
+                }
+            }
+        });
+        if (added.size) console.log(`New listings with daily archives only: ${[...added].sort().join(', ')} (${days - before} files)`);
         writer.close();
         console.log(`Daily tail through ${dayKey(lastDay)}: ${days} files, ${(dayBytes / 1e6).toFixed(1)}MB`);
     }
