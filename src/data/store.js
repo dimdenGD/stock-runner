@@ -1107,20 +1107,20 @@ export class Dataset {
         const segs = this.parts.get(key) ?? [];
         if (segs.length < (coverage ? 1 : 2)) return false;
         let inputs = segs;
-        if (!all) {
-            const sizes = segs.map(seg => this.header(seg).size);
-            let i = segs.length - 1;
-            let acc = sizes[i];
-            while (i > 0 && sizes[i - 1] <= 2 * acc) {
-                i--;
-                acc += sizes[i];
-            }
-            if (segs.length - i < 2) i = segs.length - 2;
-            if (i + 1 > this.maxSegments) i = 0;
-            inputs = segs.slice(i);
-        }
         let loaded;
         try {
+            if (!all) {
+                const sizes = segs.map(seg => this.header(seg).size);
+                let i = segs.length - 1;
+                let acc = sizes[i];
+                while (i > 0 && sizes[i - 1] <= 2 * acc) {
+                    i--;
+                    acc += sizes[i];
+                }
+                if (segs.length - i < 2) i = segs.length - 2;
+                if (i + 1 > this.maxSegments) i = 0;
+                inputs = segs.slice(i);
+            }
             loaded = inputs.map(seg => {
                 const header = this.header(seg);
                 return { header, ...readSegment(seg.file, header) };
